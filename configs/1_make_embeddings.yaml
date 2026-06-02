@@ -1,0 +1,12 @@
+defaults: 
+- _self_
+- paths
+- disable_hydra_dirs
+
+emb_name: sentence-t5-xl
+model_folder: sentence-transformers/sentence-t5-xl
+
+category: Arts_Crafts_and_Sewing
+force: true
+
+num_gpus: 4

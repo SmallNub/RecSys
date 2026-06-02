@@ -1,0 +1,42 @@
+defaults: 
+- _self_
+- paths
+- disable_hydra_dirs
+
+optim: 
+  lr: 1e-3
+  warmup: 100
+  beta2: 0.99
+  use_scheduler: true 
+  weight_decay: 0 
+  dropout_prob: 0.05
+  batch_size: 1024
+  epochs: 3125 # 192 steps/epochs on Arts -> 3125 epochs = 600k steps, adapt to category.
+  eval_step: 100
+
+centroids: 
+  kmeans_init: true
+  kmeans_iters: 100 
+  sk_epsilons: [0., 0., 0., 0.003]
+  sk_iters: 50
+  n_centroids_list: [256, 256, 256, 256]
+
+model: 
+  layers: [1024, 512, 256, 128]
+
+loss: 
+  reconstruction_weight: 1.0
+  contrastive_weight: 0.001
+  tau: 2 
+  bias: -8
+  freeze_tau: false 
+  freeze_bias: false
+  sequence_length: 20
+
+data:
+  category: Arts_Crafts_and_Sewing
+  emb_method: sentence-t5-xl
+
+ckpt_dir: /tmp/cosette
+
+marker: null

@@ -1,0 +1,16 @@
+defaults: 
+- _self_
+- paths
+- disable_hydra_dirs
+
+categories: 
+- Arts_Crafts_and_Sewing
+# - Automotive
+# - Beauty_and_Personal_Care
+# - Cell_Phones_and_Accessories
+# - Grocery_and_Gourmet_Food
+# - Health_and_Household
+# - Office_Products
+# - Patio_Lawn_and_Garden
+# - Pet_Supplies
+# - Sports_and_Outdoors

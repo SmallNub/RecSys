@@ -1,0 +1,22 @@
+# @package paths
+
+protocol: viewfs # or something supported by fsspec.filesystem (eg: file)
+# Base folder
+root: /user/${oc.env:USER}/cosette_and_marius
+# Temporary folder for Git LFS Files
+tmp_lfs_folder: /tmp/AmazonReviews2023
+# Raw ratings and IDs
+timelines_tplt: ${.root}/data/timelines/{category}.{split}.parquet
+# Raw metadata
+meta_tplt: ${.root}/data/meta/{category}.parquet
+# Unique items
+unique_items_tplt: ${.root}/data/timelines/{category}_items.pkl
+# Embeddings
+embeddings_tplt: ${.root}/data/embeddings/{emb_method}/{category}/embeddings.parquet
+# Semantic IDs
+semantic_ids_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_method}.parquet
+semantic_model_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_method}_model.pkl
+# Model outputs
+model_folder_tplt: ${.root}/models/
+# Logging project
+wandb_project_name: cosette_and_marius
