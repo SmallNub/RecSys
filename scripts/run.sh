@@ -18,10 +18,10 @@ module load CUDA/12.4.0
 
 source activate recsys
 
-cd ../data_scripts
+cd ..
 
-python 0_raw_to_parquet.py
-python 1_make_embeddings.py
-python 2_train_cosette.py
+python data_scripts/0_raw_to_parquet.py
+python data_scripts/1_make_embeddings.py
+python data_scripts/2_train_cosette.py
 
 
