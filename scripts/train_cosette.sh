@@ -14,7 +14,6 @@ export RAY_TRAIN_V2_ENABLED=1
 module purge
 module load 2025
 module load Anaconda3/2025.06-1
-module load CUDA/12.4.0
 
 source activate recsys
 
