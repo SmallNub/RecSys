@@ -6,7 +6,7 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus=2
+#SBATCH --gpus=1
 
 
 export RAY_TRAIN_V2_ENABLED=1
