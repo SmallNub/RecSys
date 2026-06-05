@@ -4,7 +4,7 @@ defaults:
 - disable_hydra_dirs
 
 emb_name: sentence-t5-xl
-model_folder: /data/ebay-slc-a100/notebooks/udthakur/cosette_and_marius/models/sentence-transformers--sentence-t5-xl
+model_folder: sentence-transformers/sentence-t5-xl
 
 category: Video_Games
 force: false

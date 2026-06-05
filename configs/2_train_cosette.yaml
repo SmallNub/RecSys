@@ -38,6 +38,6 @@ data:
   emb_method: sentence-t5-xl
 
 num_gpus: 1
-ckpt_dir: /data/ebay-slc-a100/notebooks/udthakur/cosette_and_marius/output/cosette
+ckpt_dir:  /tmp/cosette
 
 marker: null

@@ -14,7 +14,7 @@ AMAZON_2014_BASE = "https://snap.stanford.edu/data/amazon/productGraph/categoryF
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--base_dir",
-    default="/data/ebay-slc-a100/notebooks/udthakur/cosette_and_marius/datasets",
+    default="datasets",
     help="Base directory to download into",
 )
 parser.add_argument(

@@ -5,6 +5,7 @@ import random
 from collections import defaultdict
 from math import ceil
 from uuid import uuid4
+from datetime import datetime
 
 import fsspec
 import hydra
@@ -378,8 +379,8 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
         )
 
 
-def make_name(config):
-    name = f"COSETTE_{config.model.layers[-1]}d_{config.centroids.n_centroids_list[-1]}x{len(config.centroids.n_centroids_list)}_{uuid4().hex[:4]}"
+def make_name(config, timestamp):
+    name = f"COSETTE_{config.model.layers[-1]}d_{config.centroids.n_centroids_list[-1]}x{len(config.centroids.n_centroids_list)}_{config.data.category}_{timestamp}"
     if config.marker is not None:
         name += f"_{config.marker}"
     return name
@@ -387,7 +388,10 @@ def make_name(config):
 
 @ray.remote(num_cpus=8)
 def make_cosette_embs(config):
-    config.ckpt_dir = os.path.join(config.ckpt_dir, uuid4().hex)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+    config.ckpt_dir = os.path.join(config.ckpt_dir, timestamp)
 
     # Input paths
     embeddings_path = config.paths.embeddings_tplt.format(
@@ -447,7 +451,7 @@ def make_cosette_embs(config):
     )
 
     print("Model : ", model)
-    quant_method = make_name(config)
+    quant_method = make_name(config, timestamp)
 
     wandb.login()
     wandb.init(
