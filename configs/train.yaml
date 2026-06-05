@@ -12,10 +12,6 @@ trainer:
   _target_: pytorch_lightning.Trainer
   accelerator: auto
   devices: auto
-  strategy:
-    _target_: ray.train.lightning.RayDDPStrategy
-  plugins:
-    _target_: ray.train.lightning.RayLightningEnvironment
   precision: bf16-mixed
   check_val_every_n_epoch: null
   val_check_interval: 10_000
@@ -29,7 +25,13 @@ trainer:
     logging_interval: step
     log_momentum: False
     log_weight_decay: True
-  - _target_: src.utils.callbacks.CustomReportCallback
+  - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.model_folder_tplt}/${task_name}_${date}
+    filename: "checkpoint"
+    save_top_k: 1
+    monitor: valid/${data.datasets.category}/HR@10
+    mode: max
+  - _target_: src.utils.callbacks.SaveConfigCallback
   # LOGGING 
   logger:
     _target_: pytorch_lightning.loggers.wandb.WandbLogger
@@ -54,42 +56,23 @@ model: # Lightning Module for Training
     warmup_steps: ???
     cosine_steps: ${eval:'${trainer.max_steps} - ${model.scheduler.warmup_steps}'}
 
-ray: 
-  scaling_config:
-    _target_: ray.train.ScalingConfig
-    num_workers: 1 # HARDCODED
-    use_gpu: True
-    resources_per_worker:
-      CPU: 4 # The rest is handled by Ray Data (24 CPUs: 2x4=8 training, 16 for pipeline)
-      GPU: 1
-  run_config:
-    _target_: ray.train.RunConfig
-    storage_path: ${paths.model_folder_tplt}
-    checkpoint_config:
-      _target_: ray.train.CheckpointConfig
-      num_to_keep: 2
-      checkpoint_score_attribute: valid/${data.ray_datasets.category}/HR@10
-      checkpoint_score_order: max
-    failure_config:
-      _target_: ray.train.FailureConfig
-      max_failures: 0
-  runtime_env: {}
+
 
 
 data: 
-  ray_datasets: 
-    _target_: src.data.ray_data.make_ray_dataset
+  datasets: 
+    _target_: src.data.datasets.make_datasets
     category: Video_Games
     total_len: ${eval:'${trainer.max_steps}*${data.datamodule.train_batch_size}'}
     emb_id: ??? # Overriden by experiment selection
     quant_id: ??? # Overriden by experiment selection
-    num_cpus: 4 # Depends on the machine (24 CPUs: 2x4=8 training, 4 ToRow, 12 PrePro)
+    num_workers: 4 # Depends on the machine
     prepro_cfg: 
       _cls_: ??? # Overriden by experiment selection
       crop_length: 50
       augment: timewise_shuffle
   datamodule:
-    _target_: src.data.datamodule.RayDataModule
+    _target_: src.data.datamodule.RecDataModule
     train_batch_size: 256
     valid_batch_size: 256
 

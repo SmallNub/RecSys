@@ -5,28 +5,29 @@ task_name: SASRec
 model:
   net: 
     _target_: src.models.sasrec.SASRec
+    vocab_size: 3_000_000 # Should be overriden at instantiation
     n_layers: 2
-    d_model: 128
     d_head: 64
-    vocab_size: 89959
-    dropout: 0.4
-    seq_len: ${data.ray_datasets.prepro_cfg.crop_length}
+    d_model: 512
+    dropout: 0.5
+    emb_dropout: 0.5
+    seq_len: ${data.datasets.prepro_cfg.crop_length}
+    filter_preds: true # Better evaluation of "true" validation metrics, but slower
     normalization: l2
     criterion:
       _target_: src.models.sasrec.SampledSoftmax
       temperature: 0.05
       n_items: 30000
-  mode: "dense"
+  mode: "discriminative"
   optimizer: 
-    lr: 0.0005
-    weight_decay: 0. 
+    lr: 0.001
+    weight_decay: 0.0001
   scheduler: 
     warmup_steps: 2000
 
-
 data: 
-  ray_datasets: 
+  datasets: 
     emb_id: null
-    quant_id: null # No quantization for SASRec
+    quant_id: null
     prepro_cfg: 
       _cls_: src.data.sasrec.SASRecPrePro

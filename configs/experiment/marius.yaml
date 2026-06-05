@@ -7,7 +7,7 @@ model:
     _target_: src.models.marius.MARIUS
     temporal_cfg:
       _target_: src.models.marius.TransformerConfig
-      seq_len: ${data.ray_datasets.prepro_cfg.crop_length}
+      seq_len: ${data.datasets.prepro_cfg.crop_length}
       vocab_size: 1026 # 4 * 256 + 2
       n_layers: 4
       d_head: 64
@@ -32,7 +32,7 @@ model:
     warmup_steps: 2000
 
 data: 
-  ray_datasets: 
+  datasets: 
     emb_id: sentence-t5-xl
     quant_id: COSETTE_128d_256x4_71e4col
     # quant_id: COSETTE_128d_256x4_4ba1-col

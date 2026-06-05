@@ -24,7 +24,7 @@ class LitModule(LightningModule):
 
     @property
     def category(self):
-        return self.full_hydra_config.data.ray_datasets.category
+        return self.full_hydra_config.data.datasets.category
 
     def training_step(self, batch, batch_idx):
         loss, _ = self.net.get_loss(batch)

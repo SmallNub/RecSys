@@ -1,16 +1,15 @@
 from typing import Any, Optional
 
 from pytorch_lightning import LightningDataModule
-from ray.train import get_dataset_shard
 from torch.utils.data import DataLoader
 
 
-class RayDataModule(LightningDataModule):
+class RecDataModule(LightningDataModule):
     def __init__(
         self,
         train_batch_size: int,
         valid_batch_size: int,
-        ray_datasets=None,  # Used to load the datasets without a TorchTrainer
+        datasets=None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -18,40 +17,37 @@ class RayDataModule(LightningDataModule):
         self.data_train = None
         self.data_valid = None
         self.data_test = None
-        self.ray_datasets = ray_datasets
-
-    def get_dataset(self, name: str):
-        if self.ray_datasets is not None:
-            return self.ray_datasets[name]
-        else:
-            return get_dataset_shard(name)
+        self.datasets = datasets
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
-            self.data_train = self.get_dataset("train")
-            self.data_valid = self.get_dataset("valid")
+            self.data_train = self.datasets["train"]
+            self.data_valid = self.datasets["valid"]
 
         if stage == "test" or stage is None:
-            self.data_valid = self.get_dataset("valid")
-            self.data_test = self.get_dataset("test")
+            self.data_valid = self.datasets["valid"]
+            self.data_test = self.datasets["test"]
 
     def train_dataloader(self) -> DataLoader[Any]:
-        return self.data_train.iter_torch_batches(
+        return DataLoader(
+            self.data_train,
             batch_size=self.hparams.train_batch_size,
             drop_last=True,
-            prefetch_batches=3,
+            num_workers=4,
         )
 
     def val_dataloader(self) -> DataLoader[Any]:
-        return self.data_valid.iter_torch_batches(
+        return DataLoader(
+            self.data_valid,
             batch_size=self.hparams.valid_batch_size,
             drop_last=False,
-            prefetch_batches=3,
+            num_workers=4,
         )
 
     def test_dataloader(self) -> DataLoader[Any]:
-        return self.data_test.iter_torch_batches(
+        return DataLoader(
+            self.data_test,
             batch_size=self.hparams.valid_batch_size,
             drop_last=False,
-            prefetch_batches=3,
+            num_workers=4,
         )

@@ -1,5 +1,4 @@
 import numpy as np
-import ray
 
 from src.models import SpecialTokens
 
@@ -27,7 +26,7 @@ class SASRecPrePro:
             split=split,
         )
 
-        items_map = ray.get(items_ref)
+        items_map = items_ref
         self.item_to_id = items_map["item_to_id"]
         self.id_to_item = items_map["id_to_item"]
 

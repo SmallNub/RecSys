@@ -9,7 +9,7 @@ model:
     _target_: src.models.marius.MARIUS
     temporal_cfg:
       _target_: src.models.marius.TransformerConfig
-      seq_len: ${data.ray_datasets.prepro_cfg.crop_length}
+      seq_len: ${data.datasets.prepro_cfg.crop_length}
       vocab_size: 1026 # 4 * 256 + 2
       n_layers: 2
       d_head: 64
@@ -25,17 +25,18 @@ model:
       d_model: ${model.net.temporal_cfg.d_model}
       dropout: 0.1
       emb_dropout: null
-    filter_preds: true
+    filter_preds: true # Better evaluation of "true" validation metrics, but slower
   mode: "generative"
-  optimizer:
+  optimizer: 
     lr: 0.0005
     weight_decay: 0.0001
-  scheduler:
+  scheduler: 
     warmup_steps: 2000
 
-data:
-  ray_datasets:
+data: 
+  datasets:
     emb_id: sentence-t5-xl
-    quant_id: COSETTE_128d_256x4_a135-col
-    prepro_cfg:
+    # quant_id: COSETTE_128d_256x4_4ba1-col
+    quant_id: COSETTE_128d_256x4_71e4col
+    prepro_cfg: 
       _cls_: src.data.marius.MARIUSPrePro

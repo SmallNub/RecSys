@@ -1,5 +1,4 @@
 import numpy as np
-import ray
 
 from src.models import SpecialTokens
 
@@ -41,7 +40,7 @@ class MARIUSPrePro:
             split=split,
         )
 
-        self.quant_df = ray.get(quantizer_ref)
+        self.quant_df = quantizer_ref
 
         self.L = len(self.quant_df.columns)
         self.K = self.quant_df.values.max() + 1

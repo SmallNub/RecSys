@@ -7,7 +7,6 @@ import fsspec
 import hydra
 import numpy as np
 import pandas as pd
-import ray
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -61,8 +60,7 @@ def get_model(fs, model_folder):
 )
 def main(config):
     # Could loop over multiple categories here ?
-    scaled_embed = ray.remote(embed).options(num_gpus=config.num_gpus)
-    ray.get(scaled_embed.remote(config))
+    embed(config)
 
 
 def embed(config):

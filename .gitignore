@@ -6,7 +6,6 @@ outputs/
 wandb/
 lightning_logs/
 tmp/
-ray_tools
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

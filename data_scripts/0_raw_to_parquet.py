@@ -6,7 +6,6 @@ from pathlib import Path
 import fsspec
 import hydra
 import pandas as pd
-import ray
 
 from src.utils.tools import patch_fsspec
 
@@ -15,22 +14,6 @@ from src.utils.tools import patch_fsspec
     config_path="../configs", config_name="0_raw_to_parquet", version_base="1.2"
 )
 def main(config):
-    # Download only the files needed for the configured categories (avoids pulling 750 GB).
-    # Run scripts/download_data.py --categories <cat1> <cat2> ... to download first,
-    # or set paths.skip_download: true if data is already present.
-
-    # Original approach: clone the full repo via git + LFS (kept for reference).
-    # if not os.path.exists(config.paths.tmp_lfs_folder):
-    #     subprocess.run(
-    #         [
-    #             "git",
-    #             "clone",
-    #             "https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023",
-    #             config.paths.tmp_lfs_folder,
-    #         ],
-    #         env=dict(os.environ, GIT_LFS_SKIP_SMUDGE="1"),
-    #     )
-
     if not config.paths.get("skip_download", False):
         subprocess.run(
             [
@@ -43,14 +26,9 @@ def main(config):
             check=True,
         )
 
-    ray.init()
-    print(ray.cluster_resources())
     wd = os.getcwd()
-    refs = [
-        process_category.remote(category, config, wd) for category in config.categories
-    ]
-    ray.get(refs)
-    ray.shutdown()
+    for category in config.categories:
+        process_category(category, config, wd)
 
 
 def _sanitize(p):
@@ -73,7 +51,6 @@ META_SELECTED_COLS = [
 ]
 
 
-@ray.remote(num_cpus=5)
 def process_category(category, config, wd):
     # Original LFS pull per file (replaced by snapshot_download in main).
     # os.chdir(config.paths.tmp_lfs_folder)

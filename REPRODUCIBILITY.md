@@ -28,7 +28,7 @@ This study reproduces COSETTE and MARIUS from scratch on Amazon 2014 (Beauty, Vi
 3. git lfs needed to download the dataset, if error, install git lfs and run `git lfs install` else using hf download
 4. embeddings creations script is not verbose at all, doesn't show progress
 5. embeddings creation on 2 A100 GPUs takes around 30-35 minutes
-6. Ray instances requires matching cpu and gpu otherwise it throws errors
+6. Instances requires matching cpu and gpu otherwise it throws errors
 7. MARIUS trained on 2 GPUs for 80k steps as reported in the paper. Validation metrics reported on the best checkpoint selected during training.
 8. COSETTE multi-GPU not viable (SigLIP contrastive loss requires full batch). Run one category per GPU.
 9. Paper does not specify COSETTE training steps/epochs for smaller datasets. Scaled proportionally from 500k steps (90k items) to ~67k steps for 12k items (1000 epochs at bs=256).
@@ -38,7 +38,7 @@ This study reproduces COSETTE and MARIUS from scratch on Amazon 2014 (Beauty, Vi
 
 ### TODOs
 
-- Run SASRec++ baseline: `RAY_TRAIN_V2_ENABLED=1 PYTHONPATH=. python src/train.py experiment=sasrec`
+- Run SASRec++ baseline: `PYTHONPATH=. python src/train.py experiment=sasrec`
 
 ---
 
@@ -52,7 +52,7 @@ This study reproduces COSETTE and MARIUS from scratch on Amazon 2014 (Beauty, Vi
 
 **Silent embeddings:** `encode_multi_process` runs with no output for 30+ minutes. Added chunked tqdm wrapper; no quality impact.
 
-**Ray GPU detection:** Ray didn't detect GPUs automatically. Fixed with `ray.init(num_gpus=torch.cuda.device_count())`.
+
 
 **COSETTE DataLoader OOM:** hardcoded `num_workers=11` causes OOM when running alongside MARIUS. Reduced to 4.
 
@@ -105,11 +105,11 @@ PYTHONPATH=. python data_scripts/3_remove_colisions.py data.category=Video_Games
 
 **Train MARIUS** (small model: d=256, L_T=2, L_D=2 per Table 3)
 ```bash
-RAY_TRAIN_V2_ENABLED=1 python src/train.py experiment=marius_small \
-  data.ray_datasets.category=Beauty data.ray_datasets.quant_id=COSETTE_128d_256x4-xxxx
+python src/train.py experiment=marius_small \
+  data.datasets.category=Beauty data.datasets.quant_id=COSETTE_128d_256x4-xxxx
 
-RAY_TRAIN_V2_ENABLED=1 python src/train.py experiment=marius_small \
-  data.ray_datasets.category=Video_Games data.ray_datasets.quant_id=COSETTE_128d_256x4-xxxx
+python src/train.py experiment=marius_small \
+  data.datasets.category=Video_Games data.datasets.quant_id=COSETTE_128d_256x4-xxxx
 ```
 
 **Test**
@@ -149,8 +149,8 @@ PYTHONPATH=. python data_scripts/3_remove_colisions.py \
 
 **Train MARIUS** (full model: d=512, L_T=4, L_D=6 per Table 3)
 ```bash
-RAY_TRAIN_V2_ENABLED=1 python src/train.py experiment=marius \
-  data.ray_datasets.category=Arts_Crafts_and_Sewing data.ray_datasets.quant_id=COSETTE_128d_256x4-xxxx
+python src/train.py experiment=marius \
+  data.datasets.category=Arts_Crafts_and_Sewing data.datasets.quant_id=COSETTE_128d_256x4-xxxx
 ```
 
 ---

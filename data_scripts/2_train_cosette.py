@@ -11,7 +11,6 @@ import fsspec
 import hydra
 import numpy as np
 import pandas as pd
-import ray
 import torch
 import wandb
 from omegaconf import OmegaConf
@@ -386,7 +385,6 @@ def make_name(config, timestamp):
     return name
 
 
-@ray.remote(num_cpus=8)
 def make_cosette_embs(config):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -489,11 +487,7 @@ def main(config):
         }
     }
     num_gpus = config.get("num_gpus", 1)
-    ray.init(
-        num_gpus=torch.cuda.device_count(),
-        runtime_env=runtime_env
-    )
-    ray.get(make_cosette_embs.options(num_gpus=num_gpus).remote(config))
+    make_cosette_embs(config)
 
 
 if __name__ == "__main__":

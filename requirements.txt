@@ -11,7 +11,7 @@ torchmetrics==1.6.1
 
 
 pytorch-lightning==2.5.0.post0
-ray==2.44.1
+
 
 fsspec==2025.2.0
 hydra-core==1.3.2

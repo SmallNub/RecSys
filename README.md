@@ -33,12 +33,6 @@ It includes :
 
 ## Usage
 
-> ⚠️ **Note:** This codebase is built for Ray Train v2. Make sure to enable it with
-> ```sh
-> export RAY_TRAIN_V2_ENABLED=1
-> ```
-
-
 ### Environment
 
 Create a new environment with Python 3.9 and install dependencies:
