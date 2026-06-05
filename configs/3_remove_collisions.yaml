@@ -8,4 +8,4 @@ data:
   emb_method: sentence-t5-xl
 
 paths:
-  ckpt_dir: checkpoints/cosette
+  ckpt_dir: outputs/checkpoints/cosette
