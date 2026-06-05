@@ -20,23 +20,32 @@ source activate recsys
 
 export PYTHONPATH=/gpfs/home4/scur1207/RecSys:$PYTHONPATH
 
+# Download both categories in one call (already parallel)
 python scripts/download_data.py --year 2014 --categories Beauty Video_Games
 
-PYTHONPATH=. python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 categories=[Beauty] paths.skip_download=true
-PYTHONPATH=. python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 categories=[Video_Games] paths.skip_download=true
+# Parquet conversion - CPU only, run in parallel
+PYTHONPATH=. python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 categories=[Beauty] paths.skip_download=true &
+PYTHONPATH=. python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 categories=[Video_Games] paths.skip_download=true &
+wait
 
-CUDA_VISIBLE_DEVICES=0 python data_scripts/1_make_embeddings.py category=Beauty num_gpus=1
-CUDA_VISIBLE_DEVICES=1 python data_scripts/1_make_embeddings.py category=Video_Games num_gpus=1
+# Embeddings - one GPU each, run in parallel
+CUDA_VISIBLE_DEVICES=0 python data_scripts/1_make_embeddings.py category=Beauty num_gpus=1 &
+CUDA_VISIBLE_DEVICES=1 python data_scripts/1_make_embeddings.py category=Video_Games num_gpus=1 &
+wait
 
+# COSETTE training - one GPU each, run in parallel
 CUDA_VISIBLE_DEVICES=0 python data_scripts/2_train_cosette.py \
-  data.category=Beauty optim.batch_size=256 optim.epochs=1000 optim.eval_step=100 optim.dropout_prob=0.1
-
+  data.category=Beauty optim.batch_size=256 optim.epochs=1000 optim.eval_step=100 optim.dropout_prob=0.1 &
 CUDA_VISIBLE_DEVICES=1 python data_scripts/2_train_cosette.py \
-  data.category=Video_Games optim.batch_size=256 optim.epochs=1000 optim.eval_step=100 optim.dropout_prob=0.1
+  data.category=Video_Games optim.batch_size=256 optim.epochs=1000 optim.eval_step=100 optim.dropout_prob=0.1 &
+wait
 
-PYTHONPATH=. python data_scripts/3_remove_colisions.py data.category=Beauty
-PYTHONPATH=. python data_scripts/3_remove_colisions.py data.category=Video_Games
+# Collision removal - CPU only, run in parallel
+PYTHONPATH=. python data_scripts/3_remove_colisions.py data.category=Beauty &
+PYTHONPATH=. python data_scripts/3_remove_colisions.py data.category=Video_Games &
+wait
 
+# Resolve quant method names after collision removal
 BEAUTY_QUANT=$(python -c "
 from pathlib import Path
 base = Path('/tmp/cosette')
@@ -50,19 +59,20 @@ runs = [d for d in base.iterdir() if d.is_dir() and 'Video_Games' in d.name]
 print(max(runs, key=lambda d: d.name).name)
 ")
 
+# Ray training - sequential (Ray manages its own GPU scheduling)
 RAY_TRAIN_V2_ENABLED=1 python src/train.py experiment=marius_small \
-  data.ray_datasets.category=Beauty data.ray_datasets.quant_id=${BEAUTY_QUANT}-col ray.run_config.storage_path=
+  data.ray_datasets.category=Beauty data.ray_datasets.quant_id=${BEAUTY_QUANT}-col
 
 RAY_TRAIN_V2_ENABLED=1 python src/train.py experiment=marius_small \
   data.ray_datasets.category=Video_Games data.ray_datasets.quant_id=${VIDEO_GAMES_QUANT}-col
 
+# Resolve run directories after training
 BEAUTY_RUN=$(python -c "
 from pathlib import Path
 base = Path('/gpfs/home4/scur1207/RecSys/models/')
 runs = [d for d in base.iterdir() if d.is_dir() and 'Beauty' in d.name]
 print(max(runs, key=lambda d: d.name).name)
 ")
-
 VIDEO_GAMES_RUN=$(python -c "
 from pathlib import Path
 base = Path('/gpfs/home4/scur1207/RecSys/models/')
@@ -70,5 +80,7 @@ runs = [d for d in base.iterdir() if d.is_dir() and 'Video_Games' in d.name]
 print(max(runs, key=lambda d: d.name).name)
 ")
 
-python src/test.py run_directory=${BEAUTY_RUN}
-python src/test.py run_directory=${VIDEO_GAMES_RUN}
+# Testing - run in parallel
+python src/test.py run_directory=${BEAUTY_RUN} &
+python src/test.py run_directory=${VIDEO_GAMES_RUN} &
+wait
