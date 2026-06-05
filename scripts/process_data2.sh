@@ -8,16 +8,15 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 
-
-export RAY_TRAIN_V2_ENABLED=1
-
 module purge
 module load 2025
 module load Anaconda3/2025.06-1
 
 source activate recsys
 
-export PYTHONPATH=/gpfs/home4/scur1207/RecSys:$PYTHONPATH
+export $(cat .env | xargs)
+export RAY_TRAIN_V2_ENABLED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 python scripts/download_data.py --year 2014 --categories Beauty
 

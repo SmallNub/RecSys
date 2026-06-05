@@ -8,17 +8,15 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 
-
-export RAY_TRAIN_V2_ENABLED=1
-export $(cat .env | xargs)
-
 module purge
 module load 2025
 module load Anaconda3/2025.06-1
 
 source activate recsys
 
-export PYTHONPATH=/gpfs/home4/scur1207/RecSys:$PYTHONPATH
+export $(cat .env | xargs)
+export RAY_TRAIN_V2_ENABLED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 # python data_scripts/2_train_cosette.py \
 #   data.category=Beauty optim.batch_size=256 optim.epochs=500 optim.eval_step=100 optim.dropout_prob=0.1

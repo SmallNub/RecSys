@@ -40,8 +40,10 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y-%m-
     base_dir = Path(base_dir_path)
     latest_dir = None
     latest_time = None
+    print("a", base_dir)
 
     for entry in base_dir.iterdir():
+        print("b", entry)
         if entry.is_dir():
             try:
                 folder_time = datetime.strptime(entry.name, timestamp_format)
@@ -51,8 +53,8 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y-%m-
                     latest_dir = entry
             except ValueError:
                 continue
-
-    return latest_dir
+    print("c", latest_dir)
+    return os.path.join(base_dir_path, latest_dir)
 
 
 def check_collision(all_indices_tup):
