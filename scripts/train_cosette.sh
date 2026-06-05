@@ -20,13 +20,6 @@ source activate recsys
 
 export PYTHONPATH=/gpfs/home4/scur1207/RecSys:$PYTHONPATH
 
-# Download both categories in one call (already parallel)
-python scripts/download_data.py --year 2014 --categories Beauty Video_Games
-
-# Parquet conversion - CPU only, run in parallel
-PYTHONPATH=. python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 categories=[Beauty] paths.skip_download=true &
-PYTHONPATH=. python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 categories=[Video_Games] paths.skip_download=true &
-wait
 
 # Embeddings - one GPU each, run in parallel
 CUDA_VISIBLE_DEVICES=0 python data_scripts/1_make_embeddings.py category=Beauty num_gpus=1 &
