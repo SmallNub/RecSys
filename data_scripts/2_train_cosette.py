@@ -482,8 +482,17 @@ def make_cosette_embs(config):
 @hydra.main(config_path="../configs", config_name="2_train_cosette", version_base="1.2")
 def main(config):
     import torch
+    api_key = os.getenv("WANDB_API_KEY")
+    runtime_env = {
+        "env_vars": {
+            "WANDB_API_KEY": api_key if api_key else ""
+        }
+    }
     num_gpus = config.get("num_gpus", 1)
-    ray.init(num_gpus=torch.cuda.device_count())
+    ray.init(
+        num_gpus=torch.cuda.device_count(),
+        runtime_env=runtime_env
+    )
     ray.get(make_cosette_embs.options(num_gpus=num_gpus).remote(config))
 
 
