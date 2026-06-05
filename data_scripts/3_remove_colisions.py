@@ -29,13 +29,9 @@ def partition_list(lst, partition_sizes):
     return partitions
 
 
-def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y-%m-%d_%H-%M-%S") -> Path:
+def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d_%H%M%S") -> Path:
     """
     Finds the directory with the latest timestamp name inside base_dir_path.
-
-    :param base_dir_path: The root directory to search inside.
-    :param timestamp_format: The datetime format string matching your folder names.
-    :return: Path object of the latest timestamp directory, or None if none found.
     """
     base_dir = Path(base_dir_path)
     latest_dir = None
@@ -54,7 +50,7 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y-%m-
             except ValueError:
                 continue
     print("c", latest_dir)
-    return os.path.join(base_dir_path, latest_dir)
+    return latest_dir
 
 
 def check_collision(all_indices_tup):
