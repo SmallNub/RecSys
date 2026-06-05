@@ -4,7 +4,7 @@ defaults:
 - disable_hydra_dirs
 
 data:
-  category: Video_Games
+  category: Beauty
   emb_method: sentence-t5-xl
 
 paths:

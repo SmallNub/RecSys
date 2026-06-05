@@ -34,7 +34,7 @@ loss:
   sequence_length: 20
 
 data:
-  category: Video_Games
+  category: Beauty
   emb_method: sentence-t5-xl
 
 num_gpus: 1
