@@ -25,4 +25,4 @@ model_folder_tplt: ${.root}/models/
 # Logging project
 wandb_project_name: recsys
 wandb_entity: smallnub
-wandb_mode: online
+wandb_mode: offline
