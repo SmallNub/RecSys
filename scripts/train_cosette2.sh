@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_cosette
 #SBATCH --output=scripts/slurm/train_cosette%j.log
 #SBATCH --error=scripts/slurm/train_cosette%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=0:30:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -10,6 +10,7 @@
 
 
 export RAY_TRAIN_V2_ENABLED=1
+export $(cat .env | xargs)
 
 module purge
 module load 2025
