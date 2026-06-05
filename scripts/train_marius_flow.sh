@@ -18,29 +18,24 @@ export $(cat .env | xargs)
 export RAY_TRAIN_V2_ENABLED=1
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-python data_scripts/1_make_embeddings.py category=Beauty num_gpus=1
+COSETTE_TIMESTAMP="20260605_193615"
+CATEGORY="Beauty"
+QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
+EXPERIMENT="marius_small"
 
-python data_scripts/2_train_cosette.py \
-  data.category=Beauty optim.batch_size=256 optim.epochs=1000 optim.eval_step=100 optim.dropout_prob=0.1
+python src/train.py experiment=${EXPERIMENT} \
+    data.ray_datasets.category=${CATEGORY} data.ray_datasets.quant_id=${QUANT}-col
 
-PYTHONPATH=. python data_scripts/3_remove_colisions.py data.category=Beauty
+BASE_DIR="outputs/checkpoints/marius"
 
-BEAUTY_QUANT=$(python -c "
-from pathlib import Path
-base = Path('/tmp/cosette')
-runs = [d for d in base.iterdir() if d.is_dir() and 'Beauty' in d.name]
-print(max(runs, key=lambda d: d.name).name)
-")
+LATEST_RUN=$(ls -1d ${BASE_DIR}/${EXPERIMENT}_*/ 2>/dev/null | sort | tail -n 1)
 
-RAY_TRAIN_V2_ENABLED=1 python src/train.py experiment=marius_small \
-  data.ray_datasets.category=Beauty data.ray_datasets.quant_id=${BEAUTY_QUANT}-col
+if [ -z "$LATEST_RUN" ]; then
+    echo "Error: No timestamp directory found for experiment '${EXPERIMENT}' in $BASE_DIR"
+    exit 1
+fi
 
-BEAUTY_RUN=$(python -c "
-from pathlib import Path
-base = Path('/gpfs/home4/scur1207/RecSys/models/')
-runs = [d for d in base.iterdir() if d.is_dir() and 'Beauty' in d.name]
-print(max(runs, key=lambda d: d.name).name)
-")
+RUN=${LATEST_RUN}
+echo "Running evaluation on latest experiment directory: ${RUN}"
 
-# Testing - run in parallel
-python src/test.py run_directory=${BEAUTY_RUN}
+python src/test.py run_directory=${RUN}
