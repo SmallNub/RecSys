@@ -24,7 +24,7 @@ def get_top_cfg(fs, config):
     root = os.path.join(config.paths.model_folder_tplt, config.run_directory)
 
     # Get a config file to look for a best metric
-    folders = [f for f in fs.ls(root) if "/checkpoint_" in f]
+    folders = [f for f in fs.ls(root) if "/checkpoint_" in f and fs.isdir(f)]
     with fs.open(os.path.join(folders[0], FILENAMES["config"])) as f:
         cfg = OmegaConf.load(f)
     print(cfg.data)

@@ -76,7 +76,7 @@ def make_pipeline(
             .map(
                 ToRow,
                 fn_constructor_kwargs={"timeline_ref": timeline_ref},
-                concurrency=5,
+                concurrency=4,
             )
             .map(pp_cls, fn_constructor_kwargs=pp_cfg, concurrency=num_cpus)
         )

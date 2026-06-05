@@ -13,7 +13,7 @@ def remove_then_create(path):
     """Remove the directory if it exists and create it."""
     if os.path.exists(path):
         shutil.rmtree(path)
-    os.makedirs(path)
+    os.makedirs(path, exist_ok=True)
 
 
 class CustomReportCallback(pl.callbacks.Callback):

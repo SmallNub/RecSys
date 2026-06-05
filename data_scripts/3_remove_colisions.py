@@ -1,6 +1,7 @@
 import collections
 import copy
 from collections import defaultdict
+from pathlib import Path
 
 import fsspec
 import hydra
@@ -24,6 +25,17 @@ def partition_list(lst, partition_sizes):
         start += size
 
     return partitions
+
+
+def find_latest_quant_method(base_dir: str, category: str):
+    base = Path(base_dir)
+    runs = [d for d in base.iterdir() if d.is_dir() and category in d.name]
+
+    if not runs:
+        raise ValueError(f"No runs found in {base_dir} for category {category}")
+
+    latest_run = max(runs, key=lambda d: d.name)
+    return latest_run.name
 
 
 def check_collision(all_indices_tup):
@@ -59,17 +71,20 @@ def main(config):
     patch_fsspec()
     fs = fsspec.filesystem(config.paths.protocol)
 
+    quant_method = find_latest_quant_method(config.paths.ckpt_dir, config.data.category)
+    print(f"Using quant method: {quant_method}")
+
     embeddings_path = config.paths.embeddings_tplt.format(
         emb_method=config.data.emb_method, category=config.data.category
     )
     quantized_path = config.paths.semantic_ids_tplt.format(
         emb_method=config.data.emb_method,
-        quant_method=config.data.quant_method,
+        quant_method=quant_method,
         category=config.data.category,
     )
     model_path = config.paths.semantic_model_tplt.format(
         emb_method=config.data.emb_method,
-        quant_method=config.data.quant_method,
+        quant_method=quant_method,
         category=config.data.category,
     )
 
@@ -225,7 +240,7 @@ def main(config):
 
     df["product_id"] = embs_df["product_id"].values
 
-    new_quant_method = config.data.quant_method + "-col"
+    new_quant_method = quant_method + "-col"
     quantized_path = config.paths.semantic_ids_tplt.format(
         emb_method=config.data.emb_method,
         quant_method=new_quant_method,

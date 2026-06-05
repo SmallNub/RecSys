@@ -6,7 +6,8 @@ defaults:
 emb_name: sentence-t5-xl
 model_folder: sentence-transformers/sentence-t5-xl
 
-category: Arts_Crafts_and_Sewing
-force: true
+category: Video_Games
+force: false
 
-num_gpus: 4
+num_gpus: 2
+batch_size: 64

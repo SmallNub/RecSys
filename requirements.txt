@@ -19,4 +19,4 @@ pandas==2.2.3
 pyarrow==19.0.1
 python-dotenv==1.0.1
 tqdm==4.67.1
-wandb==0.19.7
+wandb==0.26.1

@@ -4,7 +4,8 @@ defaults:
 - disable_hydra_dirs
 
 data:
-  category: Arts_Crafts_and_Sewing
+  category: Video_Games
   emb_method: sentence-t5-xl
-  quant_method: COSETTE_128d_256x4_??? # Replace with generated COSETTE ID.
 
+paths:
+  ckpt_dir: /tmp/cosette

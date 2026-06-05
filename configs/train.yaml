@@ -35,6 +35,8 @@ trainer:
     _target_: pytorch_lightning.loggers.wandb.WandbLogger
     name: null # Overriden with run name in code
     project: ${paths.wandb_project_name}
+    entity: ${paths.wandb_entity}
+    mode: ${paths.wandb_mode}
 
 model: # Lightning Module for Training 
   _target_: src.lightning_module.LitModule
@@ -55,10 +57,10 @@ model: # Lightning Module for Training
 ray: 
   scaling_config:
     _target_: ray.train.ScalingConfig
-    num_workers: 1
+    num_workers: 2
     use_gpu: True
     resources_per_worker:
-      CPU: 1 # The rest is handled by Ray Data
+      CPU: 4 # The rest is handled by Ray Data (24 CPUs: 2x4=8 training, 16 for pipeline)
       GPU: 1
   run_config:
     _target_: ray.train.RunConfig
@@ -77,11 +79,11 @@ ray:
 data: 
   ray_datasets: 
     _target_: src.data.ray_data.make_ray_dataset
-    category: Arts_Crafts_and_Sewing
+    category: Video_Games
     total_len: ${eval:'${trainer.max_steps}*${data.datamodule.train_batch_size}'}
     emb_id: ??? # Overriden by experiment selection
     quant_id: ??? # Overriden by experiment selection
-    num_cpus: 15 # Depends on the machine
+    num_cpus: 4 # Depends on the machine (24 CPUs: 2x4=8 training, 4 ToRow, 12 PrePro)
     prepro_cfg: 
       _cls_: ??? # Overriden by experiment selection
       crop_length: 50
