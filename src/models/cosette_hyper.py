@@ -6,60 +6,66 @@ from sklearn.cluster import KMeans
 from torch import nn
 
 # ==========================================
-# Phase 1: Lorentz Manifold Primitives
+# Phase 1: Optimized Lorentz Manifold Primitives
 # ==========================================
 
 def lorentz_inner(u, v):
-    """Computes the Minkowski inner product."""
+    """Optimized: single sum and subtraction"""
     return -u[..., 0] * v[..., 0] + (u[..., 1:] * v[..., 1:]).sum(dim=-1)
 
 def distance_lorentz(x, y):
-    """Computes the hyperbolic distance on the Lorentz manifold."""
     inner = lorentz_inner(x, y)
-    inner = torch.clamp(inner, max=-1.0 - 1e-5) # Prevent NaNs from numerical imprecision
+    inner = torch.clamp(inner, max=-1.0 - 1e-7)
     return torch.acosh(-inner)
 
 def project_to_manifold(x):
-    """Projects a Euclidean vector x in R^d to the Lorentz manifold L^{d+1}."""
-    x_norm_sq = (x ** 2).sum(dim=-1, keepdim=True)
+    """Forced float32 internally to prevent bfloat16 NaN collapse."""
+    x_f = x.float()
+    x_norm_sq = (x_f ** 2).sum(dim=-1, keepdim=True)
     x0 = torch.sqrt(1.0 + x_norm_sq)
-    return torch.cat([x0, x], dim=-1)
+    return torch.cat([x0, x_f], dim=-1).to(x.dtype)
 
 def log_map(x, y):
-    """Logarithmic map: Maps y from the manifold to the tangent space at x."""
     inner = lorentz_inner(x, y)
-    inner = torch.clamp(inner, max=-1.0 - 1e-5)
+    inner = torch.clamp(inner, max=-1.0 - 1e-7)
     dist = torch.acosh(-inner)
     
+    # Taylor expansion fallback for stability to avoid 0/0
     sinh_dist = torch.sinh(dist)
-    scale = torch.where(dist > 1e-5, dist / torch.clamp(sinh_dist, min=1e-5), torch.ones_like(dist))
+    scale = torch.where(dist > 1e-6, dist / torch.clamp(sinh_dist, min=1e-6), 1.0)
     
     v = y + inner.unsqueeze(-1) * x
     return scale.unsqueeze(-1) * v
 
 def exp_map(x, v):
-    """Exponential map: Maps a tangent vector v at x back to the manifold."""
     norm_v_sq = lorentz_inner(v, v)
-    norm_v = torch.sqrt(torch.clamp(norm_v_sq, min=1e-5))
+    norm_v_sq = torch.clamp(norm_v_sq, min=0.0) # Prevent NaNs from fp precision
+    norm_v = torch.sqrt(norm_v_sq)
     
-    scale = torch.where(norm_v_sq > 1e-5, torch.sinh(norm_v) / norm_v, torch.ones_like(norm_v))
+    # Taylor expansion of sinh(x)/x around 0 is 1 + x^2/6
+    scale = torch.where(norm_v > 1e-6, torch.sinh(norm_v) / norm_v, 1.0 + norm_v_sq / 6.0)
     return torch.cosh(norm_v).unsqueeze(-1) * x + scale.unsqueeze(-1) * v
 
 def parallel_transport_to_origin(x, v):
-    """Transports tangent vector v from T_x to the origin O=(1,0,...,0)."""
-    O = torch.zeros_like(x)
-    O[..., 0] = 1.0
-    denom = 1.0 - lorentz_inner(x, O) # <x,O> is -x_0 (which is <= -1), so denom >= 2
-    factor = lorentz_inner(O, v) / denom
-    return v - factor.unsqueeze(-1) * (x + O)
+    """Analytically simplified: No zero-tensors allocated. Fixed sign bug."""
+    x0 = x[..., 0:1]
+    v0 = v[..., 0:1]
+    factor = -v0 / (1.0 + x0)
+    
+    out = v + factor * x
+    out[..., 0:1] += factor # (x + O)_0 is x0 + 1. We add the +1 part here.
+    return out
 
 def parallel_transport_from_origin(x, v):
-    """Transports tangent vector v from the origin T_O to T_x."""
-    O = torch.zeros_like(x)
-    O[..., 0] = 1.0
-    denom = 1.0 - lorentz_inner(O, x)
-    factor = lorentz_inner(x, v) / denom
-    return v - factor.unsqueeze(-1) * (O + x)
+    """Analytically simplified: O -> x transport."""
+    x0 = x[..., 0:1]
+    # v is in T_O, so v_0 is 0. Inner product is just the spatial part.
+    inner_xv = (x[..., 1:] * v[..., 1:]).sum(dim=-1, keepdim=True)
+    factor = inner_xv / (1.0 + x0)
+    
+    out = v + factor * x
+    out[..., 0:1] += factor
+    return out
 
 # ==========================================
 # Standard Modules
@@ -222,31 +228,32 @@ class HyperbolicVectorQuantizer(nn.Module):
         self.initted = True
 
     def forward(self, x_L, use_sk=True):
-        # x_L is on the Lorentz Manifold: [B, d+1]
-        centroids_R = self.embedding.weight # [K, d]
-        centroids_L = project_to_manifold(centroids_R) # [K, d+1]
+        centroids_R = self.embedding.weight 
+        centroids_L = project_to_manifold(centroids_R) 
 
-        # Compute hyperbolic distance matrix
+        # 1. Fast Distance Matrix
+        # Only compute the raw inner product (matrix multiplication is extremely fast on GPUs)
         inner = -x_L[:, 0:1] * centroids_L[:, 0:1].t() + torch.matmul(x_L[:, 1:], centroids_L[:, 1:].t())
-        inner = torch.clamp(inner, max=-1.0 - 1e-5)
-        d = torch.acosh(-inner)
-
+        
         if not use_sk or self.sk_epsilon <= 0:
-            indices = torch.argmin(d, dim=-1)
+            # OPTIMIZATION: Minimizing acosh(-inner) is identical to maximizing inner.
+            indices = torch.argmax(inner, dim=-1)
+            d = -inner # Proxy distance to maintain API output
         else:
+            d = torch.acosh(torch.clamp(-inner, max=-1.0 - 1e-5))
             d_centered = VectorQuantizer.center_distance_for_constraint(d)
             Q = sinkhorn_algorithm(d_centered.double(), self.sk_epsilon, self.sk_iters)
             indices = torch.argmax(Q, dim=-1)
 
-        c1_R = self.embedding(indices) # [B, d]
-        c1 = project_to_manifold(c1_R) # [B, d+1]
+        c1_R = self.embedding(indices) 
+        c1 = project_to_manifold(c1_R) 
         
-        # Calculate Target Residual for subsequent Euclidean VQs
-        v_target = log_map(c1, x_L) # Tangent space log map
+        # 2. Tangent Extraction
+        v_target = log_map(c1, x_L) 
         r_target_L = parallel_transport_to_origin(c1, v_target)
-        r_target_E = r_target_L[:, 1:] # Drop 0th dimension -> exact R^d residual
+        r_target_E = r_target_L[:, 1:] 
 
-        # Codebook and Commitment Losses
+        # 3. Exact Codebook Losses (Computed ONLY for the 1 selected centroid, not all 256)
         commitment_loss = distance_lorentz(x_L.detach(), c1).mean()
         codebook_loss = distance_lorentz(x_L, c1.detach()).mean()
         loss = codebook_loss + self.beta * commitment_loss
