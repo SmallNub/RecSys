@@ -25,4 +25,4 @@ model_folder_tplt: ${.root}/models/
 # Logging project
 wandb_project_name: cosette-and-marius
 wandb_entity: esearch
-wandb_mode: offline
+wandb_mode: online
