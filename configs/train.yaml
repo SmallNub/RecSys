@@ -57,7 +57,7 @@ model: # Lightning Module for Training
 ray: 
   scaling_config:
     _target_: ray.train.ScalingConfig
-    num_workers: 2
+    num_workers: 1 # HARDCODED
     use_gpu: True
     resources_per_worker:
       CPU: 4 # The rest is handled by Ray Data (24 CPUs: 2x4=8 training, 16 for pipeline)
