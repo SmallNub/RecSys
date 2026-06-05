@@ -20,7 +20,7 @@ source activate recsys
 
 export PYTHONPATH=/gpfs/home4/scur1207/RecSys:$PYTHONPATH
 
-python data_scripts/2_train_cosette.py \
-  data.category=Beauty optim.batch_size=256 optim.epochs=500 optim.eval_step=100 optim.dropout_prob=0.1
+# python data_scripts/2_train_cosette.py \
+#   data.category=Beauty optim.batch_size=256 optim.epochs=500 optim.eval_step=100 optim.dropout_prob=0.1
 
 python data_scripts/3_remove_colisions.py data.category=Beauty

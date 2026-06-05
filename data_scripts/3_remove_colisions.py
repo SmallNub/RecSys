@@ -1,7 +1,9 @@
 import collections
 import copy
+import os
 from collections import defaultdict
 from pathlib import Path
+from datetime import datetime
 
 import fsspec
 import hydra
@@ -27,15 +29,30 @@ def partition_list(lst, partition_sizes):
     return partitions
 
 
-def find_latest_quant_method(base_dir: str, category: str):
-    base = Path(base_dir)
-    runs = [d for d in base.iterdir() if d.is_dir() and category in d.name]
+def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y-%m-%d_%H-%M-%S") -> Path:
+    """
+    Finds the directory with the latest timestamp name inside base_dir_path.
 
-    if not runs:
-        raise ValueError(f"No runs found in {base_dir} for category {category}")
+    :param base_dir_path: The root directory to search inside.
+    :param timestamp_format: The datetime format string matching your folder names.
+    :return: Path object of the latest timestamp directory, or None if none found.
+    """
+    base_dir = Path(base_dir_path)
+    latest_dir = None
+    latest_time = None
 
-    latest_run = max(runs, key=lambda d: d.name)
-    return latest_run.name
+    for entry in base_dir.iterdir():
+        if entry.is_dir():
+            try:
+                folder_time = datetime.strptime(entry.name, timestamp_format)
+
+                if latest_time is None or folder_time > latest_time:
+                    latest_time = folder_time
+                    latest_dir = entry
+            except ValueError:
+                continue
+
+    return latest_dir
 
 
 def check_collision(all_indices_tup):
@@ -71,7 +88,7 @@ def main(config):
     patch_fsspec()
     fs = fsspec.filesystem(config.paths.protocol)
 
-    quant_method = find_latest_quant_method(config.paths.ckpt_dir, config.data.category)
+    quant_method = os.path.join(get_latest_timestamp_dir(config.paths.ckpt_dir), "last_model.pth")
     print(f"Using quant method: {quant_method}")
 
     embeddings_path = config.paths.embeddings_tplt.format(

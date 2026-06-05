@@ -77,7 +77,7 @@ class Trainer(object):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.ckpt_dir = config.ckpt_dir  # Local /tmp, will be uploaded after training.
-        self.local_dir = os.path.join(self.ckpt_dir, str(uuid4()))
+        self.local_dir = self.ckpt_dir
         os.makedirs(self.local_dir)
 
         self.last_ckpt = "last_model.pth"
