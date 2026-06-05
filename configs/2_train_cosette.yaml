@@ -38,6 +38,6 @@ data:
   emb_method: sentence-t5-xl
 
 num_gpus: 1
-ckpt_dir:  /tmp/cosette
+ckpt_dir:  cosette/checkpoints
 
 marker: null

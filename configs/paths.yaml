@@ -23,6 +23,6 @@ semantic_model_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_met
 # Model outputs
 model_folder_tplt: ${.root}/models/
 # Logging project
-wandb_project_name: cosette-and-marius
-wandb_entity: esearch
+wandb_project_name: recsys
+wandb_entity: smallnub
 wandb_mode: online
