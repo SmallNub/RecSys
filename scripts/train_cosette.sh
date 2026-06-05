@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=process_data
-#SBATCH --output=scripts/slurm/process_data_%j.log
-#SBATCH --error=scripts/slurm/process_data_%j.err
+#SBATCH --job-name=train_cosette
+#SBATCH --output=scripts/slurm/train_cosette%j.log
+#SBATCH --error=scripts/slurm/train_cosette%j.err
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
