@@ -1,10 +1,14 @@
 # @package paths
 
-protocol: viewfs # or something supported by fsspec.filesystem (eg: file)
-# Base folder
-root: /user/${oc.env:USER}/cosette_and_marius
-# Temporary folder for Git LFS Files
-tmp_lfs_folder: /tmp/AmazonReviews2023
+protocol: file
+# Base folder — resolves to <project_root>/datasets/ wherever the script is run from
+root: ${oc.env:PWD}/datasets
+# Folder where Amazon-Reviews-2023 was downloaded via HuggingFace
+hf_data_folder: ${.root}/amazon-2023
+# Folder where Amazon-Reviews-2014 raw files live (Beauty_5.json, meta_Beauty.json, ...)
+hf_data_folder_2014: ${.root}/amazon-2014
+# Set to true to skip downloading (data already present in hf_data_folder)
+skip_download: false
 # Raw ratings and IDs
 timelines_tplt: ${.root}/data/timelines/{category}.{split}.parquet
 # Raw metadata
@@ -19,4 +23,6 @@ semantic_model_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_met
 # Model outputs
 model_folder_tplt: ${.root}/models/
 # Logging project
-wandb_project_name: cosette_and_marius
+wandb_project_name: cosette-and-marius
+wandb_entity: esearch
+wandb_mode: offline

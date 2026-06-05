@@ -317,7 +317,7 @@ class DataLoader:
             batch_size=1,
             shuffle=False,
             drop_last=False,
-            num_workers=11,
+            num_workers=4,
             persistent_workers=True,
             pin_memory=True,
             in_order=False,
@@ -385,7 +385,7 @@ def make_name(config):
     return name
 
 
-@ray.remote(num_gpus=1, num_cpus=10)
+@ray.remote(num_cpus=8)
 def make_cosette_embs(config):
     config.ckpt_dir = os.path.join(config.ckpt_dir, uuid4().hex)
 
@@ -452,6 +452,8 @@ def make_cosette_embs(config):
     wandb.login()
     wandb.init(
         project=config.paths.wandb_project_name,
+        entity=config.paths.wandb_entity,
+        mode=config.paths.wandb_mode,
         config=OmegaConf.to_container(config, resolve=True),
         name=quant_method,
     )
@@ -475,8 +477,10 @@ def make_cosette_embs(config):
 
 @hydra.main(config_path="../configs", config_name="2_train_cosette", version_base="1.2")
 def main(config):
-    ray.init()
-    ray.get(make_cosette_embs.remote(config))
+    import torch
+    num_gpus = config.get("num_gpus", 1)
+    ray.init(num_gpus=torch.cuda.device_count())
+    ray.get(make_cosette_embs.options(num_gpus=num_gpus).remote(config))
 
 
 if __name__ == "__main__":

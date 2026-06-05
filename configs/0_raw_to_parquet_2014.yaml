@@ -1,0 +1,13 @@
+defaults:
+- _self_
+- paths
+- disable_hydra_dirs
+
+dataset_year: 2014
+
+categories:
+- Beauty
+# - Sports_and_Outdoors
+# - Toys_and_Games
+# - Movies_and_TV
+# - Video_Games

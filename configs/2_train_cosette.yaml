@@ -9,9 +9,9 @@ optim:
   beta2: 0.99
   use_scheduler: true 
   weight_decay: 0 
-  dropout_prob: 0.05
-  batch_size: 1024
-  epochs: 3125 # 192 steps/epochs on Arts -> 3125 epochs = 600k steps, adapt to category.
+  dropout_prob: 0.1
+  batch_size: 256
+  epochs: 500 # 192 steps/epochs on Arts -> 3125 epochs = 600k steps, adapt to category.
   eval_step: 100
 
 centroids: 
@@ -34,9 +34,10 @@ loss:
   sequence_length: 20
 
 data:
-  category: Arts_Crafts_and_Sewing
+  category: Video_Games
   emb_method: sentence-t5-xl
 
-ckpt_dir: /tmp/cosette
+num_gpus: 1
+ckpt_dir: /data/ebay-slc-a100/notebooks/udthakur/cosette_and_marius/output/cosette
 
 marker: null
