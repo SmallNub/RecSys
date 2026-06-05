@@ -18,24 +18,35 @@ export $(cat .env | xargs)
 export RAY_TRAIN_V2_ENABLED=1
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-COSETTE_TIMESTAMP="20260605_193615"
+# Change here for new runs
 CATEGORY="Beauty"
-QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 EXPERIMENT="marius_small"
+
+COSETTE_BASE_DIR="outputs/checkpoints/cosette"
+LATEST_COSETTE_DIR=$(ls -1d ${COSETTE_BASE_DIR}/*/ 2>/dev/null | sort | tail -n 1)
+
+if [ -z "$LATEST_COSETTE_DIR" ]; then
+    echo "Error: No timestamp directory found inside $COSETTE_BASE_DIR"
+    exit 1
+fi
+
+COSETTE_TIMESTAMP=$(basename ${LATEST_COSETTE_DIR})
+echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
+
+QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
 python src/train.py experiment=${EXPERIMENT} \
     data.ray_datasets.category=${CATEGORY} data.ray_datasets.quant_id=${QUANT}-col
 
-BASE_DIR="outputs/checkpoints/marius"
+MARIUS_BASE_DIR="outputs/checkpoints/marius"
+LATEST_MARIUS_RUN=$(ls -1d ${MARIUS_BASE_DIR}/${EXPERIMENT}_*/ 2>/dev/null | sort | tail -n 1)
 
-LATEST_RUN=$(ls -1d ${BASE_DIR}/${EXPERIMENT}_*/ 2>/dev/null | sort | tail -n 1)
-
-if [ -z "$LATEST_RUN" ]; then
-    echo "Error: No timestamp directory found for experiment '${EXPERIMENT}' in $BASE_DIR"
+if [ -z "$LATEST_MARIUS_RUN" ]; then
+    echo "Error: No timestamp directory found for experiment '${EXPERIMENT}' in $MARIUS_BASE_DIR"
     exit 1
 fi
 
-RUN=${LATEST_RUN}
+RUN=${LATEST_MARIUS_RUN}
 echo "Running evaluation on latest experiment directory: ${RUN}"
 
 python src/test.py run_directory=${RUN}
