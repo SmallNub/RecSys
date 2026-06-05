@@ -380,7 +380,7 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
 
 
 def make_name(config, timestamp):
-    name = f"COSETTE_{config.model.layers[-1]}d_{config.centroids.n_centroids_list[-1]}x{len(config.centroids.n_centroids_list)}_{config.data.category}_{timestamp}"
+    name = f"COSETTE_{config.data.category}_{timestamp}"
     if config.marker is not None:
         name += f"_{config.marker}"
     return name

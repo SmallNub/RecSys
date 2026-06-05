@@ -36,10 +36,8 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d
     base_dir = Path(base_dir_path)
     latest_dir = None
     latest_time = None
-    print("a", base_dir)
 
     for entry in base_dir.iterdir():
-        print("b", entry)
         if entry.is_dir():
             try:
                 folder_time = datetime.strptime(entry.name, timestamp_format)
@@ -49,7 +47,6 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d
                     latest_dir = entry
             except ValueError:
                 continue
-    print("c", latest_dir)
     return latest_dir
 
 
@@ -86,7 +83,7 @@ def main(config):
     patch_fsspec()
     fs = fsspec.filesystem(config.paths.protocol)
 
-    quant_method = os.path.join(get_latest_timestamp_dir(config.paths.ckpt_dir), "last_model.pth")
+    quant_method = f"COSETTE_{config.data.category}_{get_latest_timestamp_dir(config.paths.ckpt_dir).name}"
     print(f"Using quant method: {quant_method}")
 
     embeddings_path = config.paths.embeddings_tplt.format(
