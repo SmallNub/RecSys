@@ -3,7 +3,7 @@
 #SBATCH --output=scripts/slurm/process_data_%j.log
 #SBATCH --error=scripts/slurm/process_data_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --partition=gpu_a100
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
