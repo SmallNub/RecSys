@@ -27,11 +27,6 @@ class LitModule(LightningModule):
         return self.full_hydra_config.data.datasets.category
 
     def training_step(self, batch, batch_idx):
-        # Check if the entire batch is padding before calling the model
-        targets = batch["target"]
-        if (targets[:, :, 0] == -100).all():
-            return None  # PyTorch Lightning safely skips optimization for this step!
-
         loss, _ = self.net.get_loss(batch)
 
         self.log(

@@ -194,61 +194,55 @@ class MARIUS(torch.nn.Module):
         B, L, _ = input.shape
         device = input.device
         
-        # 1. Map history sequentially under a strict temporal causal mask
+        # 1. Process history sequentially through the temporal transformer (Fully Graded)
         temporal_tokens = self.temporal_forward(input) # (B, L, d_model)
         mid_tokens = self.mid_proj(temporal_tokens)    # (B, L, d_model)
 
-        # 2. Randomly select an interaction index per batch element to form pairs
-        # Needs at least 1 valid history token to flow from, and 1 next item target
-        valid_indices = []
-        chosen_positions = []
-        
-        for b in range(B):
-            # Locate active unpadded entries
-            valid_len = (input[b, :, 0] != SpecialTokens.PAD.value).sum().item()
-            # Also ensure target isn't an ignored flag
-            valid_targets = torch.where(target[b, :, 0] != -100)[0]
-            
-            # Intersection of existing steps and real targets
-            possible_idx = [idx for idx in range(valid_len) if idx in valid_targets]
-            
-            if len(possible_idx) > 0:
-                pos = float(torch.randint(0, len(possible_idx), (1,)).item())
-                chosen_positions.append(possible_idx[int(pos)])
-                valid_indices.append(b)
-                
-        if len(valid_indices) == 0:
-            # Fallback if batch contains only padding junk
-            return torch.zeros((1, self.depth_cfg.d_model), device=device), torch.zeros((1, self.depth_cfg.d_model), device=device)
+        # 2. Get embeddings for the source items (x_0) and target items (x_1) across the entire sequence
+        x_0 = self.depth_emb(input).sum(dim=-2)   # (B, L, d_model)
+        x_1 = self.depth_emb(target).sum(dim=-2)  # (B, L, d_model)
 
-        # Squeeze batch data down to only valid parsed entries
-        valid_b = torch.tensor(valid_indices, device=device)
-        valid_l = torch.tensor(chosen_positions, device=device)
+        # 3. Sample unique random flow values (t) for EVERY element in the batch and sequence dimension
+        # Shape: (B, L, 1) so it broadcasts perfectly with our sequence vectors
+        t = torch.rand((B, L, 1), device=device)
 
-        # Extract context representing history up to step l
-        mid_tokens_sampled = mid_tokens[valid_b, valid_l] # (N, d_model)
-
-        # Pull item tokens
-        input_sampled = input[valid_b, valid_l]   # (N, K) -> Item at t=0
-        target_sampled = target[valid_b, valid_l] # (N, K) -> Next item at t=1
-
-        x_0 = self.depth_emb(input_sampled).sum(dim=1)
-        x_1 = self.depth_emb(target_sampled).sum(dim=1)
-
-        # 3. Continuous Integration Mechanics
-        t_flat = torch.rand((x_0.shape[0], 1), device=device)
-
-        # Flow straight path setups
-        x_t = t_flat * x_1 + (1.0 - t_flat) * x_0
+        # 4. Construct the path trajectory across the whole grid
+        x_t = t * x_1 + (1.0 - t) * x_0
         target_velocity = x_1 - x_0
 
-        v_pred = self.depth_forward(x_t, t_flat, mid_tokens_sampled)
+        # Flatten out spatial grids to feed into our velocity neural field
+        x_t_flat = rearrange(x_t, "b l d -> (b l) d")
+        t_flat = rearrange(t, "b l 1 -> (b l) 1")
+        mid_tokens_flat = rearrange(mid_tokens, "b l d -> (b l) d")
+
+        # 5. Predict our trajectories 
+        v_pred_flat = self.depth_forward(x_t_flat, t_flat, mid_tokens_flat)
+        v_pred = rearrange(v_pred_flat, "(b l) d -> b l d", b=B, l=L)
+        
         return v_pred, target_velocity
 
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
         v_pred, target_velocity = self.train_forward(input, target)
-        loss = self.criterion(v_pred, target_velocity)
+        
+        # Calculate raw element-wise MSE loss
+        raw_loss = (v_pred - target_velocity) ** 2 # (B, L, d_model)
+        
+        # Build a hard mask to locate padding elements (-100 values)
+        # 1.0 for valid real pairs, 0.0 for padding junk
+        loss_mask = (target[:, :, 0] != -100).float().unsqueeze(-1) # (B, L, 1)
+        
+        # Suppress any loss calculations tied to padding blocks
+        masked_loss = raw_loss * loss_mask
+        
+        # Calculate true final mean, ignoring the zeroed out masked zones
+        num_valid_elements = loss_mask.sum()
+        if num_valid_elements > 0:
+            loss = masked_loss.sum() / (num_valid_elements * self.depth_cfg.d_model)
+        else:
+            # If the entire batch is somehow padding, create a zero loss tied to the graph 
+            loss = v_pred.sum() * 0.0
+            
         return loss, v_pred
 
     def search(self, batch, n_results):
