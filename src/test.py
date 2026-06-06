@@ -13,6 +13,7 @@ FILENAMES = {
     "metrics": "metrics.pkl",
     "config": "config.yaml",
     "checkpoint": "checkpoint.ckpt",
+    "snapshot": "checkpoint_manager_snapshot.json",
 }
 
 
@@ -27,7 +28,20 @@ def get_top_cfg(fs, config):
         cfg = OmegaConf.load(f)
     print(cfg.data)
 
-    best_checkpoint = os.path.join(root, FILENAMES["checkpoint"])
+    snapshot_path = os.path.join(root, FILENAMES["snapshot"])
+
+    if fs.exists(snapshot_path):
+        with fs.open(snapshot_path, "r") as f:
+            snapshot_data = json.load(f)
+
+        latest_dir_name = snapshot_data["latest_checkpoint_result"]["checkpoint_dir_name"]
+        print(f"[INFO] Found latest sub-checkpoint from snapshot: {latest_dir_name}")
+
+        best_checkpoint = os.path.join(root, latest_dir_name, FILENAMES["checkpoint"])
+    else:
+        print(f"[WARNING] {FILENAMES['snapshot']} not found in {root}. Falling back to root directory.")
+        best_checkpoint = os.path.join(root, FILENAMES["checkpoint"])
+
     return cfg, best_checkpoint
 
 
