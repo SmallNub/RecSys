@@ -23,6 +23,6 @@ semantic_model_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_met
 # Model outputs
 model_folder_tplt: ${oc.env:PWD}/outputs/checkpoints/marius
 # Logging project
-wandb_project_name: recsys
-wandb_entity: smallnub
-wandb_mode: offline
+wandb_project_name: RecSys
+wandb_entity: smallnub-university-of-amsterdam
+wandb_mode: online
