@@ -20,27 +20,47 @@ FILENAMES = {
 def get_top_cfg(fs, config):
     print(f"[STEP] Loading from {config.run_directory}")
 
+    # This is: outputs/checkpoints/marius/MARIUS_small_2026-06-05_21-10-57
     root = os.path.join(config.paths.model_folder_tplt, config.run_directory)
 
-    # Get a config file to look for a best metric
-    cfg_path = os.path.join(root, FILENAMES["config"])
-    with fs.open(cfg_path) as f:
-        cfg = OmegaConf.load(f)
-    print(cfg.data)
-
+    # 1. Look for the snapshot registry file directly in the root folder
     snapshot_path = os.path.join(root, FILENAMES["snapshot"])
 
     if fs.exists(snapshot_path):
         with fs.open(snapshot_path, "r") as f:
             snapshot_data = json.load(f)
 
+        # Pull the exact folder name designated as the latest checkpoint
         latest_dir_name = snapshot_data["latest_checkpoint_result"]["checkpoint_dir_name"]
         print(f"[INFO] Found latest sub-checkpoint from snapshot: {latest_dir_name}")
 
-        best_checkpoint = os.path.join(root, latest_dir_name, FILENAMES["checkpoint"])
+        # Target directory becomes: root/checkpoint_2026-06-05_22-02-14.786737
+        target_dir = os.path.join(root, latest_dir_name)
     else:
-        print(f"[WARNING] {FILENAMES['snapshot']} not found in {root}. Falling back to root directory.")
-        best_checkpoint = os.path.join(root, FILENAMES["checkpoint"])
+        # Fallback: If snapshot JSON doesn't exist, search for any "checkpoint_*" directory inside root
+        print(f"[WARNING] {FILENAMES['snapshot']} not found at {root}. Searching for sub-directories...")
+        try:
+            subdirs = [os.path.basename(x.rstrip('/')) for x in fs.glob(os.path.join(root, "checkpoint_*"))]
+            if subdirs:
+                latest_dir_name = sorted(subdirs)[-1]
+                print(f"[INFO] Fallback selected latest sub-directory: {latest_dir_name}")
+                target_dir = os.path.join(root, latest_dir_name)
+            else:
+                target_dir = root
+        except Exception as e:
+            print(f"[WARNING] Could not list subdirectories: {e}")
+            target_dir = root
+
+    # 2. Now load config.yaml from inside the correct sub-directory
+    cfg_path = os.path.join(target_dir, FILENAMES["config"])
+    print(f"[INFO] Attempting to load config from: {cfg_path}")
+
+    with fs.open(cfg_path) as f:
+        cfg = OmegaConf.load(f)
+    print(cfg.data)
+
+    # 3. Define the path to checkpoint.ckpt inside the sub-directory
+    best_checkpoint = os.path.join(target_dir, FILENAMES["checkpoint"])
 
     return cfg, best_checkpoint
 
