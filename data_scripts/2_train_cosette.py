@@ -1,4 +1,3 @@
-# From MQL4GRec
 import logging
 import os
 import random
@@ -75,9 +74,9 @@ class Trainer(object):
         self.eval_step = min(config.optim.eval_step, self.epochs)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.ckpt_dir = config.ckpt_dir  # Local /tmp, will be uploaded after training.
+        self.ckpt_dir = config.ckpt_dir  
         self.local_dir = self.ckpt_dir
-        os.makedirs(self.local_dir)
+        os.makedirs(self.local_dir, exist_ok=True)
 
         self.last_ckpt = "last_model.pth"
 
@@ -96,7 +95,6 @@ class Trainer(object):
         def _select(n):
             return "embedding" in n or "siglip" in n
 
-        # No weight_decay
         no_wd_group = {
             "params": [
                 p
@@ -105,7 +103,6 @@ class Trainer(object):
             ],
             "weight_decay": 0.0,
         }
-        # All other parameters
         other_params = {
             "params": [
                 p
@@ -131,13 +128,21 @@ class Trainer(object):
     def _train_epoch(self, train_data, epoch_idx):
         self.model.train()
 
+        # Dynamic Curvature Annealing Calculations (10% of total epochs window)
+        anneal_period = max(1, int(self.epochs * 0.10))
+        if epoch_idx < anneal_period:
+            # Linear scaling from flat 0.01 up to fully hyperbolic 1.0
+            c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
+        else:
+            c = 1.0
+
         total_loss = 0
         iter_data = (
             tqdm(
                 train_data,
                 total=len(train_data),
                 ncols=100,
-                desc=f"Train {epoch_idx}",
+                desc=f"Train {epoch_idx} (c={c:.4f})",
             )
             if self.config.loss.contrastive_weight > 0
             else tqdm(range(len(train_data)))
@@ -154,7 +159,8 @@ class Trainer(object):
 
             self.optimizer.zero_grad()
 
-            loss, b_metrics = self.model.training_loss(**data)
+            # Passing our active curvature variable directly into the loss calculator
+            loss, b_metrics = self.model.training_loss(**data, c=c)
 
             self._check_nan(loss)
             loss.backward()
@@ -173,8 +179,7 @@ class Trainer(object):
         self.model.eval()
 
         indices_list = []
-        indices, _ = self.model.get_indices()
-        # Indices : B x L
+        indices, _ = self.model.get_indices(c=1.0) # Always inspect fully curved space properties
         for index in indices:
             code = tuple(index.cpu().numpy().tolist())
             indices_list.append(code)
@@ -233,7 +238,6 @@ class Trainer(object):
                 }
             )
 
-            # eval
             if (epoch_idx + 1) % self.eval_step == 0:
                 print("=" * 100)
                 print(">>>> EVALUATING <<<<")
@@ -283,20 +287,17 @@ class _Dataset(torch.utils.data.IterableDataset):
 
         self._indices = np.random.permutation(len(self.timelines))
 
-        for i in range(L):  # Shared across workers
+        for i in range(L):  
             yield self.__make_batch(i)
 
     def __make_batch(self, i):
         sel_indices = self._indices[i * self.bs : (i + 1) * self.bs]
 
-        # Crop
         sel_timelines = self.timelines[sel_indices]
-        # %timeit _ = self.timelines[sel_indices] # 2µs
         sel_timelines = np.array([self._to_size(t) for t in sel_timelines])
 
-        # Unique items
-        all_items = np.unique(np.concatenate(sel_timelines))  # Sorted
-        if all_items[0] == -1:  # Remove the padding item
+        all_items = np.unique(np.concatenate(sel_timelines))  
+        if all_items[0] == -1:  
             all_items = all_items[1:]
 
         return {
@@ -320,10 +321,9 @@ class DataLoader:
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
-            in_order=False,
         )
 
-    def _collate_fn(self, batch):  # No batching, already done by the workers
+    def _collate_fn(self, batch):  
         assert len(batch) == 1, "Batch size should be 1"
         return batch[0]
 
@@ -351,7 +351,7 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
     )
 
     print("Forward.")
-    indices, _ = model.get_indices(use_sk=False)
+    indices, _ = model.get_indices(use_sk=False, c=1.0) # Export final vectors with true curvature
     indices = indices.cpu().numpy().astype(np.int32)
 
     print("Preparing dataframe.")
@@ -366,20 +366,20 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
     quant_df.to_parquet(quantized_path, filesystem=filesystem)
 
     sd = model.state_dict()
-    del sd["embeddings"]  # Don't save the entire embedding table...
+    del sd["embeddings"]  
     with fs.open(model_path, "wb") as f:
         torch.save(
             {
                 "config": config,
                 "state_dict": sd,
-                "epoch": config.optim.epochs,  # Last epoch.
+                "epoch": config.optim.epochs,  
             },
             f,
         )
 
 
 def make_name(config, timestamp):
-    name = f"COSETTE_{config.data.category}_{timestamp}"
+    name = f"COSETTE_HYPER_SIGLIP_{config.data.category}_{timestamp}"
     if config.marker is not None:
         name += f"_{config.marker}"
     return name
@@ -387,11 +387,8 @@ def make_name(config, timestamp):
 
 def make_cosette_embs(config):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
     config.ckpt_dir = os.path.join(config.ckpt_dir, timestamp)
 
-    # Input paths
     embeddings_path = config.paths.embeddings_tplt.format(
         emb_method=config.data.emb_method, category=config.data.category
     )
@@ -408,7 +405,6 @@ def make_cosette_embs(config):
     embeddings_df = pd.read_parquet(embeddings_path, filesystem=fs)
     train_timelines = pd.read_parquet(train_timelines_path, filesystem=fs)
 
-    # Order the rows of the embeddings dataframe
     embeddings_df.set_index("product_id", inplace=True)
     embeddings_df = embeddings_df.loc[items]
     embs_block = torch.from_numpy(
@@ -426,11 +422,9 @@ def make_cosette_embs(config):
 
     model = COSETTE(
         embs_block=embs_block,
-        # Model
         in_dim=embs_block.shape[-1],
         layers=config.model.layers,
         dropout_prob=config.optim.dropout_prob,
-        # Loss
         loss_weights={
             "quantization": 1,
             "reconstruction": config.loss.reconstruction_weight,
@@ -440,7 +434,6 @@ def make_cosette_embs(config):
         bias=config.loss.bias,
         freeze_tau=config.loss.freeze_tau,
         freeze_bias=config.loss.freeze_bias,
-        # Cluster assignment
         n_centroids_list=config.centroids.n_centroids_list,
         kmeans_init=config.centroids.kmeans_init,
         kmeans_iters=config.centroids.kmeans_iters,
@@ -479,14 +472,6 @@ def make_cosette_embs(config):
 
 @hydra.main(config_path="../configs", config_name="2_train_cosette", version_base="1.2")
 def main(config):
-    import torch
-    api_key = os.getenv("WANDB_API_KEY")
-    runtime_env = {
-        "env_vars": {
-            "WANDB_API_KEY": api_key if api_key else ""
-        }
-    }
-    num_gpus = config.get("num_gpus", 1)
     make_cosette_embs(config)
 
 

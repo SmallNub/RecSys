@@ -4,7 +4,7 @@ defaults:
 - disable_hydra_dirs
 
 optim: 
-  lr: 1e-3
+  lr: 3e-4
   warmup: 100
   beta2: 0.99
   use_scheduler: true 
@@ -28,7 +28,7 @@ loss:
   reconstruction_weight: 1.0
   contrastive_weight: 0.001
   tau: 2 
-  bias: -8
+  bias: 0.0
   freeze_tau: false 
   freeze_bias: false
   sequence_length: 20

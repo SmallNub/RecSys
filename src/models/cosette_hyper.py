@@ -18,9 +18,12 @@ def distance_lorentz(x, y):
     inner = torch.clamp(inner, max=-1.0 - 1e-7)
     return torch.acosh(-inner)
 
-def project_to_manifold(x):
-    """Forced float32 internally to prevent bfloat16 NaN collapse."""
+def project_to_manifold(x, c=1.0):
+    """Forced float32 internally to prevent bfloat16 NaN collapse. 
+    Supports curvature annealing by scaling coordinates by sqrt(c)."""
     x_f = x.float()
+    if c != 1.0:
+        x_f = x_f * torch.sqrt(torch.tensor(c, dtype=torch.float32, device=x.device))
     x_norm_sq = (x_f ** 2).sum(dim=-1, keepdim=True)
     x0 = torch.sqrt(1.0 + x_norm_sq)
     return torch.cat([x0, x_f], dim=-1).to(x.dtype)
@@ -227,18 +230,16 @@ class HyperbolicVectorQuantizer(nn.Module):
         self.embedding.weight.data.copy_(centers)
         self.initted = True
 
-    def forward(self, x_L, use_sk=True):
+    def forward(self, x_L, use_sk=True, c=1.0):
         centroids_R = self.embedding.weight 
-        centroids_L = project_to_manifold(centroids_R) 
+        centroids_L = project_to_manifold(centroids_R, c=c) 
 
-        # 1. Fast Distance Matrix
-        # Only compute the raw inner product (matrix multiplication is extremely fast on GPUs)
+        # 1. Fast Distance Matrix Matrix Multiplications
         inner = -x_L[:, 0:1] * centroids_L[:, 0:1].t() + torch.matmul(x_L[:, 1:], centroids_L[:, 1:].t())
         
         if not use_sk or self.sk_epsilon <= 0:
-            # OPTIMIZATION: Minimizing acosh(-inner) is identical to maximizing inner.
             indices = torch.argmax(inner, dim=-1)
-            d = -inner # Proxy distance to maintain API output
+            d = -inner 
         else:
             d = torch.acosh(torch.clamp(-inner, max=-1.0 - 1e-5))
             d_centered = VectorQuantizer.center_distance_for_constraint(d)
@@ -246,14 +247,14 @@ class HyperbolicVectorQuantizer(nn.Module):
             indices = torch.argmax(Q, dim=-1)
 
         c1_R = self.embedding(indices) 
-        c1 = project_to_manifold(c1_R) 
+        c1 = project_to_manifold(c1_R, c=c) 
         
         # 2. Tangent Extraction
         v_target = log_map(c1, x_L) 
         r_target_L = parallel_transport_to_origin(c1, v_target)
         r_target_E = r_target_L[:, 1:] 
 
-        # 3. Exact Codebook Losses (Computed ONLY for the 1 selected centroid, not all 256)
+        # 3. Exact Manifold Codebook Losses
         commitment_loss = distance_lorentz(x_L.detach(), c1).mean()
         codebook_loss = distance_lorentz(x_L, c1.detach()).mean()
         loss = codebook_loss + self.beta * commitment_loss
@@ -262,7 +263,7 @@ class HyperbolicVectorQuantizer(nn.Module):
 
 
 class HyperbolicResidualVectorQuantizer(nn.Module):
-    """Hybird RVQ: L1 = Lorentz, L2..N = Tangent Euclidean"""
+    """Hybrid RVQ: L1 = Lorentz, L2..N = Tangent Euclidean"""
     def __init__(self, n_centroids_list, centroids_dim, sk_epsilons, kmeans_init=False, kmeans_iters=100, sk_iters=100):
         super().__init__()
         self.n_centroids_list = n_centroids_list
@@ -287,15 +288,15 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
             all_codebook.append(quantizer.get_codebook())
         return torch.stack(all_codebook)
 
-    def forward(self, x, use_sk=True):
+    def forward(self, x, use_sk=True, c=1.0):
         if not self.hyp_vq.initted and self.training:
             self.hyp_vq.init_emb(x)
 
-        # 1. Project base Euclidean vector onto Lorentz Manifold
-        x_L = project_to_manifold(x)
+        # 1. Project base Euclidean vector onto Lorentz Manifold with curvature c
+        x_L = project_to_manifold(x, c=c)
         
         # 2. Hyperbolic Root Tokenization
-        c1, residual_E, loss0, idx0, d0 = self.hyp_vq(x_L, use_sk=use_sk)
+        c1, residual_E, loss0, idx0, d0 = self.hyp_vq(x_L, use_sk=use_sk, c=c)
         
         all_losses = [loss0]
         all_indices = [idx0]
@@ -327,11 +328,11 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         all_indices = torch.stack(all_indices, dim=-1)
         all_distances = torch.stack(all_distances, dim=1)
 
-        return x_q, mean_losses, all_indices, all_distances
+        return x_q, mean_losses, all_indices, all_distances, x_q_L
 
 
 # ==========================================
-# Wrapping it up in COSETTE
+# Native Hyperbolic SigLIP Contrastive Loss
 # ==========================================
 
 class SigLIPLoss(torch.nn.Module):
@@ -352,10 +353,15 @@ class SigLIPLoss(torch.nn.Module):
         loss = -(logsig.sum(dim=1) / (mask == 1).sum(dim=1)).mean()
         return loss
 
-    def forward(self, xa, xb, items, timelines):
-        xa = F.normalize(xa, dim=-1)
-        xb = F.normalize(xb, dim=-1)
-        logits = torch.mm(xa, xb.T) * self.tau.exp() + self.bias
+    def forward(self, xa_L, xb_L, items, timelines):
+        """Processes contrastive alignment entirely using native Lorentz distance."""
+        # Pairwise Lorentz Inner Product Matrix
+        inner = -xa_L[:, 0:1] * xb_L[:, 0:1].t() + torch.matmul(xa_L[:, 1:], xb_L[:, 1:].t())
+        inner = torch.clamp(inner, max=-1.0 - 1e-7)
+        dist = torch.acosh(-inner)
+        
+        # Negative Hyperbolic distance represents similarity bounds
+        logits = -dist * self.tau.exp() + self.bias
         loss = self._siglip_loss(logits, items, timelines)
         return loss
 
@@ -381,7 +387,6 @@ class COSETTE(torch.nn.Module):
         self.encoder = MLPLayers(layers=self.encode_layer_dims, dropout=self.dropout)
         self.decoder = MLPLayers(layers=self.decode_layer_dims, dropout=self.dropout)
 
-        # Replaced standard RVQ with the new Hyperbolic RVQ
         self.rq = HyperbolicResidualVectorQuantizer(
             n_centroids_list=self.n_centroids_list,
             centroids_dim=self.centroids_dim,
@@ -395,7 +400,7 @@ class COSETTE(torch.nn.Module):
             self.siglip = SigLIPLoss(tau=tau, bias=bias, freeze_tau=freeze_tau, freeze_bias=freeze_bias)
 
     @torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
-    def training_loss(self, items, timelines):
+    def training_loss(self, items, timelines, c=1.0):
         loss = 0.0
         metrics = defaultdict(float)
 
@@ -404,7 +409,7 @@ class COSETTE(torch.nn.Module):
             embeddings = F.embedding(idxs, self.embeddings)
             x = self.encoder(embeddings)
             
-            x_q, rq_loss, _, _ = self.rq(x, use_sk=True)
+            x_q, rq_loss, _, _, _ = self.rq(x, use_sk=True, c=c)
             x_hat = self.decoder(x_q)
 
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
@@ -416,9 +421,9 @@ class COSETTE(torch.nn.Module):
         if self.loss_weights["contrastive"] > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
-            x_q, sig_rq_loss, _, _ = self.rq(x, use_sk=True)
+            _, sig_rq_loss, _, _, x_q_L = self.rq(x, use_sk=True, c=c)
 
-            contrastive_loss = self.siglip(x_q, x_q, items, timelines)
+            contrastive_loss = self.siglip(x_q_L, x_q_L, items, timelines)
             loss += sig_rq_loss * self.loss_weights["quantization"]
             loss += contrastive_loss * self.loss_weights["contrastive"]
 
@@ -428,12 +433,13 @@ class COSETTE(torch.nn.Module):
             metrics["bias"] = self.siglip.bias.item()
             metrics["n_items_in_batch"] = len(items)
 
+        metrics["manifold_curvature"] = c
         return loss, metrics
 
     @torch.no_grad()
-    def get_indices(self, embeddings=None, use_sk=False):
+    def get_indices(self, embeddings=None, use_sk=False, c=1.0):
         if embeddings is None:
             embeddings = self.embeddings
         x_e = self.encoder(embeddings)
-        _, _, indices, distances = self.rq(x_e, use_sk=use_sk)
+        _, _, indices, distances, _ = self.rq(x_e, use_sk=use_sk, c=c)
         return indices, distances
