@@ -18,7 +18,8 @@ source activate recsys
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 CATEGORY="Beauty"
-EXPERIMENT="MARIUS_small"
+EXPERIMENT="marius_small"
+TASKNAME="MARIUS_small"
 
 COSETTE_BASE_DIR="outputs/checkpoints/cosette"
 LATEST_COSETTE_DIR=$(ls -1d ${COSETTE_BASE_DIR}/*/ 2>/dev/null | sort | tail -n 1)
@@ -37,10 +38,10 @@ python src/train.py experiment=${EXPERIMENT} \
     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"
-LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${EXPERIMENT}"_*/ 2>/dev/null | sort | tail -n 1)
+LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
 
 if [ -z "$LATEST_MARIUS_RUN" ]; then
-    echo "Error: No timestamp directory found for experiment '${EXPERIMENT}' in $MARIUS_BASE_DIR"
+    echo "Error: No timestamp directory found for experiment '${TASKNAME}' in $MARIUS_BASE_DIR"
     exit 1
 fi
 
