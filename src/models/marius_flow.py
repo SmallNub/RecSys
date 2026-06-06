@@ -1,16 +1,15 @@
 from dataclasses import dataclass
+from datetime import datetime
 import glob
 import math
 import os
-import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-# Importing your existing Cosette model architecture directly
-from src.models import SpecialTokens
-from src.models.cosette import COSETTE
+from src.models import COSETTE, SpecialTokens
 
 
 @dataclass
@@ -27,153 +26,82 @@ class TransformerConfig:
     fourier_dim: int = 32
 
 
-# ==========================================
-# DIAGNOSTIC LATEST CHECKPOINT LOADER FUNCTION
-# ==========================================
+def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d_%H%M%S") -> Path:
+    base_dir = Path(base_dir_path)
+    latest_dir = None
+    latest_time = None
+
+    if not base_dir.exists():
+        return None
+
+    for entry in base_dir.iterdir():
+        if entry.is_dir():
+            try:
+                folder_time = datetime.strptime(entry.name, timestamp_format)
+                if latest_time is None or folder_time > latest_time:
+                    latest_time = folder_time
+                    latest_dir = entry
+            except ValueError:
+                continue
+    return latest_dir
+
 
 def load_latest_catalog_tokens(device="cuda"):
-    """
-    Finds the newest timestamp checkpoint inside outputs/checkpoints/cosette/{timestamp}/last_model.pth,
-    loads the pre-trained weights, and extracts the full token catalog map.
-    """
-    base_path = os.path.join(os.getcwd(), "outputs", "checkpoints", "cosette", "*", "last_model.pth")
-    checkpoint_files = glob.glob(base_path)
+    cosette_base_dir = os.path.join(os.getcwd(), "outputs", "checkpoints", "cosette")
+    latest_timestamp_folder = get_latest_timestamp_dir(cosette_base_dir)
 
-    if not checkpoint_files:
-        print("⚠️ Warning: No Cosette checkpoints found in outputs/checkpoints/cosette/! Reverting to vocabulary flat lookups.")
+    if latest_timestamp_folder is None:
         return None
 
-    # Sorting strings naturally sorts 'YYYYMMDD_HHMMSS' chronologically
-    checkpoint_files.sort()
-    latest_checkpoint_path = checkpoint_files[-1]
-    print(f"🚀 Found latest Cosette checkpoint path target: {latest_checkpoint_path}")
-
-    # Check if file size is empty (corrupted save)
-    if os.path.exists(latest_checkpoint_path):
-        file_size_mb = os.path.getsize(latest_checkpoint_path) / (1024 * 1024)
-        print(f"📦 Checkpoint target file size: {file_size_mb:.2f} MB")
-        if file_size_mb == 0:
-            print("❌ Error: Checkpoint file is completely empty (0 bytes).")
-            return None
-
-    # Safely load weights map
-    try:
-        checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
-    except Exception as e:
-        print(f"❌ Critical Error reading the physical pth file with torch.load: {e}")
+    latest_checkpoint_path = latest_timestamp_folder / "last_model.pth"
+    if not latest_checkpoint_path.exists():
         return None
 
-    if checkpoint is None:
-        print("❌ Error: torch.load returned a None object.")
+    checkpoint = torch.load(str(latest_checkpoint_path), map_location=torch.device("cpu"), weights_only=False)
+    
+    model_cfg = checkpoint.pop("config", None)
+    state_dict = checkpoint.pop("state_dict", None)
+
+    if model_cfg is None or state_dict is None:
         return None
 
-    # Debug checkpoint object types
-    print(f"🔍 Loaded checkpoint raw type identifier: {type(checkpoint)}")
-
-    # Extract state dict safely regardless of key nesting structure
-    if isinstance(checkpoint, dict):
-        if "state_dict" in checkpoint:
-            print("ℹ️ Found wrapped 'state_dict' layer key within checkpoint.")
-            state_dict = checkpoint["state_dict"]
-        else:
-            print("ℹ️ Checkpoint is a dictionary without an explicit 'state_dict' wrapper; reading raw keys.")
-            state_dict = checkpoint
-    else:
-        print(f"⚠️ Warning: Checkpoint object is not a standard dictionary wrapper. Object contents: {checkpoint}")
-        state_dict = None
-
-    if state_dict is None or not hasattr(state_dict, "items"):
-        print(f"❌ Error: Extracted state_dict is invalid or not iterable. Content: {state_dict}")
-        return None
-
-    # Print top-level weight names for auditing layers
-    available_keys = list(state_dict.keys())
-    print(f"📊 Total weight keys found in file: {len(available_keys)}")
-    print(f"📋 First 10 layer keys: {available_keys[:10]}")
-
-    # Recover structural dimension features from saved embedding parameters
     embeddings_weight = state_dict.get("embeddings", state_dict.get("module.embeddings", None))
     if embeddings_weight is None:
-        print("❌ Error: Checkpoint missing base 'embeddings' layer mappings.")
         return None
-
-    total_items, in_dim = embeddings_weight.shape
-    print(f"📐 Found catalog shape matrix features: Items={total_items}, Dimension={in_dim}")
-
-    # Recover structural dimension features from state layers directly
-    encoder_weights = [v for k, v in state_dict.items() if "encoder.mlp_layers" in k and "weight" in k]
-    layers_dims = [w.shape[0] for w in encoder_weights]
-    print(f"📐 Recovered Encoder Layer dimensions sequence: {layers_dims}")
     
-    if not layers_dims:
-        print("❌ Error: Could not parse encoder shape dimensions. Your layer key structure might differ.")
-        return None
+    in_dim = embeddings_weight.shape[-1]
 
-    # Read centroid counts dynamically from parameters
-    num_quantizers = len([k for k in state_dict.keys() if "rq.vq_layers" in k and "embedding.weight" in k])
-    n_centroids_list = [256] * num_quantizers
-    print(f"🔢 Quantizers detected count: {num_quantizers} -> Book Config List: {n_centroids_list}")
+    cosette_model = COSETTE(
+        embs_block=None,
+        in_dim=in_dim,
+        layers=model_cfg.model.layers,
+        n_centroids_list=model_cfg.centroids.n_centroids_list,
+        dropout_prob=model_cfg.optim.dropout_prob,
+        loss_weights={
+            "quantization": 1,
+            "reconstruction": model_cfg.loss.reconstruction_weight,
+            "contrastive": model_cfg.loss.contrastive_weight,
+        },
+        tau=model_cfg.loss.tau,
+        bias=model_cfg.loss.bias,
+        freeze_tau=model_cfg.loss.freeze_tau,
+        freeze_bias=model_cfg.loss.freeze_bias,
+        kmeans_init=model_cfg.centroids.kmeans_init,
+        kmeans_iters=model_cfg.centroids.kmeans_iters,
+        sk_epsilons=model_cfg.centroids.sk_epsilons,
+        sk_iters=model_cfg.centroids.sk_iters,
+    )
 
-    # FIX: Ensure layers_dims matching matches what your COSETTE structure expects.
-    # If the last layer was squashed to 128 but the codebook expects 256, or if layers_dims already includes 
-    # the input dimension (768), COSETTE will crash when it prepends [self.in_dim] + self.layers.
-    # We strip the input dimension if it was accidentally captured:
-    if layers_dims[0] == in_dim:
-        layers_dims = layers_dims[1:]
-
-    # Force the final bottleneck layer dimension to explicitly match what the Residual Quantizer codebook uses
-    # based on the weights shape inside your saved state dict
-    codebook_key = "rq.vq_layers.0.embedding.weight"
-    if codebook_key in state_dict:
-        expected_centroids_dim = state_dict[codebook_key].shape[1]
-        if layers_dims[-1] != expected_centroids_dim:
-            print(f"🔧 Adjusting final bottleneck layer from {layers_dims[-1]} to match codebook dim {expected_centroids_dim}")
-            layers_dims[-1] = expected_centroids_dim
-
-    # Initialize imported model structure instance safely inside a try/except to reveal the exact PyTorch error if it fails
-    try:
-        cosette_model = COSETTE(
-            embs_block=embeddings_weight,
-            in_dim=in_dim,
-            layers=layers_dims,
-            n_centroids_list=n_centroids_list,
-            dropout_prob=0.0,
-            tau=1.0, bias=0.0, freeze_tau=True, freeze_bias=True,
-            loss_weights={"reconstruction": 0.0, "quantization": 0.0, "contrastive": 0.0}
-        ).to(device)
-        print("🏗️ COSETTE model architecture instantiated successfully.")
-    except Exception as e:
-        print(f"❌ Critical crash during COSETTE constructor initialization allocation: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-    # Clean key prefixes if wrapped inside extra distributed DataParallel modules
-    sanitized_state_dict = {}
-    for k, v in state_dict.items():
-        name = k.replace("module.", "") if k.startswith("module.") else k
-        sanitized_state_dict[name] = v
-
-    try:
-        cosette_model.load_state_dict(sanitized_state_dict, strict=False)
-        print("✨ State dict matching complete.")
-    except Exception as e:
-        print(f"⚠️ Non-breaking mismatch notification during layer copy verification: {e}")
-
+    cosette_model.load_state_dict(state_dict)
+    cosette_model = cosette_model.to(device)
     cosette_model.eval()
 
-    # Process all available catalog vectors directly into discrete multi-scale tokens
-    print("⏳ Processing index projection lookup map...")
     with torch.no_grad():
-        catalog_tokens, _ = cosette_model.get_indices(use_sk=False)
+        catalog_tokens, _ = cosette_model.get_indices(embeddings=embeddings_weight.to(device), use_sk=False)
+        catalog_tokens = catalog_tokens.detach().cpu()
 
-    print(f"✅ Successfully loaded and processed {catalog_tokens.shape[0]} unique items with codebook depth {catalog_tokens.shape[1]}.")
     return catalog_tokens
 
-
-# ==========================================
-# MARIUS FLOW SEQUENCE MODEL IMPLEMENTATION
-# ==========================================
 
 class MARIUS(torch.nn.Module):
     def __init__(
@@ -188,7 +116,6 @@ class MARIUS(torch.nn.Module):
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
 
-        # Flow Matching variables
         self.sigma = getattr(self.depth_cfg, "sigma", 0.0)
         self.ode_steps = getattr(self.depth_cfg, "ode_steps", 10)
         self.fourier_dim = getattr(self.depth_cfg, "fourier_dim", 32)
@@ -202,7 +129,6 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -219,12 +145,10 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Timeline Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
             torch.randn((1, self.temporal_cfg.seq_len, self.temporal_cfg.d_model))
         )
         
-        # Fourier Time Embedding Network
         self.register_buffer(
             "fourier_frequencies", 
             torch.randn(self.fourier_dim // 2) * 2 * math.pi
@@ -235,7 +159,6 @@ class MARIUS(torch.nn.Module):
             torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model),
         )
 
-        # Runtime Dynamic Catalog Registration Interface
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tokens_map = load_latest_catalog_tokens(device=device)
         if tokens_map is not None:
@@ -243,11 +166,9 @@ class MARIUS(torch.nn.Module):
         else:
             self.catalog_tokens = None
 
-        # Embedding dropout
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Transformer Blocks
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -360,7 +281,7 @@ class MARIUS(torch.nn.Module):
         return loss, v_pred
 
     def search(self, batch, n_results):
-        assert self.training is False, "Not in evaluation mode (dropout)."
+        assert self.training is False
 
         input = batch["input"]
         L = batch["target"].shape[-1] 
