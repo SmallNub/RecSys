@@ -18,6 +18,6 @@ source activate recsys
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 python data_scripts/2_train_cosette.py \
-  data.category=Beauty optim.batch_size=256 optim.epochs=500 optim.eval_step=100 optim.dropout_prob=0.1
+  data.category=Beauty
 
 python data_scripts/3_remove_colisions.py data.category=Beauty

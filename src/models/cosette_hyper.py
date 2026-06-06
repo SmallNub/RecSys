@@ -50,21 +50,21 @@ def exp_map(x, v):
     return torch.cosh(norm_v).unsqueeze(-1) * x + scale.unsqueeze(-1) * v
 
 def parallel_transport_to_origin(x, v):
-    """Analytically simplified: No zero-tensors allocated. Fixed sign bug."""
+    """Analytically simplified: x -> O transport. (FIXED: Sign is positive)"""
     x0 = x[..., 0:1]
     v0 = v[..., 0:1]
-    factor = -v0 / (1.0 + x0)
+    factor = v0 / (1.0 + x0) # <--- Fixed sign
     
     out = v + factor * x
-    out[..., 0:1] += factor # (x + O)_0 is x0 + 1. We add the +1 part here.
+    out[..., 0:1] += factor 
     return out
 
 def parallel_transport_from_origin(x, v):
-    """Analytically simplified: O -> x transport."""
+    """Analytically simplified: O -> x transport. (FIXED: Sign is negative)"""
     x0 = x[..., 0:1]
     # v is in T_O, so v_0 is 0. Inner product is just the spatial part.
     inner_xv = (x[..., 1:] * v[..., 1:]).sum(dim=-1, keepdim=True)
-    factor = inner_xv / (1.0 + x0)
+    factor = -inner_xv / (1.0 + x0) # <--- Fixed sign
     
     out = v + factor * x
     out[..., 0:1] += factor
@@ -254,9 +254,13 @@ class HyperbolicVectorQuantizer(nn.Module):
         r_target_L = parallel_transport_to_origin(c1, v_target)
         r_target_E = r_target_L[:, 1:] 
 
-        # 3. Exact Manifold Codebook Losses
-        commitment_loss = distance_lorentz(x_L.detach(), c1).mean()
-        codebook_loss = distance_lorentz(x_L, c1.detach()).mean()
+        # 3. Exact Manifold Codebook Losses (FIXED)
+        # We detach x_L to pass the 1.0 gradient purely to the codebook (c1)
+        codebook_loss = distance_lorentz(x_L.detach(), c1).mean()
+        
+        # We detach c1 to pass the 0.25 (beta) gradient purely to the encoder (x_L)
+        commitment_loss = distance_lorentz(x_L, c1.detach()).mean()
+        
         loss = codebook_loss + self.beta * commitment_loss
 
         return c1, r_target_E, loss, indices, d
@@ -324,6 +328,10 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         # 5. Inverse projection back to flat R^d space for the Decoder
         x_q = x_q_L[:, 1:]
         
+        # <--- NEW: Un-scale curvature so the Decoder doesn't thrash
+        if c != 1.0:
+            x_q = x_q / torch.sqrt(torch.tensor(c, dtype=torch.float32, device=x.device))
+        
         mean_losses = torch.stack(all_losses).mean()
         all_indices = torch.stack(all_indices, dim=-1)
         all_distances = torch.stack(all_distances, dim=1)
@@ -360,8 +368,12 @@ class SigLIPLoss(torch.nn.Module):
         inner = torch.clamp(inner, max=-1.0 - 1e-7)
         dist = torch.acosh(-inner)
         
-        # Negative Hyperbolic distance represents similarity bounds
-        logits = -dist * self.tau.exp() + self.bias
+        # FIX: Map unbounded hyperbolic distance [0, inf) to bounded similarity [-1, 1]
+        # This perfectly matches the Euclidean cosine similarity gradient scale.
+        # If dist = 0 -> sim = 1.0. If dist = infinity -> sim = -1.0.
+        sim = (2.0 / (1.0 + dist)) - 1.0
+        
+        logits = sim * self.tau.exp() + self.bias
         loss = self._siglip_loss(logits, items, timelines)
         return loss
 
@@ -421,6 +433,7 @@ class COSETTE(torch.nn.Module):
         if self.loss_weights["contrastive"] > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
+            
             _, sig_rq_loss, _, _, x_q_L = self.rq(x, use_sk=True, c=c)
 
             contrastive_loss = self.siglip(x_q_L, x_q_L, items, timelines)
@@ -441,5 +454,6 @@ class COSETTE(torch.nn.Module):
         if embeddings is None:
             embeddings = self.embeddings
         x_e = self.encoder(embeddings)
+        
         _, _, indices, distances, _ = self.rq(x_e, use_sk=use_sk, c=c)
         return indices, distances

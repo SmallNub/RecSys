@@ -12,9 +12,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from src.models.cosette import COSETTE
 from src.utils.tools import patch_fsspec
-
 
 def partition_list(lst, partition_sizes):
     if sum(partition_sizes) != len(lst):
@@ -83,7 +81,23 @@ def main(config):
     patch_fsspec()
     fs = fsspec.filesystem(config.paths.protocol)
 
-    quant_method = f"COSETTE_{config.data.category}_{get_latest_timestamp_dir(config.paths.ckpt_dir).name}"
+    # --- HYBRID TOGGLE: Dynamic Import ---
+    model_type = config.model.get("type", "euclidean")
+    if model_type == "hyperbolic":
+        print("\n>>> LOADING HYPERBOLIC COSETTE FOR COLLISION RESOLUTION <<<")
+        from src.models.cosette_hyper import COSETTE
+        prefix = "COSETTE_HYPER_SIGLIP"
+    else:
+        print("\n>>> LOADING EUCLIDEAN COSETTE FOR COLLISION RESOLUTION <<<")
+        from src.models.cosette import COSETTE
+        prefix = "COSETTE_SIGLIP"
+
+    # --- HYBRID TOGGLE: Dynamic Naming ---
+    latest_dir_name = get_latest_timestamp_dir(config.paths.ckpt_dir).name
+    quant_method = f"{prefix}_{config.data.category}_{latest_dir_name}"
+    if config.get("marker") is not None:
+        quant_method += f"_{config.marker}"
+
     print(f"Using quant method: {quant_method}")
 
     embeddings_path = config.paths.embeddings_tplt.format(
@@ -145,9 +159,15 @@ def main(config):
     all_distances = []
     all_indices_tup_set = set()
 
-    indices, all_distances = model.get_indices(
-        embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False
-    )
+    # --- HYBRID TOGGLE: Curvature execution ---
+    if model_type == "hyperbolic":
+        indices, all_distances = model.get_indices(
+            embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False, c=1.0
+        )
+    else:
+        indices, all_distances = model.get_indices(
+            embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False
+        )
 
     indices = indices.cpu().numpy()  # (N, L)
     all_distances = all_distances.cpu().numpy()  # (N, L, K)
@@ -239,7 +259,7 @@ def main(config):
 
     tot_item = len(all_indices_tup)
     tot_indice = len(set(all_indices_tup))
-    print("Collision Rate", (tot_item - tot_indice) / tot_item)
+    print("Final Collision Rate", (tot_item - tot_indice) / tot_item)
 
     codes_holder = np.zeros((embs_block.shape[0], indices.shape[1]), dtype=np.int32)
     for i, code in enumerate(all_indices):

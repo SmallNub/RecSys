@@ -128,11 +128,16 @@ class Trainer(object):
             c = 1.0
 
         total_loss = 0
-        desc_str = f"Train {epoch_idx} (c={c:.4f})" if self.is_hyper else f"Train {epoch_idx}"
+        
+        model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"
+        desc_str = f"[{model_name}] Train {epoch_idx}"
+        if self.is_hyper:
+            desc_str += f" (c={c:.4f})"
+
         iter_data = (
             tqdm(train_data, total=len(train_data), ncols=100, desc=desc_str)
             if self.config.loss.contrastive_weight > 0
-            else tqdm(range(len(train_data)))
+            else tqdm(range(len(train_data)), desc=desc_str)
         )
 
         metrics = defaultdict(float)
@@ -213,6 +218,11 @@ class Trainer(object):
         self.logger.info(f"Saving current: {ckpt_path}")
 
     def fit(self, train_data):
+        model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"
+        print(f"\n{'='*60}")
+        print(f">>>> STARTING {model_name} TRAINING LOOP <<<<")
+        print(f"{'='*60}\n")
+
         for epoch_idx in range(self.epochs):
             if self.scheduler is not None:
                 self.scheduler.step()
