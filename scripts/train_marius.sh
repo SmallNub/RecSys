@@ -17,13 +17,6 @@ source activate recsys
 # export $(cat .env | xargs)
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-# CATEGORIES=(
-#     "Arts_Crafts_and_Sewing"
-#     "Beauty"
-#     "Toys_and_Games"
-#     "Video_Games"
-# )
-
 CATEGORY="Beauty"
 EXPERIMENT="MARIUS_small"
 
@@ -40,8 +33,8 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
-# python src/train.py experiment=${EXPERIMENT} \
-#     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
+python src/train.py experiment=${EXPERIMENT} \
+    data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"
 LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${EXPERIMENT}"_*/ 2>/dev/null | sort | tail -n 1)
