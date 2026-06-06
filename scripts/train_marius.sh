@@ -25,7 +25,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # )
 
 CATEGORY="Beauty"
-EXPERIMENT="marius_small"
+EXPERIMENT="MARIUS_small"
 
 COSETTE_BASE_DIR="outputs/checkpoints/cosette"
 LATEST_COSETTE_DIR=$(ls -1d ${COSETTE_BASE_DIR}/*/ 2>/dev/null | sort | tail -n 1)
@@ -40,8 +40,8 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
-python src/train.py experiment=${EXPERIMENT} \
-    data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
+# python src/train.py experiment=${EXPERIMENT} \
+#     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
 
 TASK_NAME="marius_small"
 MARIUS_BASE_DIR="outputs/checkpoints/marius"

@@ -21,7 +21,7 @@ embeddings_tplt: ${.root}/data/embeddings/{emb_method}/{category}/embeddings.par
 semantic_ids_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_method}.parquet
 semantic_model_tplt: ${.root}/data/embeddings/{emb_method}/{category}/{quant_method}_model.pkl
 # Model outputs
-model_folder_tplt: ${.root}/outputs/checkpoints/marius
+model_folder_tplt: ${oc.env:PWD}/outputs/checkpoints/marius
 # Logging project
 wandb_project_name: recsys
 wandb_entity: smallnub
