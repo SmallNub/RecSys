@@ -186,29 +186,63 @@ class MARIUS(torch.nn.Module):
         depth_preds = self.depth_tf(dec_inputs)
         return depth_preds[:, -1, :]
 
-    def train_forward(self, input, target):
+    def train_forward(self, input, target, timestamps=None):
+        """
+        timestamps: Tensor of shape (B, L) containing the randomly assigned 
+                    but sequentially ordered timestamps (e.g., 0.12, 0.25, 0.43...)
+        """
         B, L, _ = input.shape
-        temporal_tokens = self.temporal_forward(input)
+        device = input.device
+
+        if timestamps is None:
+            # Fallback: create random sorted timestamps per batch if not provided by dataloader
+            timestamps = torch.sort(torch.rand((B, L), device=device), dim=-1).values
+
+        # 1. Generate a Time-Based Causal Mask for the temporal encoder
+        # Position i can only attend to position j if timestamp[j] <= timestamp[i]
+        time_mask = timestamps.unsqueeze(1) < timestamps.unsqueeze(2) # (B, L, L)
+        
+        # Combined mask with your padding mask and structural causal mask
+        # Note: PyTorch Transformer Encoder expects True where attention is forbidden
+        pad_mask = (input[:, :, 0] == SpecialTokens.PAD.value).unsqueeze(1).repeat(1, L, 1)
+        full_temporal_mask = time_mask | pad_mask
+
+        # 2. Pass through temporal encoder with our strict timestamp mask
+        # We must loop or use a custom attention mechanism if masks vary per batch element,
+        # or process them using PyTorch's native tuple/3D mask support.
+        temporal_tokens = []
+        for b in range(B):
+            # Process per batch element because each has a unique random timeline
+            input_embs = self.temp_emb(input[b]).sum(dim=-1) + self.temp_pos_emb[0, :L, :]
+            out_b = self.temp_tf(
+                input_embs.unsqueeze(0),
+                mask=full_temporal_mask[b]
+            )
+            temporal_tokens.append(out_b)
+        temporal_tokens = torch.cat(temporal_tokens, dim=0)
+
         mid_tokens = self.mid_proj(temporal_tokens)
         mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
 
+        # 3. Flow Matching Setup
         target_flat = rearrange(target, "b l k -> (b l) k")
         keep = target_flat[:, 0] != -100
 
         mid_tokens = mid_tokens[keep]
         target_flat = target_flat[keep]
-
+        
         x_1 = self.depth_emb(target_flat).sum(dim=1)
-
+        
         input_flat = rearrange(input, "b l k -> (b l) k")[keep]
         x_0 = self.depth_emb(input_flat).sum(dim=1)
 
-        time_steps = torch.linspace(0.0, 0.9, steps=L, device=input.device)
-        t_matrix = time_steps.unsqueeze(0).repeat(B, 1)
-        t_flat = rearrange(t_matrix, "b l -> (b l) 1")[keep]
+        # Crucial Fix: Flow time (t) must be completely decoupled from history timeline
+        # to avoid algebraic reverse-engineering tricks!
+        t_flat = torch.rand((mid_tokens.shape[0], 1), device=device)
 
-        x_t = t_flat * x_1 + (1.0 - (1.0 - self.sigma) * t_flat) * x_0
-        target_velocity = x_1 - (1.0 - self.sigma) * x_0
+        # Standard Rectified Flow Equation
+        x_t = t_flat * x_1 + (1.0 - t_flat) * x_0
+        target_velocity = x_1 - x_0
 
         v_pred = self.depth_forward(x_t, t_flat, mid_tokens)
         return v_pred, target_velocity
