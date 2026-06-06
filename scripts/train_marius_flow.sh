@@ -34,7 +34,7 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
-python src/train.py experiment=${EXPERIMENT} \
+HYDRA_FULL_ERROR=1 python src/train.py experiment=${EXPERIMENT} \
     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"

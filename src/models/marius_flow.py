@@ -4,12 +4,15 @@ import glob
 import math
 import os
 from pathlib import Path
+import pandas as pd
+import numpy as np
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from src.models import COSETTE, SpecialTokens
+from src.models import SpecialTokens
+from src.models.cosette import COSETTE
 
 
 @dataclass
@@ -32,6 +35,7 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d
     latest_time = None
 
     if not base_dir.exists():
+        print(f"[DEBUG] Base directory does not exist: {base_dir_path}")
         return None
 
     for entry in base_dir.iterdir():
@@ -48,57 +52,108 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d
 
 def load_latest_catalog_tokens(device="cuda"):
     cosette_base_dir = os.path.join(os.getcwd(), "outputs", "checkpoints", "cosette")
+    print(f"[DEBUG] Searching for checkpoints in: {cosette_base_dir}")
+    
     latest_timestamp_folder = get_latest_timestamp_dir(cosette_base_dir)
-
     if latest_timestamp_folder is None:
+        print("[DEBUG] No valid timestamp folders found.")
         return None
 
     latest_checkpoint_path = latest_timestamp_folder / "last_model.pth"
+    print(f"[DEBUG] Identified latest checkpoint path target: {latest_checkpoint_path}")
+    
     if not latest_checkpoint_path.exists():
+        print(f"[DEBUG] Target file missing: {latest_checkpoint_path}")
         return None
 
-    checkpoint = torch.load(str(latest_checkpoint_path), map_location=torch.device("cpu"), weights_only=False)
+    try:
+        checkpoint = torch.load(str(latest_checkpoint_path), map_location=torch.device("cpu"), weights_only=False)
+        print("[DEBUG] Checkpoint successfully loaded into memory via torch.load.")
+    except Exception as e:
+        print(f"[DEBUG] Crash during torch.load execution: {e}")
+        return None
     
     model_cfg = checkpoint.pop("config", None)
     state_dict = checkpoint.pop("state_dict", None)
 
-    if model_cfg is None or state_dict is None:
+    if model_cfg is None:
+        print("[DEBUG] Unpacking failed: 'config' block key is missing.")
+        return None
+    if state_dict is None:
+        print("[DEBUG] Unpacking failed: 'state_dict' block key is missing.")
         return None
 
-    embeddings_weight = state_dict.get("embeddings", state_dict.get("module.embeddings", None))
-    if embeddings_weight is None:
+    emb_method = getattr(model_cfg.data, "emb_method", "sentence-t5-xl")
+    embeddings_path = os.path.join(os.getcwd(), "datasets", "data", "embeddings", emb_method, "items.parquet")
+    print(f"[DEBUG] Attempting to load external parquet file from target: {embeddings_path}")
+
+    if not os.path.exists(embeddings_path):
+        print(f"[DEBUG] Target path directory structure does not exist. Attempting lookups using wildcard fallback strategy...")
+        wildcard_path = os.path.join(os.getcwd(), "datasets", "data", "embeddings", "**", "*.parquet")
+        fallback_paths = glob.glob(wildcard_path, recursive=True)
+        if fallback_paths:
+            embeddings_path = fallback_paths[0]
+            print(f"[DEBUG] Re-mapped tracking path target dynamically to file: {embeddings_path}")
+        else:
+            print(f"[DEBUG] Error: Could not locate fallback items parquet file using query sequence {wildcard_path}")
+            return None
+
+    try:
+        embs_df = pd.read_parquet(embeddings_path)
+        embs_block = np.stack(embs_df["embedding"].values)
+        print(f"[DEBUG] Successfully loaded parquet. Shape: {embs_block.shape}")
+    except Exception as e:
+        print(f"[DEBUG] Failed reading external data frame properties matrix: {e}")
         return None
-    
-    in_dim = embeddings_weight.shape[-1]
 
-    cosette_model = COSETTE(
-        embs_block=None,
-        in_dim=in_dim,
-        layers=model_cfg.model.layers,
-        n_centroids_list=model_cfg.centroids.n_centroids_list,
-        dropout_prob=model_cfg.optim.dropout_prob,
-        loss_weights={
-            "quantization": 1,
-            "reconstruction": model_cfg.loss.reconstruction_weight,
-            "contrastive": model_cfg.loss.contrastive_weight,
-        },
-        tau=model_cfg.loss.tau,
-        bias=model_cfg.loss.bias,
-        freeze_tau=model_cfg.loss.freeze_tau,
-        freeze_bias=model_cfg.loss.freeze_bias,
-        kmeans_init=model_cfg.centroids.kmeans_init,
-        kmeans_iters=model_cfg.centroids.kmeans_iters,
-        sk_epsilons=model_cfg.centroids.sk_epsilons,
-        sk_iters=model_cfg.centroids.sk_iters,
-    )
+    in_dim = embs_block.shape[-1]
 
-    cosette_model.load_state_dict(state_dict)
+    try:
+        cosette_model = COSETTE(
+            embs_block=None,
+            in_dim=in_dim,
+            layers=model_cfg.model.layers,
+            n_centroids_list=model_cfg.centroids.n_centroids_list,
+            dropout_prob=model_cfg.optim.dropout_prob,
+            loss_weights={
+                "quantization": 1,
+                "reconstruction": model_cfg.loss.reconstruction_weight,
+                "contrastive": model_cfg.loss.contrastive_weight,
+            },
+            tau=model_cfg.loss.tau,
+            bias=model_cfg.loss.bias,
+            freeze_tau=model_cfg.loss.freeze_tau,
+            freeze_bias=model_cfg.loss.freeze_bias,
+            kmeans_init=model_cfg.centroids.kmeans_init,
+            kmeans_iters=model_cfg.centroids.kmeans_iters,
+            sk_epsilons=model_cfg.centroids.sk_epsilons,
+            sk_iters=model_cfg.centroids.sk_iters,
+        )
+        print("[DEBUG] COSETTE module instantiation complete.")
+    except Exception as e:
+        print(f"[DEBUG] Crash during COSETTE constructor logic: {e}")
+        return None
+
+    try:
+        cosette_model.load_state_dict(state_dict)
+        print("[DEBUG] Load state dict applied successfully to COSETTE.")
+    except Exception as e:
+        print(f"[DEBUG] Crash within load_state_dict assignment transfer: {e}")
+        return None
+
     cosette_model = cosette_model.to(device)
     cosette_model.eval()
 
-    with torch.no_grad():
-        catalog_tokens, _ = cosette_model.get_indices(embeddings=embeddings_weight.to(device), use_sk=False)
-        catalog_tokens = catalog_tokens.detach().cpu()
+    try:
+        print("[DEBUG] Executing get_indices projection sweep across external item embeddings matrix...")
+        with torch.no_grad():
+            embeddings_tensor = torch.from_numpy(embs_block).to(device).float()
+            catalog_tokens, _ = cosette_model.get_indices(embeddings=embeddings_tensor, use_sk=False)
+            catalog_tokens = catalog_tokens.detach().cpu()
+        print(f"[DEBUG] Indexing complete. Tokens matrix shape: {catalog_tokens.shape}")
+    except Exception as e:
+        print(f"[DEBUG] Crash inside get_indices operation: {e}")
+        return None
 
     return catalog_tokens
 
