@@ -22,6 +22,7 @@ centroids:
   n_centroids_list: [256, 256, 256, 256]
 
 model: 
+  type: hyperbolic #euclidean
   layers: [1024, 512, 256, 128]
 
 loss: 

@@ -17,48 +17,40 @@ from torch import optim
 from torch.optim.lr_scheduler import LRScheduler
 from tqdm import tqdm
 
-from src.models.cosette import COSETTE
 from src.utils.tools import patch_fsspec
 
 
 class LinearDecayScheduler(LRScheduler):
+    # ... (Keep this class exactly the same) ...
     def __init__(self, optimizer, warmup_steps, cooldown_steps, factor=0.1):
         self.optimizer = optimizer
-
         self.factor = factor
         self.warmup_steps = warmup_steps
         self.cooldown_steps = cooldown_steps
-
         self.base_lrs = [group["lr"] for group in optimizer.param_groups]
-
         self.warmup_step_sizes = [
             (base_lr - self.factor * base_lr) / warmup_steps
             for base_lr in self.base_lrs
         ]
-
         self.cooldown_step_sizes = [
             (self.factor * base_lr - base_lr) / cooldown_steps
             for base_lr in self.base_lrs
         ]
-
         super().__init__(optimizer)
 
     def get_lr(self):
         if self.last_epoch == 0:
             return [base_lr * self.factor for base_lr in self.base_lrs]
-
         elif self.last_epoch < self.warmup_steps:
             return [
                 base_lr * self.factor + step_size * self.last_epoch
                 for base_lr, step_size in zip(self.base_lrs, self.warmup_step_sizes)
             ]
-
         elif (self.last_epoch - self.warmup_steps) < self.cooldown_steps:
             return [
                 base_lr + step_size * (self.last_epoch - self.warmup_steps)
                 for base_lr, step_size in zip(self.base_lrs, self.cooldown_step_sizes)
             ]
-
         else:
             return [base_lr * self.factor for base_lr in self.base_lrs]
 
@@ -69,6 +61,7 @@ class Trainer(object):
         self.model = model
         self.dataset = dataset
         self.logger = logging.getLogger()
+        self.is_hyper = self.config.model.get("type", "euclidean") == "hyperbolic"
 
         self.epochs = config.optim.epochs
         self.eval_step = min(config.optim.eval_step, self.epochs)
@@ -118,7 +111,6 @@ class Trainer(object):
             lr=self.config.optim.lr,
             weight_decay=self.config.optim.weight_decay,
         )
-
         return optimizer
 
     def _check_nan(self, loss):
@@ -128,22 +120,17 @@ class Trainer(object):
     def _train_epoch(self, train_data, epoch_idx):
         self.model.train()
 
-        # Dynamic Curvature Annealing Calculations (10% of total epochs window)
+        # Dynamic Curvature Annealing Calculations
         anneal_period = max(1, int(self.epochs * 0.10))
         if epoch_idx < anneal_period:
-            # Linear scaling from flat 0.01 up to fully hyperbolic 1.0
             c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
         else:
             c = 1.0
 
         total_loss = 0
+        desc_str = f"Train {epoch_idx} (c={c:.4f})" if self.is_hyper else f"Train {epoch_idx}"
         iter_data = (
-            tqdm(
-                train_data,
-                total=len(train_data),
-                ncols=100,
-                desc=f"Train {epoch_idx} (c={c:.4f})",
-            )
+            tqdm(train_data, total=len(train_data), ncols=100, desc=desc_str)
             if self.config.loss.contrastive_weight > 0
             else tqdm(range(len(train_data)))
         )
@@ -153,14 +140,15 @@ class Trainer(object):
             if self.config.loss.contrastive_weight == 0:
                 data = {"items": None, "timelines": None}
             else:
-                data = {
-                    k: v.to(self.device, non_blocking=True) for k, v in data.items()
-                }
+                data = {k: v.to(self.device, non_blocking=True) for k, v in data.items()}
 
             self.optimizer.zero_grad()
 
-            # Passing our active curvature variable directly into the loss calculator
-            loss, b_metrics = self.model.training_loss(**data, c=c)
+            # --- HYBRID TOGGLE: Safe parameter routing ---
+            if self.is_hyper:
+                loss, b_metrics = self.model.training_loss(**data, c=c)
+            else:
+                loss, b_metrics = self.model.training_loss(**data)
 
             self._check_nan(loss)
             loss.backward()
@@ -179,7 +167,13 @@ class Trainer(object):
         self.model.eval()
 
         indices_list = []
-        indices, _ = self.model.get_indices(c=1.0) # Always inspect fully curved space properties
+        
+        # --- HYBRID TOGGLE ---
+        if self.is_hyper:
+            indices, _ = self.model.get_indices(c=1.0) 
+        else:
+            indices, _ = self.model.get_indices()
+
         for index in indices:
             code = tuple(index.cpu().numpy().tolist())
             indices_list.append(code)
@@ -190,8 +184,8 @@ class Trainer(object):
         }
 
         freq_count = defaultdict(int)
-        for c in indices_list:
-            freq_count[c] += 1
+        for c_code in indices_list:
+            freq_count[c_code] += 1
         max_value = max(list(freq_count.values()))
         min_value = min(list(freq_count.values()))
         mean_value = np.mean(list(freq_count.values()))
@@ -209,9 +203,6 @@ class Trainer(object):
 
     def _save_checkpoint(self, epoch, ckpt_file):
         ckpt_path = os.path.join(self.local_dir, ckpt_file)
-
-        print(ckpt_path)
-
         state = {
             "config": self.config,
             "epoch": epoch,
@@ -219,7 +210,6 @@ class Trainer(object):
             "optimizer": self.optimizer.state_dict(),
         }
         torch.save(state, ckpt_path, pickle_protocol=4)
-
         self.logger.info(f"Saving current: {ckpt_path}")
 
     def fit(self, train_data):
@@ -242,18 +232,16 @@ class Trainer(object):
                 print("=" * 100)
                 print(">>>> EVALUATING <<<<")
                 metrics = self._valid_epoch()
-
                 wandb.log({"epoch": epoch_idx, **metrics})
 
         self._save_checkpoint(epoch_idx, ckpt_file=self.last_ckpt)
-
         return os.path.join(self.local_dir, self.last_ckpt)
 
 
 class _Dataset(torch.utils.data.IterableDataset):
+    # ... (Keep this class exactly the same) ...
     def __init__(self, timelines, items_to_row, bs, items_cut):
         self.items_to_row = items_to_row
-
         self.timelines = np.array(
             [
                 np.array(
@@ -264,7 +252,6 @@ class _Dataset(torch.utils.data.IterableDataset):
             ],
             dtype=object,
         )
-
         self.bs = bs
         self.items_cut = items_cut
 
@@ -281,25 +268,19 @@ class _Dataset(torch.utils.data.IterableDataset):
         w_info = torch.utils.data.get_worker_info()
         world_size = w_info.num_workers if w_info else 1
         worker_id = w_info.id if w_info else 0
-
         T = len(self)
         L = ceil(T / world_size) if T % world_size > worker_id else T // world_size
-
         self._indices = np.random.permutation(len(self.timelines))
-
         for i in range(L):  
             yield self.__make_batch(i)
 
     def __make_batch(self, i):
         sel_indices = self._indices[i * self.bs : (i + 1) * self.bs]
-
         sel_timelines = self.timelines[sel_indices]
         sel_timelines = np.array([self._to_size(t) for t in sel_timelines])
-
         all_items = np.unique(np.concatenate(sel_timelines))  
         if all_items[0] == -1:  
             all_items = all_items[1:]
-
         return {
             "items": torch.from_numpy(all_items),
             "timelines": torch.from_numpy(sel_timelines),
@@ -307,10 +288,10 @@ class _Dataset(torch.utils.data.IterableDataset):
 
 
 class DataLoader:
+    # ... (Keep this class exactly the same) ...
     def __init__(self, items, timelines, bs, cut):
         self.timelines = timelines
         self.items_to_row = {item: i for i, item in enumerate(items)}
-
         self.ds = _Dataset(self.timelines, self.items_to_row, bs, cut)
         self.dl = torch.utils.data.DataLoader(
             self.ds,
@@ -351,7 +332,13 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
     )
 
     print("Forward.")
-    indices, _ = model.get_indices(use_sk=False, c=1.0) # Export final vectors with true curvature
+    # --- HYBRID TOGGLE ---
+    is_hyper = config.model.get("type", "euclidean") == "hyperbolic"
+    if is_hyper:
+        indices, _ = model.get_indices(use_sk=False, c=1.0)
+    else:
+        indices, _ = model.get_indices(use_sk=False)
+        
     indices = indices.cpu().numpy().astype(np.int32)
 
     print("Preparing dataframe.")
@@ -359,7 +346,6 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
     for _ in range(indices.shape[1]):
         series.append(pd.Series(indices[:, _], name=f"L{_}"))
     quant_df = pd.concat(series, axis=1)
-
     quant_df["product_id"] = product_id
 
     print("Saving quantized dataframe.")
@@ -379,7 +365,9 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
 
 
 def make_name(config, timestamp):
-    name = f"COSETTE_HYPER_SIGLIP_{config.data.category}_{timestamp}"
+    model_type = config.model.get("type", "euclidean")
+    prefix = "COSETTE_HYPER_SIGLIP" if model_type == "hyperbolic" else "COSETTE_SIGLIP"
+    name = f"{prefix}_{config.data.category}_{timestamp}"
     if config.marker is not None:
         name += f"_{config.marker}"
     return name
@@ -388,6 +376,15 @@ def make_name(config, timestamp):
 def make_cosette_embs(config):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     config.ckpt_dir = os.path.join(config.ckpt_dir, timestamp)
+
+    # --- HYBRID TOGGLE: Dynamic Model Import ---
+    model_type = config.model.get("type", "euclidean")
+    if model_type == "hyperbolic":
+        print(">>> INITIALIZING HYPERBOLIC COSETTE <<<")
+        from src.models.cosette_hyper import COSETTE
+    else:
+        print(">>> INITIALIZING EUCLIDEAN COSETTE <<<")
+        from src.models.cosette import COSETTE
 
     embeddings_path = config.paths.embeddings_tplt.format(
         emb_method=config.data.emb_method, category=config.data.category
