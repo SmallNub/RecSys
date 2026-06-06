@@ -48,7 +48,7 @@ def load_latest_catalog_tokens(device="cuda"):
     print(f"🚀 Found latest Cosette checkpoint path target: {latest_checkpoint_path}")
 
     # Safely load weights map
-    checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+    checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("state_dict", checkpoint)
 
     # Recover structural dimension features from saved embedding parameters
