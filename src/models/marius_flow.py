@@ -114,16 +114,39 @@ def load_latest_catalog_tokens(device="cuda"):
     n_centroids_list = [256] * num_quantizers
     print(f"🔢 Quantizers detected count: {num_quantizers} -> Book Config List: {n_centroids_list}")
 
-    # Initialize imported model structure instance
-    cosette_model = COSETTE(
-        embs_block=embeddings_weight,
-        in_dim=in_dim,
-        layers=layers_dims,
-        n_centroids_list=n_centroids_list,
-        dropout_prob=0.0,
-        tau=1.0, bias=0.0, freeze_tau=True, freeze_bias=True,
-        loss_weights={"reconstruction": 0.0, "quantization": 0.0, "contrastive": 0.0}
-    ).to(device)
+    # FIX: Ensure layers_dims matching matches what your COSETTE structure expects.
+    # If the last layer was squashed to 128 but the codebook expects 256, or if layers_dims already includes 
+    # the input dimension (768), COSETTE will crash when it prepends [self.in_dim] + self.layers.
+    # We strip the input dimension if it was accidentally captured:
+    if layers_dims[0] == in_dim:
+        layers_dims = layers_dims[1:]
+
+    # Force the final bottleneck layer dimension to explicitly match what the Residual Quantizer codebook uses
+    # based on the weights shape inside your saved state dict
+    codebook_key = "rq.vq_layers.0.embedding.weight"
+    if codebook_key in state_dict:
+        expected_centroids_dim = state_dict[codebook_key].shape[1]
+        if layers_dims[-1] != expected_centroids_dim:
+            print(f"🔧 Adjusting final bottleneck layer from {layers_dims[-1]} to match codebook dim {expected_centroids_dim}")
+            layers_dims[-1] = expected_centroids_dim
+
+    # Initialize imported model structure instance safely inside a try/except to reveal the exact PyTorch error if it fails
+    try:
+        cosette_model = COSETTE(
+            embs_block=embeddings_weight,
+            in_dim=in_dim,
+            layers=layers_dims,
+            n_centroids_list=n_centroids_list,
+            dropout_prob=0.0,
+            tau=1.0, bias=0.0, freeze_tau=True, freeze_bias=True,
+            loss_weights={"reconstruction": 0.0, "quantization": 0.0, "contrastive": 0.0}
+        ).to(device)
+        print("🏗️ COSETTE model architecture instantiated successfully.")
+    except Exception as e:
+        print(f"❌ Critical crash during COSETTE constructor initialization allocation: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
     # Clean key prefixes if wrapped inside extra distributed DataParallel modules
     sanitized_state_dict = {}
