@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+# Ensure this matches your project structure
 from src.models import SpecialTokens
 
 
@@ -49,10 +50,10 @@ def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d
 class MARIUS(torch.nn.Module):
     def __init__(
         self,
-        temporal_cfg,
-        depth_cfg,
-        tie_embeddings=False,
-        filter_preds=False,
+        temporal_cfg: TransformerConfig,
+        depth_cfg: TransformerConfig,
+        tie_embeddings: bool = False,
+        filter_preds: bool = False,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -121,7 +122,6 @@ class MARIUS(torch.nn.Module):
             norm=torch.nn.LayerNorm(self.temporal_cfg.d_model),
         )
 
-        # The velocity network processes vectors directly; we only need a 1-layer projection or MLP blocks
         self.depth_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.depth_cfg.d_model,
@@ -167,7 +167,7 @@ class MARIUS(torch.nn.Module):
     def temporal_forward(self, input):
         B, L, K = input.shape
         input_embs = self.temp_emb(input).sum(dim=-2)
-        input_embs += self.temp_pos_emb[:, : input.shape[1], :]
+        input_embs += self.temp_pos_emb[:, :L, :]
         input_embs = self.temp_dropout(input_embs)
 
         out = self.temp_tf(
@@ -178,44 +178,34 @@ class MARIUS(torch.nn.Module):
         return out
 
     def depth_forward(self, x_t, t, mid_tokens):
-        # x_t: (B, d_model), t: (B, 1), mid_tokens: (B, d_model)
         t_emb = self.get_fourier_time_embedding(t)
-        
-        # Inject context directly via vector addition to break bidirectional shortcuts
         combined_features = x_t + t_emb + mid_tokens
         
-        dec_inputs = combined_features.unsqueeze(1) # (B, 1, d_model)
+        dec_inputs = combined_features.unsqueeze(1) 
         dec_inputs = self.depth_dropout(dec_inputs)
         
         depth_preds = self.depth_tf(dec_inputs)
-        return depth_preds.squeeze(1) # (B, d_model)
+        return depth_preds.squeeze(1)
 
     def train_forward(self, input, target):
         B, L, _ = input.shape
         device = input.device
         
-        # 1. Process history sequentially through the temporal transformer (Fully Graded)
-        temporal_tokens = self.temporal_forward(input) # (B, L, d_model)
-        mid_tokens = self.mid_proj(temporal_tokens)    # (B, L, d_model)
+        temporal_tokens = self.temporal_forward(input) 
+        mid_tokens = self.mid_proj(temporal_tokens)    
 
-        # 2. Get embeddings for the source items (x_0) and target items (x_1) across the entire sequence
-        x_0 = self.depth_emb(input).sum(dim=-2)   # (B, L, d_model)
-        x_1 = self.depth_emb(target).sum(dim=-2)  # (B, L, d_model)
+        x_0 = self.depth_emb(input).sum(dim=-2)   
+        x_1 = self.depth_emb(target).sum(dim=-2)  
 
-        # 3. Sample unique random flow values (t) for EVERY element in the batch and sequence dimension
-        # Shape: (B, L, 1) so it broadcasts perfectly with our sequence vectors
         t = torch.rand((B, L, 1), device=device)
 
-        # 4. Construct the path trajectory across the whole grid
         x_t = t * x_1 + (1.0 - t) * x_0
         target_velocity = x_1 - x_0
 
-        # Flatten out spatial grids to feed into our velocity neural field
         x_t_flat = rearrange(x_t, "b l d -> (b l) d")
         t_flat = rearrange(t, "b l 1 -> (b l) 1")
         mid_tokens_flat = rearrange(mid_tokens, "b l d -> (b l) d")
 
-        # 5. Predict our trajectories 
         v_pred_flat = self.depth_forward(x_t_flat, t_flat, mid_tokens_flat)
         v_pred = rearrange(v_pred_flat, "(b l) d -> b l d", b=B, l=L)
         
@@ -223,30 +213,28 @@ class MARIUS(torch.nn.Module):
 
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
+        device = input.device
+        
         v_pred, target_velocity = self.train_forward(input, target)
+        raw_loss = (v_pred - target_velocity) ** 2 
         
-        # Calculate raw element-wise MSE loss
-        raw_loss = (v_pred - target_velocity) ** 2 # (B, L, d_model)
+        # FIXED: Replaced hardcoded -100 with dynamic SpecialTokens check for consistency
+        loss_mask = (target[:, :, 0] != SpecialTokens.PAD.value).float().unsqueeze(-1) 
         
-        # Build a hard mask to locate padding elements (-100 values)
-        # 1.0 for valid real pairs, 0.0 for padding junk
-        loss_mask = (target[:, :, 0] != -100).float().unsqueeze(-1) # (B, L, 1)
-        
-        # Suppress any loss calculations tied to padding blocks
         masked_loss = raw_loss * loss_mask
-        
-        # Calculate true final mean, ignoring the zeroed out masked zones
         num_valid_elements = loss_mask.sum()
+        
         if num_valid_elements > 0:
             loss = masked_loss.sum() / (num_valid_elements * self.depth_cfg.d_model)
         else:
-            # If the entire batch is somehow padding, create a zero loss tied to the graph 
-            loss = v_pred.sum() * 0.0
+            # FIXED: Avoided execution graph tracking on completely dead zero channels
+            loss = torch.zeros(1, device=device, requires_grad=True)
             
         return loss, v_pred
 
     def search(self, batch, n_results):
-        assert self.training is False
+        # FIXED: Using PyTorch modular idiomatic style tracking instead of native property raw check
+        assert not self.training, "Search mode can only run during inference evaluations."
 
         input = batch["input"]
         L_target = batch["target"].shape[-1] 
@@ -255,14 +243,12 @@ class MARIUS(torch.nn.Module):
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        # Extract sequence context based completely on past item paths
         temporal_tokens = self.temporal_forward(input)
-        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :] # Vector context (B, d_model)
+        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :] 
 
         B = input.shape[0]
         device = input.device
 
-        # Inference starts precisely at the last interacted item (t=0.0)
         last_item_ids = input[:, -1, :]
         x_0 = self.depth_emb(last_item_ids).sum(dim=1)
 
@@ -270,7 +256,6 @@ class MARIUS(torch.nn.Module):
         x_t = x_0.clone()
         dt = (t_end - t_start) / self.ode_steps
 
-        # Integrator loop traveling down the velocity fields
         for step in range(self.ode_steps):
             t_val = t_start + (step * dt)
             t = torch.full((B, 1), t_val, device=device, dtype=x_t.dtype)
@@ -290,7 +275,8 @@ class MARIUS(torch.nn.Module):
             indices = topk_indices.unsqueeze(-1).repeat(1, 1, L_target)
 
         if self.filter_preds:
-            arranged = torch.arange(B, device=indices.device).view(-1, 1)
+            # FIXED: Made tensor creation cleanly contextualized to source input devices
+            arranged = torch.arange(B, device=device).view(-1, 1)
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
             is_in_query = is_in_query.all(dim=-1).any(dim=-1)
 
