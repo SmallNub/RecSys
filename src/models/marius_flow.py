@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from einops import rearrange
 
 # Importing your existing Cosette model architecture directly
-from src.models import COSETTE, SpecialTokens
+from src.models import SpecialTokens
+from src.models.cosette import COSETTE
 
 
 @dataclass
