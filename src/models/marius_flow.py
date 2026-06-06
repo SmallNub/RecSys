@@ -102,7 +102,6 @@ class MARIUS(torch.nn.Module):
             torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model),
         )
 
-        # No external item configurations or parquets are required
         self.catalog_tokens = None
 
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
@@ -122,6 +121,7 @@ class MARIUS(torch.nn.Module):
             norm=torch.nn.LayerNorm(self.temporal_cfg.d_model),
         )
 
+        # The velocity network processes vectors directly; we only need a 1-layer projection or MLP blocks
         self.depth_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.depth_cfg.d_model,
@@ -178,73 +178,71 @@ class MARIUS(torch.nn.Module):
         return out
 
     def depth_forward(self, x_t, t, mid_tokens):
-        t_emb = self.get_fourier_time_embedding(t).unsqueeze(1)
-        x_t_emb = x_t.unsqueeze(1)
-        x_t_emb = self.depth_dropout(x_t_emb)
-
-        dec_inputs = torch.cat([mid_tokens, t_emb, x_t_emb], dim=1)
+        # x_t: (B, d_model), t: (B, 1), mid_tokens: (B, d_model)
+        t_emb = self.get_fourier_time_embedding(t)
+        
+        # Inject context directly via vector addition to break bidirectional shortcuts
+        combined_features = x_t + t_emb + mid_tokens
+        
+        dec_inputs = combined_features.unsqueeze(1) # (B, 1, d_model)
+        dec_inputs = self.depth_dropout(dec_inputs)
+        
         depth_preds = self.depth_tf(dec_inputs)
-        return depth_preds[:, -1, :]
+        return depth_preds.squeeze(1) # (B, d_model)
 
-    def train_forward(self, input, target, timestamps=None):
-        """
-        timestamps: Tensor of shape (B, L) containing the randomly assigned 
-                    but sequentially ordered timestamps (e.g., 0.12, 0.25, 0.43...)
-        """
+    def train_forward(self, input, target):
         B, L, _ = input.shape
         device = input.device
-
-        if timestamps is None:
-            # Fallback: create random sorted timestamps per batch if not provided by dataloader
-            timestamps = torch.sort(torch.rand((B, L), device=device), dim=-1).values
-
-        # 1. Generate a Time-Based Causal Mask for the temporal encoder
-        # Position i can only attend to position j if timestamp[j] <= timestamp[i]
-        time_mask = timestamps.unsqueeze(1) < timestamps.unsqueeze(2) # (B, L, L)
         
-        # Combined mask with your padding mask and structural causal mask
-        # Note: PyTorch Transformer Encoder expects True where attention is forbidden
-        pad_mask = (input[:, :, 0] == SpecialTokens.PAD.value).unsqueeze(1).repeat(1, L, 1)
-        full_temporal_mask = time_mask | pad_mask
+        # 1. Map history sequentially under a strict temporal causal mask
+        temporal_tokens = self.temporal_forward(input) # (B, L, d_model)
+        mid_tokens = self.mid_proj(temporal_tokens)    # (B, L, d_model)
 
-        # 2. Pass through temporal encoder with our strict timestamp mask
-        # We must loop or use a custom attention mechanism if masks vary per batch element,
-        # or process them using PyTorch's native tuple/3D mask support.
-        temporal_tokens = []
+        # 2. Randomly select an interaction index per batch element to form pairs
+        # Needs at least 1 valid history token to flow from, and 1 next item target
+        valid_indices = []
+        chosen_positions = []
+        
         for b in range(B):
-            # Process per batch element because each has a unique random timeline
-            input_embs = self.temp_emb(input[b]).sum(dim=-1) + self.temp_pos_emb[0, :L, :]
-            out_b = self.temp_tf(
-                input_embs.unsqueeze(0),
-                mask=full_temporal_mask[b]
-            )
-            temporal_tokens.append(out_b)
-        temporal_tokens = torch.cat(temporal_tokens, dim=0)
+            # Locate active unpadded entries
+            valid_len = (input[b, :, 0] != SpecialTokens.PAD.value).sum().item()
+            # Also ensure target isn't an ignored flag
+            valid_targets = torch.where(target[b, :, 0] != -100)[0]
+            
+            # Intersection of existing steps and real targets
+            possible_idx = [idx for idx in range(valid_len) if idx in valid_targets]
+            
+            if len(possible_idx) > 0:
+                pos = float(torch.randint(0, len(possible_idx), (1,)).item())
+                chosen_positions.append(possible_idx[int(pos)])
+                valid_indices.append(b)
+                
+        if len(valid_indices) == 0:
+            # Fallback if batch contains only padding junk
+            return torch.zeros((1, self.depth_cfg.d_model), device=device), torch.zeros((1, self.depth_cfg.d_model), device=device)
 
-        mid_tokens = self.mid_proj(temporal_tokens)
-        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
+        # Squeeze batch data down to only valid parsed entries
+        valid_b = torch.tensor(valid_indices, device=device)
+        valid_l = torch.tensor(chosen_positions, device=device)
 
-        # 3. Flow Matching Setup
-        target_flat = rearrange(target, "b l k -> (b l) k")
-        keep = target_flat[:, 0] != -100
+        # Extract context representing history up to step l
+        mid_tokens_sampled = mid_tokens[valid_b, valid_l] # (N, d_model)
 
-        mid_tokens = mid_tokens[keep]
-        target_flat = target_flat[keep]
-        
-        x_1 = self.depth_emb(target_flat).sum(dim=1)
-        
-        input_flat = rearrange(input, "b l k -> (b l) k")[keep]
-        x_0 = self.depth_emb(input_flat).sum(dim=1)
+        # Pull item tokens
+        input_sampled = input[valid_b, valid_l]   # (N, K) -> Item at t=0
+        target_sampled = target[valid_b, valid_l] # (N, K) -> Next item at t=1
 
-        # Crucial Fix: Flow time (t) must be completely decoupled from history timeline
-        # to avoid algebraic reverse-engineering tricks!
-        t_flat = torch.rand((mid_tokens.shape[0], 1), device=device)
+        x_0 = self.depth_emb(input_sampled).sum(dim=1)
+        x_1 = self.depth_emb(target_sampled).sum(dim=1)
 
-        # Standard Rectified Flow Equation
+        # 3. Continuous Integration Mechanics
+        t_flat = torch.rand((x_0.shape[0], 1), device=device)
+
+        # Flow straight path setups
         x_t = t_flat * x_1 + (1.0 - t_flat) * x_0
         target_velocity = x_1 - x_0
 
-        v_pred = self.depth_forward(x_t, t_flat, mid_tokens)
+        v_pred = self.depth_forward(x_t, t_flat, mid_tokens_sampled)
         return v_pred, target_velocity
 
     def get_loss(self, batch):
@@ -257,25 +255,28 @@ class MARIUS(torch.nn.Module):
         assert self.training is False
 
         input = batch["input"]
-        L = batch["target"].shape[-1] 
+        L_target = batch["target"].shape[-1] 
 
         if self.filter_preds:
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
+        # Extract sequence context based completely on past item paths
         temporal_tokens = self.temporal_forward(input)
-        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :].unsqueeze(1)
+        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :] # Vector context (B, d_model)
 
         B = input.shape[0]
         device = input.device
 
+        # Inference starts precisely at the last interacted item (t=0.0)
         last_item_ids = input[:, -1, :]
         x_0 = self.depth_emb(last_item_ids).sum(dim=1)
 
-        t_start, t_end = 0.9, 1.0
+        t_start, t_end = 0.0, 1.0
         x_t = x_0.clone()
         dt = (t_end - t_start) / self.ode_steps
 
+        # Integrator loop traveling down the velocity fields
         for step in range(self.ode_steps):
             t_val = t_start + (step * dt)
             t = torch.full((B, 1), t_val, device=device, dtype=x_t.dtype)
@@ -290,10 +291,9 @@ class MARIUS(torch.nn.Module):
             _, topk_item_indices = torch.topk(scores, n_results, dim=-1)
             indices = self.catalog_tokens[topk_item_indices]
         else:
-            # Reverts directly back to embedding lookup structures if no token maps are explicitly passed
             logits = torch.einsum("bd, vd -> bv", target_item_embedding, self.depth_emb.weight)
             _, topk_indices = torch.topk(logits, n_results, dim=-1)
-            indices = topk_indices.unsqueeze(-1).repeat(1, 1, L)
+            indices = topk_indices.unsqueeze(-1).repeat(1, 1, L_target)
 
         if self.filter_preds:
             arranged = torch.arange(B, device=indices.device).view(-1, 1)
