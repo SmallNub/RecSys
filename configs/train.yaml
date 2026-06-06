@@ -17,6 +17,7 @@ trainer:
   val_check_interval: 10_000
   limit_val_batches: 1000 # Reduce for faster (approximate) validation
   max_steps: 81_000 # Overriden by experiment selection
+  limit_train_batches: ${eval:'${data.datasets.total_len} // ${data.datamodule.train_batch_size}'}
   # CALLBACKS
   callbacks: 
   - _target_: pytorch_lightning.callbacks.ModelSummary

@@ -35,27 +35,22 @@ COL_ORDER = ["user_id", "timeline", "rating", "timestamp"]
 
 
 class TrainDataset(IterableDataset):
-    def __init__(self, df, pp_cfg, total_len):
+    def __init__(self, df, pp_cfg):
+        # NOTE: total_len removed from here entirely
         self.df = df
         self.pp_cls = hydra.utils.get_class(pp_cfg.pop("_cls_"))
         self.pp = self.pp_cls(**pp_cfg)
-        self.total_len = total_len
         self.df_len = len(df)
         self.values = df.values
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        num_workers = worker_info.num_workers if worker_info else 1
-        
-        per_worker = self.total_len // num_workers
-        for _ in range(per_worker):
+        # Infinite generator: let workers stream random items seamlessly.
+        # PyTorch Lightning will decide when to stop based on limit_train_batches.
+        while True:
             idx = random.randint(0, self.df_len - 1)
             row_vals = self.values[idx]
             row = {k: row_vals[i] for i, k in enumerate(COL_ORDER)}
             yield self.pp(row)
-
-    def __len__(self):
-        return self.total_len
 
 
 class EvalDataset(Dataset):
@@ -77,7 +72,7 @@ def make_datasets(
     quant_id,
     category,
     prepro_cfg,
-    total_len,
+    total_len,  # Retained in signature so your existing pipeline doesn't break
     num_workers,
     paths,
     which=["train", "valid"],
@@ -109,14 +104,12 @@ def make_datasets(
         )
 
         path = paths.timelines_tplt.format(category=category, split=split)
-        
+
         if split == "train":
-            assert (
-                total_len is not None
-            ), "total_len must be specified for the training dataset."
             df = pd.read_parquet(path, filesystem=fs).reset_index()[COL_ORDER]
             df = df[df.timeline.apply(len) > 1]
-            datasets["train"] = TrainDataset(df, pp_cfg, total_len)
+            # Passed without total_len parameter
+            datasets["train"] = TrainDataset(df, pp_cfg)
         else:
             # Just read the dataframe
             df = pd.read_parquet(path, filesystem=fs).reset_index()[COL_ORDER]
