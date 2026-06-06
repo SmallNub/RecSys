@@ -51,6 +51,7 @@ if [ -z "$LATEST_MARIUS_RUN" ]; then
     exit 1
 fi
 
-echo "Running evaluation on latest experiment directory: ${LATEST_MARIUS_RUN}"
+RUN=$(basename "${LATEST_MARIUS_RUN}")
+echo "Running evaluation on latest experiment directory: ${RUN}"
 
-python src/test.py run_directory="${LATEST_MARIUS_RUN}"
+python src/test.py run_directory="${RUN}"
