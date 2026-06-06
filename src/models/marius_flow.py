@@ -2,14 +2,14 @@ from dataclasses import dataclass
 import glob
 import math
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
 # Importing your existing Cosette model architecture directly
-from src.models import SpecialTokens
-from src.models.cosette import COSETTE
+from src.models import COSETTE, SpecialTokens
 
 
 @dataclass
@@ -27,7 +27,7 @@ class TransformerConfig:
 
 
 # ==========================================
-# AUTOMATED LATEST CHECKPOINT LOADER FUNCTION
+# DIAGNOSTIC LATEST CHECKPOINT LOADER FUNCTION
 # ==========================================
 
 def load_latest_catalog_tokens(device="cuda"):
@@ -35,7 +35,6 @@ def load_latest_catalog_tokens(device="cuda"):
     Finds the newest timestamp checkpoint inside outputs/checkpoints/cosette/{timestamp}/last_model.pth,
     loads the pre-trained weights, and extracts the full token catalog map.
     """
-    # Strictly lock the path pattern to the cosette timestamp directory structure
     base_path = os.path.join(os.getcwd(), "outputs", "checkpoints", "cosette", "*", "last_model.pth")
     checkpoint_files = glob.glob(base_path)
 
@@ -48,30 +47,71 @@ def load_latest_catalog_tokens(device="cuda"):
     latest_checkpoint_path = checkpoint_files[-1]
     print(f"🚀 Found latest Cosette checkpoint path target: {latest_checkpoint_path}")
 
+    # Check if file size is empty (corrupted save)
+    if os.path.exists(latest_checkpoint_path):
+        file_size_mb = os.path.getsize(latest_checkpoint_path) / (1024 * 1024)
+        print(f"📦 Checkpoint target file size: {file_size_mb:.2f} MB")
+        if file_size_mb == 0:
+            print("❌ Error: Checkpoint file is completely empty (0 bytes).")
+            return None
+
     # Safely load weights map
-    checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("state_dict", checkpoint) if checkpoint is not None else None
-    
-    # CRITICAL GUARD: Stop immediately if the state_dict couldn't be loaded
-    if state_dict is None:
-        print("⚠️ Warning: Checkpoint state dict is empty. Reverting to vocabulary flat lookups.")
+    try:
+        checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+    except Exception as e:
+        print(f"❌ Critical Error reading the physical pth file with torch.load: {e}")
         return None
+
+    if checkpoint is None:
+        print("❌ Error: torch.load returned a None object.")
+        return None
+
+    # Debug checkpoint object types
+    print(f"🔍 Loaded checkpoint raw type identifier: {type(checkpoint)}")
+
+    # Extract state dict safely regardless of key nesting structure
+    if isinstance(checkpoint, dict):
+        if "state_dict" in checkpoint:
+            print("ℹ️ Found wrapped 'state_dict' layer key within checkpoint.")
+            state_dict = checkpoint["state_dict"]
+        else:
+            print("ℹ️ Checkpoint is a dictionary without an explicit 'state_dict' wrapper; reading raw keys.")
+            state_dict = checkpoint
+    else:
+        print(f"⚠️ Warning: Checkpoint object is not a standard dictionary wrapper. Object contents: {checkpoint}")
+        state_dict = None
+
+    if state_dict is None or not hasattr(state_dict, "items"):
+        print(f"❌ Error: Extracted state_dict is invalid or not iterable. Content: {state_dict}")
+        return None
+
+    # Print top-level weight names for auditing layers
+    available_keys = list(state_dict.keys())
+    print(f"📊 Total weight keys found in file: {len(available_keys)}")
+    print(f"📋 First 10 layer keys: {available_keys[:10]}")
 
     # Recover structural dimension features from saved embedding parameters
     embeddings_weight = state_dict.get("embeddings", state_dict.get("module.embeddings", None))
     if embeddings_weight is None:
-        print("⚠️ Warning: Checkpoint missing base embedding layer mappings. Reverting.")
+        print("❌ Error: Checkpoint missing base 'embeddings' layer mappings.")
         return None
 
     total_items, in_dim = embeddings_weight.shape
+    print(f"📐 Found catalog shape matrix features: Items={total_items}, Dimension={in_dim}")
 
     # Recover structural dimension features from state layers directly
     encoder_weights = [v for k, v in state_dict.items() if "encoder.mlp_layers" in k and "weight" in k]
     layers_dims = [w.shape[0] for w in encoder_weights]
+    print(f"📐 Recovered Encoder Layer dimensions sequence: {layers_dims}")
     
+    if not layers_dims:
+        print("❌ Error: Could not parse encoder shape dimensions. Your layer key structure might differ.")
+        return None
+
     # Read centroid counts dynamically from parameters
     num_quantizers = len([k for k in state_dict.keys() if "rq.vq_layers" in k and "embedding.weight" in k])
     n_centroids_list = [256] * num_quantizers
+    print(f"🔢 Quantizers detected count: {num_quantizers} -> Book Config List: {n_centroids_list}")
 
     # Initialize imported model structure instance
     cosette_model = COSETTE(
@@ -90,10 +130,16 @@ def load_latest_catalog_tokens(device="cuda"):
         name = k.replace("module.", "") if k.startswith("module.") else k
         sanitized_state_dict[name] = v
 
-    cosette_model.load_state_dict(sanitized_state_dict, strict=False)
+    try:
+        cosette_model.load_state_dict(sanitized_state_dict, strict=False)
+        print("✨ State dict matching complete.")
+    except Exception as e:
+        print(f"⚠️ Non-breaking mismatch notification during layer copy verification: {e}")
+
     cosette_model.eval()
 
     # Process all available catalog vectors directly into discrete multi-scale tokens
+    print("⏳ Processing index projection lookup map...")
     with torch.no_grad():
         catalog_tokens, _ = cosette_model.get_indices(use_sk=False)
 
@@ -270,11 +316,9 @@ class MARIUS(torch.nn.Module):
 
         x_1 = self.depth_emb(target_flat).sum(dim=1)
 
-        # Baseline trajectory modification: map continuous start point to past history step
         input_flat = rearrange(input, "b l k -> (b l) k")[keep]
         x_0 = self.depth_emb(input_flat).sum(dim=1)
 
-        # Dynamic timescale creation matching total timeline boundaries
         time_steps = torch.linspace(0.0, 0.9, steps=L, device=input.device)
         t_matrix = time_steps.unsqueeze(0).repeat(B, 1)
         t_flat = rearrange(t_matrix, "b l -> (b l) 1")[keep]
@@ -307,11 +351,9 @@ class MARIUS(torch.nn.Module):
         B = input.shape[0]
         device = input.device
 
-        # Initialize continuous trajectory position using the user's last historic interaction sequence item
         last_item_ids = input[:, -1, :]
         x_0 = self.depth_emb(last_item_ids).sum(dim=1)
 
-        # Execute ODE tracking iterations inside the prediction spectrum window [0.9 -> 1.0]
         t_start, t_end = 0.9, 1.0
         x_t = x_0.clone()
         dt = (t_end - t_start) / self.ode_steps
@@ -324,15 +366,12 @@ class MARIUS(torch.nn.Module):
 
         target_item_embedding = x_t
 
-        # Fully integrated real item candidate matching lookup step
         if self.catalog_tokens is not None:
-            # Reconstruct dense coordinate space map of full hierarchical catalog items
             catalog_embeddings = self.depth_emb(self.catalog_tokens.to(device)).sum(dim=1)
             scores = torch.einsum("bd, id -> bi", target_item_embedding, catalog_embeddings)
             _, topk_item_indices = torch.topk(scores, n_results, dim=-1)
             indices = self.catalog_tokens[topk_item_indices]
         else:
-            # Fallback uniform index projection if directory lookup was skipped
             logits = torch.einsum("bd, vd -> bv", target_item_embedding, self.depth_emb.weight)
             _, topk_indices = torch.topk(logits, n_results, dim=-1)
             indices = topk_indices.unsqueeze(-1).repeat(1, 1, L)
