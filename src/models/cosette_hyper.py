@@ -14,9 +14,11 @@ def lorentz_inner(u, v):
     return -u[..., 0] * v[..., 0] + (u[..., 1:] * v[..., 1:]).sum(dim=-1)
 
 def distance_lorentz(x, y):
-    inner = lorentz_inner(x, y)
+    # FIX: Force float32 to preserve the 1e-7 clamping margin against bfloat16 rounding
+    x_f, y_f = x.float(), y.float() 
+    inner = lorentz_inner(x_f, y_f)
     inner = torch.clamp(inner, max=-1.0 - 1e-7)
-    return torch.acosh(-inner)
+    return torch.acosh(-inner).to(x.dtype)
 
 def project_to_manifold(x, c=1.0):
     """Forced float32 internally to prevent bfloat16 NaN collapse. 
@@ -29,7 +31,9 @@ def project_to_manifold(x, c=1.0):
     return torch.cat([x0, x_f], dim=-1).to(x.dtype)
 
 def log_map(x, y):
-    inner = lorentz_inner(x, y)
+    # FIX: Force float32 precision
+    x_f, y_f = x.float(), y.float()
+    inner = lorentz_inner(x_f, y_f)
     inner = torch.clamp(inner, max=-1.0 - 1e-7)
     dist = torch.acosh(-inner)
     
@@ -37,34 +41,38 @@ def log_map(x, y):
     sinh_dist = torch.sinh(dist)
     scale = torch.where(dist > 1e-6, dist / torch.clamp(sinh_dist, min=1e-6), 1.0)
     
-    v = y + inner.unsqueeze(-1) * x
-    return scale.unsqueeze(-1) * v
+    v = y_f + inner.unsqueeze(-1) * x_f
+    return (scale.unsqueeze(-1) * v).to(x.dtype)
 
 def exp_map(x, v):
-    norm_v_sq = lorentz_inner(v, v)
-    norm_v_sq = torch.clamp(norm_v_sq, min=0.0) # Prevent NaNs from fp precision
+    # FIX: Force float32 precision
+    x_f, v_f = x.float(), v.float()
+    norm_v_sq = lorentz_inner(v_f, v_f)
+    # FIX: Clamp to >0 (1e-15) to prevent NaN gradients from sqrt(0)
+    norm_v_sq = torch.clamp(norm_v_sq, min=1e-15) 
     norm_v = torch.sqrt(norm_v_sq)
     
     # Taylor expansion of sinh(x)/x around 0 is 1 + x^2/6
     scale = torch.where(norm_v > 1e-6, torch.sinh(norm_v) / norm_v, 1.0 + norm_v_sq / 6.0)
-    return torch.cosh(norm_v).unsqueeze(-1) * x + scale.unsqueeze(-1) * v
+    out = torch.cosh(norm_v).unsqueeze(-1) * x_f + scale.unsqueeze(-1) * v_f
+    return out.to(x.dtype)
 
 def parallel_transport_to_origin(x, v):
-    """Analytically simplified: x -> O transport. (FIXED: Sign is positive)"""
+    """Analytically simplified: x -> O transport."""
     x0 = x[..., 0:1]
     v0 = v[..., 0:1]
-    factor = v0 / (1.0 + x0) # <--- Fixed sign
+    factor = v0 / (1.0 + x0)
     
     out = v + factor * x
     out[..., 0:1] += factor 
     return out
 
 def parallel_transport_from_origin(x, v):
-    """Analytically simplified: O -> x transport. (FIXED: Sign is negative)"""
+    """Analytically simplified: O -> x transport."""
     x0 = x[..., 0:1]
     # v is in T_O, so v_0 is 0. Inner product is just the spatial part.
     inner_xv = (x[..., 1:] * v[..., 1:]).sum(dim=-1, keepdim=True)
-    factor = -inner_xv / (1.0 + x0) # <--- Fixed sign
+    factor = -inner_xv / (1.0 + x0)
     
     out = v + factor * x
     out[..., 0:1] += factor
@@ -237,11 +245,14 @@ class HyperbolicVectorQuantizer(nn.Module):
         # 1. Fast Distance Matrix Matrix Multiplications
         inner = -x_L[:, 0:1] * centroids_L[:, 0:1].t() + torch.matmul(x_L[:, 1:], centroids_L[:, 1:].t())
         
+        # FIX: Correctly clamp the inner product BEFORE applying the negative sign for acosh
+        clamped_inner = torch.clamp(inner, max=-1.0 - 1e-5)
+        d = torch.acosh(-clamped_inner)
+        
         if not use_sk or self.sk_epsilon <= 0:
             indices = torch.argmax(inner, dim=-1)
-            d = -inner 
+            # Distance is now consistently true hyperbolic distance
         else:
-            d = torch.acosh(torch.clamp(-inner, max=-1.0 - 1e-5))
             d_centered = VectorQuantizer.center_distance_for_constraint(d)
             Q = sinkhorn_algorithm(d_centered.double(), self.sk_epsilon, self.sk_iters)
             indices = torch.argmax(Q, dim=-1)
@@ -254,13 +265,9 @@ class HyperbolicVectorQuantizer(nn.Module):
         r_target_L = parallel_transport_to_origin(c1, v_target)
         r_target_E = r_target_L[:, 1:] 
 
-        # 3. Exact Manifold Codebook Losses (FIXED)
-        # We detach x_L to pass the 1.0 gradient purely to the codebook (c1)
+        # 3. Exact Manifold Codebook Losses
         codebook_loss = distance_lorentz(x_L.detach(), c1).mean()
-        
-        # We detach c1 to pass the 0.25 (beta) gradient purely to the encoder (x_L)
         commitment_loss = distance_lorentz(x_L, c1.detach()).mean()
-        
         loss = codebook_loss + self.beta * commitment_loss
 
         return c1, r_target_E, loss, indices, d
@@ -328,7 +335,6 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         # 5. Inverse projection back to flat R^d space for the Decoder
         x_q = x_q_L[:, 1:]
         
-        # <--- NEW: Un-scale curvature so the Decoder doesn't thrash
         if c != 1.0:
             x_q = x_q / torch.sqrt(torch.tensor(c, dtype=torch.float32, device=x.device))
         
@@ -362,15 +368,11 @@ class SigLIPLoss(torch.nn.Module):
         return loss
 
     def forward(self, xa_L, xb_L, items, timelines):
-        """Processes contrastive alignment entirely using native Lorentz distance."""
         # Pairwise Lorentz Inner Product Matrix
         inner = -xa_L[:, 0:1] * xb_L[:, 0:1].t() + torch.matmul(xa_L[:, 1:], xb_L[:, 1:].t())
         inner = torch.clamp(inner, max=-1.0 - 1e-7)
         dist = torch.acosh(-inner)
         
-        # FIX: Map unbounded hyperbolic distance [0, inf) to bounded similarity [-1, 1]
-        # This perfectly matches the Euclidean cosine similarity gradient scale.
-        # If dist = 0 -> sim = 1.0. If dist = infinity -> sim = -1.0.
         sim = (2.0 / (1.0 + dist)) - 1.0
         
         logits = sim * self.tau.exp() + self.bias
@@ -425,35 +427,4 @@ class COSETTE(torch.nn.Module):
             x_hat = self.decoder(x_q)
 
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
-            loss += recon_loss * self.loss_weights["reconstruction"]
-            loss += rq_loss * self.loss_weights["quantization"]
-            metrics["reconstruction_loss"] = recon_loss.item()
-            metrics["quantization_loss"] = rq_loss.item()
-
-        if self.loss_weights["contrastive"] > 0:
-            embeddings = F.embedding(items, self.embeddings)
-            x = self.encoder(embeddings)
-            
-            _, sig_rq_loss, _, _, x_q_L = self.rq(x, use_sk=True, c=c)
-
-            contrastive_loss = self.siglip(x_q_L, x_q_L, items, timelines)
-            loss += sig_rq_loss * self.loss_weights["quantization"]
-            loss += contrastive_loss * self.loss_weights["contrastive"]
-
-            metrics["contrastive_loss"] = contrastive_loss.item()
-            metrics["quantization_loss"] += sig_rq_loss.item()
-            metrics["tau"] = self.siglip.tau.item()
-            metrics["bias"] = self.siglip.bias.item()
-            metrics["n_items_in_batch"] = len(items)
-
-        metrics["manifold_curvature"] = c
-        return loss, metrics
-
-    @torch.no_grad()
-    def get_indices(self, embeddings=None, use_sk=False, c=1.0):
-        if embeddings is None:
-            embeddings = self.embeddings
-        x_e = self.encoder(embeddings)
-        
-        _, _, indices, distances, _ = self.rq(x_e, use_sk=use_sk, c=c)
-        return indices, distances
+            loss

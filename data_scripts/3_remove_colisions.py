@@ -234,10 +234,11 @@ def main(config):
                     ori_code[level] = sort_distances_index[item][level][num]
                     num += 1
 
-                for i in range(1, max_num):
+                # FIX: Changed inner loop variable from `i` to `j` to prevent shadowing
+                for j in range(1, max_num):
                     if tuple(ori_code) in all_indices_tup_set:
                         ori_code = copy.deepcopy(all_indices[item])
-                        ori_code[level - 1] = sort_distances_index[item][level - 1][i]
+                        ori_code[level - 1] = sort_distances_index[item][level - 1][j]
 
                     num = 0
                     while tuple(ori_code) in all_indices_tup_set and num < max_num:
