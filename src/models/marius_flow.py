@@ -1,14 +1,9 @@
 from dataclasses import dataclass
-from datetime import datetime
 import math
-import os
-from pathlib import Path
-
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-# Ensure this matches your project structure
 from src.models import SpecialTokens
 
 
@@ -24,27 +19,6 @@ class TransformerConfig:
     sigma: float = 0.0
     ode_steps: int = 10
     fourier_dim: int = 32
-
-
-def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d_%H%M%S") -> Path:
-    base_dir = Path(base_dir_path)
-    latest_dir = None
-    latest_time = None
-
-    if not base_dir.exists():
-        print(f"[DEBUG] Base directory does not exist: {base_dir_path}")
-        return None
-
-    for entry in base_dir.iterdir():
-        if entry.is_dir():
-            try:
-                folder_time = datetime.strptime(entry.name, timestamp_format)
-                if latest_time is None or folder_time > latest_time:
-                    latest_time = folder_time
-                    latest_dir = entry
-            except ValueError:
-                continue
-    return latest_dir
 
 
 class MARIUS(torch.nn.Module):
@@ -73,6 +47,7 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
+        # Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -188,52 +163,52 @@ class MARIUS(torch.nn.Module):
         return depth_preds.squeeze(1)
 
     def train_forward(self, input, target):
-        B, L, _ = input.shape
         device = input.device
         
+        # 1. Map history sequentially through temporal layers
         temporal_tokens = self.temporal_forward(input) 
         mid_tokens = self.mid_proj(temporal_tokens)    
-
-        x_0 = self.depth_emb(input).sum(dim=-2)   
-        x_1 = self.depth_emb(target).sum(dim=-2)  
-
-        t = torch.rand((B, L, 1), device=device)
-
-        x_t = t * x_1 + (1.0 - t) * x_0
-        target_velocity = x_1 - x_0
-
-        x_t_flat = rearrange(x_t, "b l d -> (b l) d")
-        t_flat = rearrange(t, "b l 1 -> (b l) 1")
         mid_tokens_flat = rearrange(mid_tokens, "b l d -> (b l) d")
 
-        v_pred_flat = self.depth_forward(x_t_flat, t_flat, mid_tokens_flat)
-        v_pred = rearrange(v_pred_flat, "(b l) d -> b l d", b=B, l=L)
+        # 2. Flatten targets and clean out padding components completely
+        target_flat = rearrange(target, "b l k -> (b l) k")
+        input_flat = rearrange(input, "b l k -> (b l) k")
         
-        return v_pred, target_velocity
+        keep = target_flat[:, 0] != -100
+
+        # Discard data entries matching padded locations
+        mid_tokens_flat = mid_tokens_flat[keep]
+        target_flat = target_flat[keep]
+        input_flat = input_flat[keep]
+
+        # 3. Form flow trajectories solely with active elements
+        x_0 = self.depth_emb(input_flat).sum(dim=-2)   
+        x_1 = self.depth_emb(target_flat).sum(dim=-2)  
+
+        N = mid_tokens_flat.shape[0]
+        t_flat = torch.rand((N, 1), device=device)
+
+        x_t_flat = t_flat * x_1 + (1.0 - t_flat) * x_0
+        target_velocity = x_1 - x_0
+
+        # 4. Predict velocities across your unpadded trajectory grid
+        v_pred_flat = self.depth_forward(x_t_flat, t_flat, mid_tokens_flat)
+        
+        return v_pred_flat, target_velocity
 
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
-        device = input.device
         
         v_pred, target_velocity = self.train_forward(input, target)
-        raw_loss = (v_pred - target_velocity) ** 2 
         
-        # FIXED: Replaced hardcoded -100 with dynamic SpecialTokens check for consistency
-        loss_mask = (target[:, :, 0] != SpecialTokens.PAD.value).float().unsqueeze(-1) 
-        
-        masked_loss = raw_loss * loss_mask
-        num_valid_elements = loss_mask.sum()
-        
-        if num_valid_elements > 0:
-            loss = masked_loss.sum() / (num_valid_elements * self.depth_cfg.d_model)
-        else:
-            # FIXED: Avoided execution graph tracking on completely dead zero channels
-            loss = torch.zeros(1, device=device, requires_grad=True)
+        if v_pred.numel() == 0:
+            # Clean fallback if an entire batch consists of padding blocks
+            return torch.zeros(1, device=input.device, requires_grad=True), v_pred
             
+        loss = self.criterion(v_pred, target_velocity)
         return loss, v_pred
 
     def search(self, batch, n_results):
-        # FIXED: Using PyTorch modular idiomatic style tracking instead of native property raw check
         assert not self.training, "Search mode can only run during inference evaluations."
 
         input = batch["input"]
@@ -275,7 +250,6 @@ class MARIUS(torch.nn.Module):
             indices = topk_indices.unsqueeze(-1).repeat(1, 1, L_target)
 
         if self.filter_preds:
-            # FIXED: Made tensor creation cleanly contextualized to source input devices
             arranged = torch.arange(B, device=device).view(-1, 1)
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
             is_in_query = is_in_query.all(dim=-1).any(dim=-1)
