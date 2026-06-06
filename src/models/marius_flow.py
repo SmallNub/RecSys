@@ -32,9 +32,10 @@ class TransformerConfig:
 
 def load_latest_catalog_tokens(device="cuda"):
     """
-    Finds the newest timestamp checkpoint inside outputs/checkpoints/cosette/,
+    Finds the newest timestamp checkpoint inside outputs/checkpoints/cosette/{timestamp}/last_model.pth,
     loads the pre-trained weights, and extracts the full token catalog map.
     """
+    # Strictly lock the path pattern to the cosette timestamp directory structure
     base_path = os.path.join(os.getcwd(), "outputs", "checkpoints", "cosette", "*", "last_model.pth")
     checkpoint_files = glob.glob(base_path)
 
@@ -42,19 +43,25 @@ def load_latest_catalog_tokens(device="cuda"):
         print("⚠️ Warning: No Cosette checkpoints found in outputs/checkpoints/cosette/! Reverting to vocabulary flat lookups.")
         return None
 
-    # Sorting text strings naturally sorts 'YYYYMMDD_HHMMSS' chronologically
+    # Sorting strings naturally sorts 'YYYYMMDD_HHMMSS' chronologically
     checkpoint_files.sort()
     latest_checkpoint_path = checkpoint_files[-1]
     print(f"🚀 Found latest Cosette checkpoint path target: {latest_checkpoint_path}")
 
     # Safely load weights map
     checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("state_dict", checkpoint)
+    state_dict = checkpoint.get("state_dict", checkpoint) if checkpoint is not None else None
+    
+    # CRITICAL GUARD: Stop immediately if the state_dict couldn't be loaded
+    if state_dict is None:
+        print("⚠️ Warning: Checkpoint state dict is empty. Reverting to vocabulary flat lookups.")
+        return None
 
     # Recover structural dimension features from saved embedding parameters
     embeddings_weight = state_dict.get("embeddings", state_dict.get("module.embeddings", None))
     if embeddings_weight is None:
-        raise ValueError("Checkpoint structure missing base embedding layer mappings.")
+        print("⚠️ Warning: Checkpoint missing base embedding layer mappings. Reverting.")
+        return None
 
     total_items, in_dim = embeddings_weight.shape
 
