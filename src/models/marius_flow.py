@@ -58,7 +58,7 @@ def load_latest_catalog_tokens(device="cuda"):
 
     # Safely load weights map
     try:
-        checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+        checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
     except Exception as e:
         print(f"❌ Critical Error reading the physical pth file with torch.load: {e}")
         return None
