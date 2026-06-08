@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn as nn
-from cosette import COSETTE
+from src.models.cosette import COSETTE
 
 
 class CosetteWrapper(nn.Module):
