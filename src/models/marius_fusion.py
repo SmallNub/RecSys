@@ -33,6 +33,15 @@ class MARIUS(torch.nn.Module):
         self.filter_preds = filter_preds
         self.cosette = cosette
 
+        assert (
+            self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size
+        ), "Vocab size mismatch"
+
+        if self.temporal_cfg.emb_dropout is None:
+            self.temporal_cfg.emb_dropout = self.temporal_cfg.dropout
+        if self.depth_cfg.emb_dropout is None:
+            self.depth_cfg.emb_dropout = self.depth_cfg.dropout
+
         # Use COSETTE as fixed embeddings
         self.temp_proj = torch.nn.Linear(
             self.cosette.model.in_dim, self.temporal_cfg.d_model
