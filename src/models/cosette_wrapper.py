@@ -29,6 +29,7 @@ class CosetteWrapper(nn.Module):
 
         model_cfg = ckpt.get("config")
         state_dict = ckpt.get("state_dict")
+        state_dict.pop("embeddings")  # Causes an error if not removed, not needed for inference
 
         layers = model_cfg.model.layers
         n_centroids_list = model_cfg.centroids.n_centroids_list
