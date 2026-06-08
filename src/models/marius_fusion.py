@@ -166,11 +166,21 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # Process through COSETTE decoder pipeline
-        raw_dec_features = self.cosette.decode(target[:, :-1])
-        dec_embs = self.depth_proj(raw_dec_features)
+        # 1. Process through COSETTE decoder pipeline
+        # Drops the last quantizer channel for teacher forcing -> shape is BL x (K-1)
+        raw_dec_features = self.cosette.decode(
+            target[:, :-1]
+        )  # Returns: BL x Cosette_In_Dim
 
-        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
+        # 2. Project down to depth model's hidden dimension
+        dec_embs = self.depth_proj(raw_dec_features)  # Returns: BL x d_model_depth
+
+        # 3. FIX: Unsqueeze the sequence dimension back to 3D -> BL x (K-1) x d_model_depth
+        # Since target[:, :-1] has a sequence length of K-1, we restore that axis
+        dec_embs = dec_embs.view(mid_tokens.shape[0], target.shape[-1] - 1, -1)
+
+        # 4. Now both are 3D tensors: [BL x 1 x d] concatenated with [BL x (K-1) x d]
+        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)  # Target shape: BL x K x d
 
         depth_logits = self.depth_forward(dec_embs)  # BL x K x V
         return depth_logits, target
