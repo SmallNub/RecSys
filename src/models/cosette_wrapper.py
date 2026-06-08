@@ -79,7 +79,8 @@ class CosetteWrapper(nn.Module):
     def decode(self, indices: torch.Tensor) -> torch.Tensor:
         """
         Decodes codebook discrete IDs back into continuous reconstruction latents.
-        Safely ignores negative boundary values and padding indexes.
+        Safely ignores negative boundary values and padding indexes, adapting dynamically
+        to shifted target slices during teacher-forcing.
         """
         # Ensure correct runtime device alignment
         indices = indices.to(self.device)
@@ -88,22 +89,26 @@ class CosetteWrapper(nn.Module):
         if len(orig_shape) > 2:
             indices = indices.view(-1, orig_shape[-1])
 
+        # Match only the quantizers present in the input slice to prevent IndexErrors
+        num_present_quantizers = indices.shape[-1]
+
         # Create a mask tracking valid indices vs padding/out-of-bound indices
-        # Assumes codebook values must be >= 0 and less than centroid limits
         valid_mask = indices >= 0
-        for i, quantizer in enumerate(self.model.rq.vq_layers):
+        for i in range(num_present_quantizers):
+            quantizer = self.model.rq.vq_layers[i]
             # Safe boundary checks pulling from VectorQuantizer property configuration
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
             valid_mask[:, i] = valid_mask[:, i] & (indices[:, i] < num_embeddings)
 
-        # Broad row-level mask: an item is valid only if all its codebook slots are valid
+        # Broad row-level mask: an item is valid only if all its active codebook slots are valid
         valid_rows = valid_mask.all(dim=-1, keepdim=True)
 
         # Clamping step: replace invalid indices with zero placeholder to prevent CUDA assertions
         safe_indices = torch.where(valid_mask, indices, torch.zeros_like(indices))
 
         x_q = 0
-        for i, quantizer in enumerate(self.model.rq.vq_layers):
+        for i in range(num_present_quantizers):
+            quantizer = self.model.rq.vq_layers[i]
             layer_indices = safe_indices[:, i]
             x_res = quantizer.get_codebook_entry(layer_indices, shape=None)
             x_q = x_q + x_res
@@ -112,9 +117,7 @@ class CosetteWrapper(nn.Module):
         reconstructed_latents = self.model.decoder(x_q)
 
         # Multiplicative masking instead of mutating tensor assignments in autocast loops
-        reconstructed_latents = reconstructed_latents * valid_rows.to(
-            reconstructed_latents.dtype
-        )
+        reconstructed_latents = reconstructed_latents * valid_rows.to(reconstructed_latents.dtype)
 
         if len(orig_shape) > 2:
             target_shape = orig_shape[:-1] + [self.model.in_dim]
