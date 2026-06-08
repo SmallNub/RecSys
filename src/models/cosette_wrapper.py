@@ -61,8 +61,6 @@ class CosetteWrapper(nn.Module):
         """
         Encodes high-dimensional continuous embeddings to multi-codebook indices (IDs).
         """
-        latents = latents.to(self.device).float()
-
         # Project through the multi-layer perceptron encoder
         x_e = self.model.encoder(latents)
 
@@ -76,7 +74,6 @@ class CosetteWrapper(nn.Module):
         """
         Decodes codebook discrete IDs back into continuous reconstruction latents.
         """
-        indices = indices.to(self.device).long()
         orig_shape = indices.shape
 
         if len(orig_shape) > 2:
