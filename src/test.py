@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import csv
 
 import fsspec
 import hydra
@@ -123,6 +124,33 @@ def main(test_config):
             "test_metrics": test_metrics,
         },
     )
+
+    # 3. Append results to shared summary CSV
+    summary_path = os.path.join(
+        test_config.paths.model_folder_tplt, "results_summary.csv"
+    )
+    category = cfg.data.datasets.category
+    run_directory = test_config.run_directory
+
+    rows = []
+    for split, metrics in [("valid", valid_metrics), ("test", test_metrics)]:
+        for k, v in metrics[0].items():
+            rows.append({
+                "run_directory": run_directory,
+                "category": category,
+                "split": split,
+                "metric": k,
+                "value": v,
+            })
+
+    file_exists = os.path.exists(summary_path)
+    with open(summary_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["run_directory", "category", "split", "metric", "value"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[INFO] Results appended to {summary_path}")
 
 
 if __name__ == "__main__":
