@@ -12,6 +12,7 @@ class CosetteWrapper(nn.Module):
 
         :param model_path: Path to the saved semantic model checkpoint (.pt / .pth)
         """
+        super().__init__()
         print("Loading frozen COSETTE checkpoint...")
         self.model = self._load_model_from_checkpoint(model_path)
 
