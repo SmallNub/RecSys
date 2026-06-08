@@ -29,7 +29,7 @@ class CosetteWrapper(nn.Module):
 
         model_cfg = ckpt.get("config")
         state_dict = ckpt.get("state_dict")
-        state_dict.pop("embeddings")  # Causes an error if not removed, not needed for inference
+        state_dict.pop("embeddings", None)  # Causes an error if not removed, not needed for inference
 
         layers = model_cfg.model.layers
         n_centroids_list = model_cfg.centroids.n_centroids_list
@@ -53,7 +53,7 @@ class CosetteWrapper(nn.Module):
         )
 
         model.load_state_dict(state_dict, strict=False)
-        return model.to(self.device)
+        return model
 
     @torch.no_grad()
     def encode(self, latents: torch.Tensor, use_sk: bool = False) -> torch.Tensor:
