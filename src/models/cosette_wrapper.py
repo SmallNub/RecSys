@@ -16,13 +16,17 @@ class CosetteWrapper(nn.Module):
         print("Loading frozen COSETTE checkpoint...")
         self.model = self._load_model_from_checkpoint(model_path)
 
+        # Buffer tracking device migration dynamically within PyTorch Lightning loops
+        # Required because freezing all parameters leaves self.parameters() empty.
+        self.register_buffer("_device_marker", torch.empty(0))
+
         self.eval()
         self.requires_grad_(False)
 
     @property
     def device(self) -> torch.device:
         """Returns the current device context of this module."""
-        return next(self.parameters()).device
+        return self._device_marker.device
 
     def _load_model_from_checkpoint(self, model_path: str) -> torch.nn.Module:
         """Helper to safely unpack config parameters and load state weights."""
@@ -79,7 +83,7 @@ class CosetteWrapper(nn.Module):
         """
         # Ensure correct runtime device alignment
         indices = indices.to(self.device)
-        orig_shape = indices.shape
+        orig_shape = list(indices.shape)
 
         if len(orig_shape) > 2:
             indices = indices.view(-1, orig_shape[-1])
@@ -88,14 +92,12 @@ class CosetteWrapper(nn.Module):
         # Assumes codebook values must be >= 0 and less than centroid limits
         valid_mask = indices >= 0
         for i, quantizer in enumerate(self.model.rq.vq_layers):
-            # Check maximum dictionary boundaries per quantizer layer
-            num_embeddings = (
-                quantizer.codebook.shape[0] if hasattr(quantizer, "codebook") else 32000
-            )
+            # Safe boundary checks pulling from VectorQuantizer property configuration
+            num_embeddings = getattr(quantizer, "n_centroids", 32000)
             valid_mask[:, i] = valid_mask[:, i] & (indices[:, i] < num_embeddings)
 
         # Broad row-level mask: an item is valid only if all its codebook slots are valid
-        valid_rows = valid_mask.all(dim=-1)
+        valid_rows = valid_mask.all(dim=-1, keepdim=True)
 
         # Clamping step: replace invalid indices with zero placeholder to prevent CUDA assertions
         safe_indices = torch.where(valid_mask, indices, torch.zeros_like(indices))
@@ -109,11 +111,13 @@ class CosetteWrapper(nn.Module):
         # Pass combined components through the Decoder MLP
         reconstructed_latents = self.model.decoder(x_q)
 
-        # Zero out the reconstructed vectors for invalid/padded rows
-        reconstructed_latents[~valid_rows] = 0.0
+        # Multiplicative masking instead of mutating tensor assignments in autocast loops
+        reconstructed_latents = reconstructed_latents * valid_rows.to(
+            reconstructed_latents.dtype
+        )
 
         if len(orig_shape) > 2:
-            target_shape = list(orig_shape[:-1]) + [self.model.in_dim]
+            target_shape = orig_shape[:-1] + [self.model.in_dim]
             reconstructed_latents = reconstructed_latents.view(target_shape)
 
         return reconstructed_latents

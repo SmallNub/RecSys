@@ -42,7 +42,7 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Use COSETTE as fixed embeddings
+        # Linear projections from continuous COSETTE manifold to transformer spaces
         self.temp_proj = torch.nn.Linear(
             self.cosette.model.in_dim, self.temporal_cfg.d_model
         )
@@ -61,11 +61,13 @@ class MARIUS(torch.nn.Module):
         # Embedding dropout
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
+
+        # Output Classification Head mapping back to Discrete IDs
         self.output_head = torch.nn.Linear(
             self.depth_cfg.d_model, self.depth_cfg.vocab_size
         )
 
-        # Transformer
+        # Transformer Blocks
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -114,28 +116,25 @@ class MARIUS(torch.nn.Module):
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     def get_param_groups(self):
+        """Routes projection layer biases or specific weights out of weight decay."""
+
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n
+            # Target biases and LayerNorm parameters across the architecture
+            return "bias" in n or "norm" in n
 
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
-        print("No decay :", len(no_decay))
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
 
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input):
-        # input shape: B x L x K (Batch, Seq_Len, Num_Quantizers)
+        # input shape: B x L x K
         B, L, K = input.shape
 
-        # 1. Decode IDs directly to continuous pre-trained latent features
-        # Output shape from wrapper: B x L x Cosette_In_Dim
+        # Decode via continuous COSETTE embeddings
         decoded_features = self.cosette.decode(input)
-
-        # 2. Project to transformer hidden dimension and combine the depth dimension
-        # (Replacing the old explicit sum over raw token embeddings)
         input_embs = self.temp_proj(decoded_features)
 
-        # 3. Inject positions and apply standard dropout
         input_embs += self.temp_pos_emb[:, :L, :]
         input_embs = self.temp_dropout(input_embs)
 
@@ -153,7 +152,7 @@ class MARIUS(torch.nn.Module):
         in_embs = self.depth_dropout(in_embs)
 
         depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K])
-        logits = self.output_head(depth_preds)  # Shape: B x K x Vocab_Size
+        logits = self.output_head(depth_preds)
         return logits
 
     def train_forward(self, input, target):
@@ -167,14 +166,10 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # --- Replace standard lookup with COSETTE decode ---
-        # Shift targets for teacher forcing and decode through the wrapper
-        raw_dec_features = self.cosette.decode(
-            target[:, :-1]
-        )  # BL x (K-1) x Cosette_In_Dim
-        dec_embs = self.depth_proj(raw_dec_features)  # BL x (K-1) x d_model_depth
+        # Process through COSETTE decoder pipeline
+        raw_dec_features = self.cosette.decode(target[:, :-1])
+        dec_embs = self.depth_proj(raw_dec_features)
 
-        # Concatenate temporal context prefix with your decoded targets
         dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
 
         depth_logits = self.depth_forward(dec_embs)  # BL x K x V
@@ -184,12 +179,9 @@ class MARIUS(torch.nn.Module):
         input, target = batch["input"], batch["target"]
 
         logits, m_target = self.train_forward(input, target)
-
-        # Torch CELoss expects (N, C, d_i...) and (N, d_i...) as input
         logits = rearrange(logits, "B k v -> B v k")
 
         loss = self.criterion(logits, m_target)
-
         return loss, logits
 
     def search(self, batch, n_results):
@@ -198,96 +190,87 @@ class MARIUS(torch.nn.Module):
         input = batch["input"]
         L = batch["target"].shape[-1]
 
-        if self.filter_preds:  # Generate more, so that we can filter out seen items.
+        if self.filter_preds:
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        # Validation only on the last prediction of the sequence
         temporal_tokens = self.temporal_forward(input)  # B x L x D
         mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]  # B, D
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
-        # Initialize the beam search ==============================================
-        ## Get logits
+        # =========================================================================
+        # BEAM SEARCH INITIALIZATION
+        # =========================================================================
         sequences = mid_tokens[:, None, :]  # B x 1 x D
-        depth_logits = self.depth_forward(sequences)  # B x 1 x D
+        depth_logits = self.depth_forward(sequences)  # B x 1 x V
         log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  # B x V
 
-        ## Get topk indices
         topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  # B x b
 
         indices = topk_indices.unsqueeze(2)  # Shape: (B, b, 1)
         scores = topk_log_probs  # Shape: B x b
 
-        ## Expand sequences
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
-        new_tokens = self.depth_emb(topk_indices).unsqueeze(2)  # Shape : (B, b, 1, D)
+        # FIX: Decode topk tokens through COSETTE and project into hidden depth space
+        raw_new_tokens = self.cosette.decode(
+            topk_indices
+        )  # Shape: (B, b, Cosette_In_Dim)
+        new_tokens = self.depth_proj(raw_new_tokens).unsqueeze(2)  # Shape: (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
-        # Start the beam search ===================================================
-        # Starting with 1 token, generated 1... need L-1 more.
+        # =========================================================================
+        # AUTOREGRESSIVE GENERATION LOOP
+        # =========================================================================
         for i in range(2, L + 1):
-            # Forward the current sequence to get logits of the next token
             last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)  # B * b x V
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
 
-            # Shape: (B * b, b) -> (B, b, b)
             topk_log_probs = topk_log_probs.view(B, b, b)
             topk_indices = topk_indices.view(B, b, b)
 
-            # Expand indices - Update with top values
-            # (B x b x L) -> B x b x b x L+1
             expanded_indices = indices.unsqueeze(2).repeat(1, 1, b, 1)
             expanded_indices = torch.cat(
                 [expanded_indices, topk_indices.unsqueeze(-1)], dim=3
             )
 
-            # Expand sequences
-            # Shape: (B, b, L, D) -> (B, b, b, L, D)
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
-            # Choose the new tokens - Shape: (B, b, b, 1, D)
-            next_tokens = self.depth_emb(topk_indices).unsqueeze(3)
+
+            # FIX: Convert the freshly selected beam indices via COSETTE decode loop
+            flat_topk = topk_indices.view(-1, topk_indices.shape[-1])
+            flat_decoded = self.cosette.decode(flat_topk)
+            flat_projected = self.depth_proj(flat_decoded)
+
+            next_tokens = flat_projected.view(B, b, b, 1, D)
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
-            # Expand scores
-            # Update scores - Shape: (B, b, b)
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
 
-            # Start flattening before selection
-            # Shape: (B, b * b)
             expanded_scores = expanded_scores.view(B, -1)
-            # Shape: (B, b * b, L+1, D)
             expanded_sequences = expanded_sequences.view(
                 B, -1, expanded_sequences.size(-2), D
             )
-            # Shape : (B, b * b, L)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
-            # Select topk from flattened scores
-            # Shape: (B, b)
-            topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
+            topk_scores, topk_indices_choice = torch.topk(expanded_scores, b, dim=-1)
 
-            # Shape: (B, b, L+1, D)
-            sequences = expanded_sequences[arranged, topk_indices]
-            indices = expanded_indices[arranged, topk_indices]
+            sequences = expanded_sequences[arranged, topk_indices_choice]
+            indices = expanded_indices[arranged, topk_indices_choice]
 
-            scores = topk_scores  # Shape: (B, b)
+            scores = topk_scores
 
         if self.filter_preds:
-            # indices : B x b x L
-            # input : B x T x L
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
             is_in_query = is_in_query.all(dim=-1).any(dim=-1)  # Shape B x b
 
             scores[is_in_query] = -torch.inf
 
-            topk_scores, topk_indices = torch.topk(scores, keep_final, dim=-1)
-            indices = indices[arranged, topk_indices]
+            topk_scores, topk_indices_choice = torch.topk(scores, keep_final, dim=-1)
+            indices = indices[arranged, topk_indices_choice]
 
         return indices
