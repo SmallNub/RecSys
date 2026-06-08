@@ -17,7 +17,6 @@ class CosetteWrapper(nn.Module):
         self.model = self._load_model_from_checkpoint(model_path)
 
         # Buffer tracking device migration dynamically within PyTorch Lightning loops
-        # Required because freezing all parameters leaves self.parameters() empty.
         self.register_buffer("_device_marker", torch.empty(0))
 
         self.eval()
@@ -76,52 +75,80 @@ class CosetteWrapper(nn.Module):
         return indices
 
     @torch.no_grad()
-    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+    def get_codebook_embeddings(self, indices: torch.Tensor) -> torch.Tensor:
         """
-        Decodes codebook discrete IDs back into continuous reconstruction latents.
-        Safely ignores negative boundary values and padding indexes, adapting dynamically
-        to shifted target slices during teacher-forcing.
+        Maps a sequence of IDs to their continuous codebook vectors without summing
+        or passing through the decoder MLP.
+        Returns tensor of shape (..., K, centroids_dim)
         """
-        # Ensure correct runtime device alignment
         indices = indices.to(self.device)
         orig_shape = list(indices.shape)
 
         if len(orig_shape) > 2:
             indices = indices.view(-1, orig_shape[-1])
 
-        # Match only the quantizers present in the input slice to prevent IndexErrors
         num_present_quantizers = indices.shape[-1]
-
-        # Create a mask tracking valid indices vs padding/out-of-bound indices
         valid_mask = indices >= 0
-        for i in range(num_present_quantizers):
-            quantizer = self.model.rq.vq_layers[i]
-            # Safe boundary checks pulling from VectorQuantizer property configuration
-            num_embeddings = getattr(quantizer, "n_centroids", 32000)
-            valid_mask[:, i] = valid_mask[:, i] & (indices[:, i] < num_embeddings)
 
-        # Broad row-level mask: an item is valid only if all its active codebook slots are valid
-        valid_rows = valid_mask.all(dim=-1, keepdim=True)
-
-        # Clamping step: replace invalid indices with zero placeholder to prevent CUDA assertions
         safe_indices = torch.where(valid_mask, indices, torch.zeros_like(indices))
+        embs = []
 
-        x_q = 0
         for i in range(num_present_quantizers):
             quantizer = self.model.rq.vq_layers[i]
-            layer_indices = safe_indices[:, i]
-            x_res = quantizer.get_codebook_entry(layer_indices, shape=None)
-            x_q = x_q + x_res
+            num_embeddings = getattr(quantizer, "n_centroids", 32000)
+
+            valid_idx = safe_indices[:, i] < num_embeddings
+            valid_mask[:, i] = valid_mask[:, i] & valid_idx
+
+            safe_idx = torch.where(valid_idx, safe_indices[:, i], torch.zeros_like(safe_indices[:, i]))
+            x_res = quantizer.get_codebook_entry(safe_idx, shape=None)
+            embs.append(x_res)
+
+        embs = torch.stack(embs, dim=1)  # B x K x centroids_dim
+        embs = embs * valid_mask.unsqueeze(-1).to(embs.dtype)
+
+        if len(orig_shape) > 2:
+            target_shape = orig_shape[:-1] + [num_present_quantizers, self.model.centroids_dim]
+            embs = embs.view(target_shape)
+
+        return embs
+
+    @torch.no_grad()
+    def get_codebook_entry(self, indices: torch.Tensor, quantizer_index: int = 0) -> torch.Tensor:
+        """
+        Fetches continuous embeddings specifically for one quantizer level.
+        Returns tensor of shape (..., centroids_dim)
+        """
+        indices = indices.to(self.device)
+        quantizer = self.model.rq.vq_layers[quantizer_index]
+        num_embeddings = getattr(quantizer, "n_centroids", 32000)
+
+        valid_mask = indices >= 0
+        valid_idx = indices < num_embeddings
+        valid_mask = valid_mask & valid_idx
+
+        safe_indices = torch.where(valid_mask, indices, torch.zeros_like(indices))
+        embs = quantizer.get_codebook_entry(safe_indices, shape=None)
+
+        embs = embs * valid_mask.unsqueeze(-1).to(embs.dtype)
+        return embs
+
+    @torch.no_grad()
+    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Decodes codebook discrete IDs back into continuous reconstruction latents via the MLP.
+        """
+        codebook_embs = self.get_codebook_embeddings(indices)
+
+        # Sum vectors across all active quantizers
+        x_q = codebook_embs.sum(dim=-2)
 
         # Pass combined components through the Decoder MLP
         reconstructed_latents = self.model.decoder(x_q)
 
-        # Multiplicative masking instead of mutating tensor assignments in autocast loops
+        # Multiplicative masking instead of mutating tensor assignments
+        valid_rows = (indices >= 0).all(dim=-1, keepdim=True)
         reconstructed_latents = reconstructed_latents * valid_rows.to(reconstructed_latents.dtype)
-
-        if len(orig_shape) > 2:
-            target_shape = orig_shape[:-1] + [self.model.in_dim]
-            reconstructed_latents = reconstructed_latents.view(target_shape)
 
         return reconstructed_latents
 
