@@ -12,3 +12,5 @@ model:
 
 paths:
   ckpt_dir: outputs/checkpoints/cosette
+
+marker: null
