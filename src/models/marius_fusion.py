@@ -32,6 +32,7 @@ class MARIUS(torch.nn.Module):
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
         self.cosette = cosette
+        self.num_quantizers = self.cosette.model.rq.num_quantizers
 
         assert (
             self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size
@@ -42,12 +43,12 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Linear projections from continuous COSETTE manifold to transformer spaces
+        # Linear projection from continuous COSETTE full item manifold to temporal transformer space
         self.temp_proj = torch.nn.Linear(
             self.cosette.model.in_dim, self.temporal_cfg.d_model
         )
 
-        # Depth projection connects the *codebook vectors* to the depth transformer
+        # Linear projection from COSETTE codebook space (centroids_dim) to depth transformer space
         self.depth_proj = torch.nn.Linear(
             self.cosette.model.centroids_dim, self.depth_cfg.d_model
         )
@@ -64,9 +65,12 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Output Classification Head mapping back to Discrete IDs
-        self.output_head = torch.nn.Linear(
-            self.depth_cfg.d_model, self.depth_cfg.vocab_size
+        # Output Classification Heads mapping back to discrete IDs layer-by-layer
+        self.output_heads = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.vocab_size)
+                for _ in range(self.num_quantizers)
+            ]
         )
 
         # Transformer Blocks
@@ -127,11 +131,12 @@ class MARIUS(torch.nn.Module):
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input):
+        # input shape: B x L x K
         B, L, K = input.shape
 
-        # Fully reconstruct sequence of latent objects 
-        decoded_features = self.cosette.decode(input)
-        input_embs = self.temp_proj(decoded_features)
+        # Decode item sequence representation using COSETTE full item decoder
+        decoded_features = self.cosette.decode(input)  # B x L x Cosette_In_Dim
+        input_embs = self.temp_proj(decoded_features)  # B x L x d_model_temporal
 
         input_embs += self.temp_pos_emb[:, :L, :]
         input_embs = self.temp_dropout(input_embs)
@@ -150,8 +155,14 @@ class MARIUS(torch.nn.Module):
         in_embs = self.depth_dropout(in_embs)
 
         depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K])
-        logits = self.output_head(depth_preds)
 
+        # Route through layer-specific linear classification heads
+        logits_list = []
+        for k in range(K):
+            logits_k = self.output_heads[k](depth_preds[:, k, :])
+            logits_list.append(logits_k)
+
+        logits = torch.stack(logits_list, dim=1)  # X x K x V
         return logits
 
     def train_forward(self, input, target):
@@ -165,14 +176,24 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # 1. Fetch distinct codebook vectors, aligning the indices with their true historical layers (0 to K-2)
-        raw_dec_features = self.cosette.get_codebook_embeddings(target[:, :-1], start_quantizer_idx=0)
+        # Extract codebook vectors layer-by-layer matching depth positions
+        dec_embs_list = []
+        for i in range(target.shape[-1] - 1):
+            quantizer = self.cosette.model.rq.vq_layers[i]
+            layer_indices = target[:, i]
 
-        # 2. Project sequential codebooks down to depth model's hidden dimension
-        dec_embs = self.depth_proj(raw_dec_features)
+            # Defensive boundary check
+            num_embeddings = getattr(quantizer, "n_centroids", 32000)
+            layer_indices = torch.clamp(layer_indices, 0, num_embeddings - 1)
 
-        # 3. Concatenate temporal embeddings [BL x 1 x d] with depth embeddings [BL x (K-1) x d]
-        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)  # Target shape: BL x K x d
+            x_res = quantizer.get_codebook_entry(layer_indices, shape=None)  # BL x centroids_dim
+            dec_embs_list.append(x_res)
+
+        dec_embs = torch.stack(dec_embs_list, dim=1)  # BL x (K-1) x centroids_dim
+        dec_embs = self.depth_proj(dec_embs)  # BL x (K-1) x d_model_depth
+
+        # Concatenate summary start token with layer token embeddings
+        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)  # BL x K x d_model_depth
 
         depth_logits = self.depth_forward(dec_embs)  # BL x K x V
         return depth_logits, target
@@ -215,8 +236,12 @@ class MARIUS(torch.nn.Module):
 
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
-        # Convert initial layer discrete IDs using the 0th codebook from Cosette
-        raw_new_tokens = self.cosette.get_codebook_entry(topk_indices, quantizer_index=0) 
+        # Extract continuous codebook representation from Layer 0
+        quantizer_0 = self.cosette.model.rq.vq_layers[0]
+        num_embeddings_0 = getattr(quantizer_0, "n_centroids", 32000)
+        safe_topk_indices = torch.clamp(topk_indices, 0, num_embeddings_0 - 1)
+
+        raw_new_tokens = quantizer_0.get_codebook_entry(safe_topk_indices, shape=None)  # B x b x centroids_dim
         new_tokens = self.depth_proj(raw_new_tokens).unsqueeze(2)  # Shape: (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
@@ -241,10 +266,14 @@ class MARIUS(torch.nn.Module):
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
-            # Retrieve only the precise codebook equivalent to the predicted layer state (i - 1)
-            raw_new_tokens = self.cosette.get_codebook_entry(topk_indices, quantizer_index=i-1)
-            next_tokens = self.depth_proj(raw_new_tokens).unsqueeze(3)  # Shape: (B, b, b, 1, D)
-            expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
+            # Query the precise hierarchical layer (i - 1) for newly added beams
+            quantizer_i = self.cosette.model.rq.vq_layers[i - 1]
+            num_embeddings_i = getattr(quantizer_i, "n_centroids", 32000)
+            safe_topk_indices_i = torch.clamp(topk_indices, 0, num_embeddings_i - 1)
+            
+            raw_new_tokens_i = quantizer_i.get_codebook_entry(safe_topk_indices_i, shape=None)  # B x b x b x centroids_dim
+            next_tokens = self.depth_proj(raw_new_tokens_i).unsqueeze(3)  # B x b x b x 1 x D
+            expanded_sequences = torch.concat([expanded_sequences, next_tokens], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
 
