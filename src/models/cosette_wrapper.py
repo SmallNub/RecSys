@@ -75,10 +75,11 @@ class CosetteWrapper(nn.Module):
         return indices
 
     @torch.no_grad()
-    def get_codebook_embeddings(self, indices: torch.Tensor) -> torch.Tensor:
+    def get_codebook_embeddings(self, indices: torch.Tensor, start_quantizer_idx: int = 0) -> torch.Tensor:
         """
         Maps a sequence of IDs to their continuous codebook vectors without summing
-        or passing through the decoder MLP.
+        or passing through the decoder MLP. Explicitly maps indices to their structural 
+        quantizer layers to prevent training-inference shifts.
         Returns tensor of shape (..., K, centroids_dim)
         """
         indices = indices.to(self.device)
@@ -94,7 +95,9 @@ class CosetteWrapper(nn.Module):
         embs = []
 
         for i in range(num_present_quantizers):
-            quantizer = self.model.rq.vq_layers[i]
+            # Map dynamically to the correct layer offset
+            actual_layer_idx = start_quantizer_idx + i
+            quantizer = self.model.rq.vq_layers[actual_layer_idx]
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
 
             valid_idx = safe_indices[:, i] < num_embeddings
@@ -134,11 +137,11 @@ class CosetteWrapper(nn.Module):
         return embs
 
     @torch.no_grad()
-    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+    def decode(self, indices: torch.Tensor, start_quantizer_idx: int = 0) -> torch.Tensor:
         """
         Decodes codebook discrete IDs back into continuous reconstruction latents via the MLP.
         """
-        codebook_embs = self.get_codebook_embeddings(indices)
+        codebook_embs = self.get_codebook_embeddings(indices, start_quantizer_idx=start_quantizer_idx)
 
         # Sum vectors across all active quantizers
         x_q = codebook_embs.sum(dim=-2)

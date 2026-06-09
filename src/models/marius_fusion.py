@@ -165,12 +165,10 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # 1. Fetch distinct codebook vectors dropping last target item for teacher forcing
-        # Returns: BL x (K-1) x centroids_dim
-        raw_dec_features = self.cosette.get_codebook_embeddings(target[:, :-1])
+        # 1. Fetch distinct codebook vectors, aligning the indices with their true historical layers (0 to K-2)
+        raw_dec_features = self.cosette.get_codebook_embeddings(target[:, :-1], start_quantizer_idx=0)
 
         # 2. Project sequential codebooks down to depth model's hidden dimension
-        # Returns: BL x (K-1) x d_model_depth
         dec_embs = self.depth_proj(raw_dec_features)
 
         # 3. Concatenate temporal embeddings [BL x 1 x d] with depth embeddings [BL x (K-1) x d]
