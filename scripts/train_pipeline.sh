@@ -47,11 +47,11 @@ for CATEGORY in "${CATEGORIES[@]}"; do
 
         # Step 3: Resolve quant_id from parquet output — name is COSETTE_SIGLIP_{category}_{timestamp}_run{N}-col
         QUANT=$(python -c "
-        from pathlib import Path
-        base = Path('datasets/data/embeddings/sentence-t5-xl/${CATEGORY}/')
-        runs = [f.stem for f in base.glob('COSETTE_SIGLIP_${CATEGORY}_*.parquet') if 'col' not in f.stem and '_model' not in f.stem]
-        print(max(runs))
-        ")
+from pathlib import Path
+base = Path('datasets/data/embeddings/sentence-t5-xl/${CATEGORY}/')
+runs = [f.stem for f in base.glob('COSETTE_SIGLIP_${CATEGORY}_*.parquet') if 'col' not in f.stem and '_model' not in f.stem]
+print(max(runs))
+")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Using quant_id=${QUANT}-col"
 
         # Step 4: Train MARIUS
