@@ -26,12 +26,14 @@ class MARIUS(torch.nn.Module):
         depth_cfg,
         cosette: CosetteWrapper,
         filter_preds=False,
+        cosette_dropout_p=0.2,  # Added to control feature drop probability
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
         self.cosette = cosette
+        self.cosette_dropout_p = cosette_dropout_p
 
         assert (
             self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size
@@ -42,14 +44,34 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Linear projections from continuous COSETTE manifold to transformer spaces
+        # Discrete Backbone Embeddings
+        self.temp_emb = torch.nn.Embedding(
+            self.temporal_cfg.vocab_size,
+            self.temporal_cfg.d_model,
+            padding_idx=SpecialTokens.PAD.value,
+        )
+        self.depth_emb = torch.nn.Embedding(
+            self.depth_cfg.vocab_size,
+            self.depth_cfg.d_model,
+            padding_idx=SpecialTokens.PAD.value,
+        )
+
+        # Projections
         self.temp_proj = torch.nn.Linear(
             self.cosette.model.in_dim, self.temporal_cfg.d_model
         )
-        # FIX: Project from individual codebook latent spaces (centroids_dim) instead of full decoded space
         self.depth_proj = torch.nn.Linear(
             self.cosette.model.centroids_dim, self.depth_cfg.d_model
         )
+
+        # =========================================================================
+        # FIX: DUAL-STREAM LAYER NORMALIZATION (Prevents one stream from drowning the other)
+        # =========================================================================
+        self.temp_ln_discrete = torch.nn.LayerNorm(self.temporal_cfg.d_model)
+        self.temp_ln_continuous = torch.nn.LayerNorm(self.temporal_cfg.d_model)
+        
+        self.depth_ln_discrete = torch.nn.LayerNorm(self.depth_cfg.d_model)
+        self.depth_ln_continuous = torch.nn.LayerNorm(self.depth_cfg.d_model)
 
         # Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
@@ -63,7 +85,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Output Classification Head mapping back to Discrete IDs
+        # Output Classification Head
         self.output_head = torch.nn.Linear(
             self.depth_cfg.d_model, self.depth_cfg.vocab_size
         )
@@ -108,33 +130,36 @@ class MARIUS(torch.nn.Module):
             ),
         )
 
-        # Projection
         self.mid_proj = torch.nn.Linear(
             self.temporal_cfg.d_model, self.depth_cfg.d_model
         )
-
-        # Loss
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     def get_param_groups(self):
-        """Routes projection layer biases or specific weights out of weight decay."""
-
         def _select_no_decay(n):
-            # Target biases and LayerNorm parameters across the architecture
             return "bias" in n or "norm" in n
 
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
-
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input):
-        # input shape: B x L x K
         B, L, K = input.shape
 
-        # Decode via continuous COSETTE embeddings
+        discrete_embs = self.temp_emb(input[:, :, 0])
         decoded_features = self.cosette.decode(input)
-        input_embs = self.temp_proj(decoded_features)
+        continuous_embs = self.temp_proj(decoded_features)
+        
+        # FIX: Align operational scales
+        discrete_embs = self.temp_ln_discrete(discrete_embs)
+        continuous_embs = self.temp_ln_continuous(continuous_embs)
+        
+        # FIX: Modality Dropout to force reliance on discrete dictionaries
+        if self.training and self.cosette_dropout_p > 0:
+            c_mask = (torch.rand((B, L, 1), device=continuous_embs.device) > self.cosette_dropout_p).to(continuous_embs.dtype)
+            continuous_embs = continuous_embs * c_mask
+        
+        input_embs = discrete_embs + continuous_embs
 
         input_embs += self.temp_pos_emb[:, :L, :]
         input_embs = self.temp_dropout(input_embs)
@@ -148,10 +173,8 @@ class MARIUS(torch.nn.Module):
 
     def depth_forward(self, in_embs):
         K = in_embs.shape[1]
-
         in_embs = in_embs + self.depth_pos_emb[:, :K, :]
         in_embs = self.depth_dropout(in_embs)
-
         depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K])
         logits = self.output_head(depth_preds)
         return logits
@@ -167,7 +190,6 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # FIX: Extract features layer-by-layer to guarantee strict causal boundary
         N, K = target.shape
         dec_embs_list = []
 
@@ -175,36 +197,46 @@ class MARIUS(torch.nn.Module):
             quantizer = self.cosette.model.rq.vq_layers[i]
             layer_indices = target[:, i]
 
-            # Boundary checks and masking
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
             valid_mask = (layer_indices >= 0) & (layer_indices < num_embeddings)
             safe_indices = torch.where(valid_mask, layer_indices, torch.zeros_like(layer_indices))
 
-            # Retrieve un-entangled residual vectors from each specific layer
+            discrete_res = self.depth_emb(safe_indices)
             x_res = quantizer.get_codebook_entry(safe_indices, shape=None)
-            x_res = x_res * valid_mask.unsqueeze(-1).to(x_res.dtype)
+            continuous_res = self.depth_proj(x_res)
 
-            # Project into hidden space and store
-            proj_res = self.depth_proj(x_res)
+            # FIX: Balance variance profile prior to additive combination
+            discrete_res = self.depth_ln_discrete(discrete_res)
+            continuous_res = self.depth_ln_continuous(continuous_res)
+
+            # FIX: Token level modality dropout inside the residual block setup
+            if self.training and self.cosette_dropout_p > 0:
+                c_mask = (torch.rand((N, 1), device=continuous_res.device) > self.cosette_dropout_p).to(continuous_res.dtype)
+                continuous_res = continuous_res * c_mask
+
+            # Post-normalization validity masking prevents zero elements leaking variance metrics
+            v_mask = valid_mask.unsqueeze(-1).to(discrete_res.dtype)
+            proj_res = (discrete_res + continuous_res) * v_mask
             dec_embs_list.append(proj_res)
 
-        dec_embs = torch.stack(dec_embs_list, dim=1)  # BL x (K-1) x d_model_depth
-        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)  # BL x K x d_model_depth
+        if len(dec_embs_list) > 0:
+            dec_embs = torch.stack(dec_embs_list, dim=1)  # BL x (K-1) x d_model_depth
+            dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)  # BL x K x d_model_depth
+        else:
+            dec_embs = mid_tokens
 
         depth_logits = self.depth_forward(dec_embs)  # BL x K x V
         return depth_logits, target
 
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
-
         logits, m_target = self.train_forward(input, target)
         logits = rearrange(logits, "B k v -> B v k")
-
         loss = self.criterion(logits, m_target)
         return loss, logits
 
     def search(self, batch, n_results):
-        assert self.training is False, "Not in evaluation mode (dropout)."
+        assert self.training is False, "Not in evaluation mode."
 
         input = batch["input"]
         L = batch["target"].shape[-1]
@@ -218,9 +250,6 @@ class MARIUS(torch.nn.Module):
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
-        # =========================================================================
-        # BEAM SEARCH INITIALIZATION
-        # =========================================================================
         sequences = mid_tokens[:, None, :]  # B x 1 x D
         depth_logits = self.depth_forward(sequences)  # B x 1 x V
         log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  # B x V
@@ -229,26 +258,29 @@ class MARIUS(torch.nn.Module):
 
         indices = topk_indices.unsqueeze(2)  # Shape: (B, b, 1)
         scores = topk_log_probs  # Shape: B x b
-
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
-        # FIX: Explicitly decode the first step from quantizer layer 0 instead of using cosette.decode
+        # First step decode (layer 0)
         quantizer = self.cosette.model.rq.vq_layers[0]
         num_embeddings = getattr(quantizer, "n_centroids", 32000)
         valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
         safe_indices = torch.where(valid_mask, topk_indices, torch.zeros_like(topk_indices))
 
+        discrete_new = self.depth_emb(safe_indices)
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
-        raw_new_tokens = raw_new_tokens * valid_mask.unsqueeze(-1).to(raw_new_tokens.dtype)
+        continuous_new = self.depth_proj(raw_new_tokens)
 
-        new_tokens = self.depth_proj(raw_new_tokens).unsqueeze(2)  # Shape: (B, b, 1, D)
+        # Apply LayerNorm evaluations sequentially during generation
+        discrete_new = self.depth_ln_discrete(discrete_new)
+        continuous_new = self.depth_ln_continuous(continuous_new)
+
+        v_mask = valid_mask.unsqueeze(-1).to(discrete_new.dtype)
+        new_tokens = ((discrete_new + continuous_new) * v_mask).unsqueeze(2)  # Shape: (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
-        # =========================================================================
-        # AUTOREGRESSIVE GENERATION LOOP
-        # =========================================================================
+        # Autoregressive Loop
         for i in range(2, L + 1):
             last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)  # B * b x V
@@ -265,7 +297,6 @@ class MARIUS(torch.nn.Module):
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
-            # FIX: Pull explicitly from layer i-1 of the hierarchical codebooks
             quantizer = self.cosette.model.rq.vq_layers[i - 1]
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
             valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
@@ -274,12 +305,15 @@ class MARIUS(torch.nn.Module):
             flat_topk = safe_indices.view(-1)
             flat_valid = valid_mask.view(-1, 1)
 
+            flat_discrete = self.depth_emb(flat_topk)
             flat_decoded = quantizer.get_codebook_entry(flat_topk, shape=None)
-            flat_decoded = flat_decoded * flat_valid.to(flat_decoded.dtype)
-
             flat_projected = self.depth_proj(flat_decoded)
 
-            next_tokens = flat_projected.view(B, b, b, 1, D)
+            # Balanced inference normalizations
+            flat_discrete = self.depth_ln_discrete(flat_discrete)
+            flat_projected = self.depth_ln_continuous(flat_projected)
+
+            next_tokens = ((flat_discrete + flat_projected) * flat_valid.to(flat_discrete.dtype)).view(B, b, b, 1, D)
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
@@ -294,15 +328,12 @@ class MARIUS(torch.nn.Module):
 
             sequences = expanded_sequences[arranged, topk_indices_choice]
             indices = expanded_indices[arranged, topk_indices_choice]
-
             scores = topk_scores
 
         if self.filter_preds:
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
-            is_in_query = is_in_query.all(dim=-1).any(dim=-1)  # Shape B x b
-
+            is_in_query = is_in_query.all(dim=-1).any(dim=-1)
             scores[is_in_query] = -torch.inf
-
             topk_scores, topk_indices_choice = torch.topk(scores, keep_final, dim=-1)
             indices = indices[arranged, topk_indices_choice]
 
