@@ -18,7 +18,7 @@ model:
       _target_: src.models.sasrec.SampledSoftmax
       temperature: 0.05
       n_items: 30000
-  mode: "discriminative"
+  mode: "dense"
   optimizer: 
     lr: 0.001
     weight_decay: 0.0001
