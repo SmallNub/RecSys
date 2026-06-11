@@ -25,4 +25,4 @@ model_folder_tplt: ${oc.env:PWD}/outputs/checkpoints/marius
 # Logging project
 wandb_project_name: RecSys
 wandb_entity: smallnub-university-of-amsterdam
-wandb_mode: online
+wandb_mode: offline
