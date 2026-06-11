@@ -27,18 +27,12 @@ class MARIUS(torch.nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        warmup_steps=15000,
-        fade_steps=30000,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
         self.cosette = cosette
-        self.tie_embeddings = tie_embeddings
-        
-        self.warmup_steps = warmup_steps
-        self.fade_steps = fade_steps
 
         assert (
             self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size
@@ -49,15 +43,14 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        self.register_buffer("global_step", torch.tensor(0, dtype=torch.long))
-
-        # Embeddings
+        # Original Discrete Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
             padding_idx=SpecialTokens.PAD.value,
         )
 
+        self.tie_embeddings = tie_embeddings
         if tie_embeddings:
             self.depth_emb = self.temp_emb
         else:
@@ -67,12 +60,18 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Continuous Projections
+        # =========================================================================
+        # FIX: ZERO-INITIALIZED RESIDUAL PROJECTIONS
+        # =========================================================================
         self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
-        self.temp_film = torch.nn.Linear(self.temporal_cfg.d_model, self.temporal_cfg.d_model * 2)
-        
         self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
-        self.depth_film = torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model * 2)
+
+        # Initialize to exact zeroes. This guarantees identical step 0 performance
+        # to the baseline, allowing organic gradient-driven fade-in.
+        torch.nn.init.zeros_(self.temp_proj.weight)
+        torch.nn.init.zeros_(self.temp_proj.bias)
+        torch.nn.init.zeros_(self.depth_proj.weight)
+        torch.nn.init.zeros_(self.depth_proj.bias)
 
         # Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
@@ -141,26 +140,22 @@ class MARIUS(torch.nn.Module):
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         print("No decay :", len(no_decay))
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
+
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
-    def temporal_forward(self, input, alpha=1.0):
+    def temporal_forward(self, input):
         B, L, K = input.shape
 
-        input_embs = self.temp_emb(input).sum(dim=-2)
+        # Original discrete extraction
+        discrete_embs = self.temp_emb(input).sum(dim=-2)
         
+        # Extract Cosette full-state continuous representation
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
-        
-        film_params = self.temp_film(continuous_embs)
-        gamma, beta = film_params.chunk(2, dim=-1)
-        
-        # FIX: Explicitly protect PAD sequence elements from bias drift
-        is_valid = (input[:, :, 0] != SpecialTokens.PAD.value).unsqueeze(-1).to(gamma.dtype)
-        gamma = gamma * alpha * is_valid
-        beta = beta * alpha * is_valid
-            
-        input_embs = input_embs * (1.0 + gamma) + beta
 
+        # Zero-Init addition guarantees safety
+        input_embs = discrete_embs + continuous_embs
+        
         input_embs += self.temp_pos_emb[:, : input.shape[1], :]
         input_embs = self.temp_dropout(input_embs)
 
@@ -169,34 +164,39 @@ class MARIUS(torch.nn.Module):
             mask=self.causal_mask[:L, :L],
             src_key_padding_mask=input[:, :, 0] == SpecialTokens.PAD.value,
         )
+
         return out
 
     def depth_forward(self, in_embs):
         K = in_embs.shape[1]
+
         in_embs = in_embs + self.depth_pos_emb[:, :K, :]
         in_embs = self.depth_dropout(in_embs)
+
         depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K])
+
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
+
         return logits
 
-    def train_forward(self, input, target, alpha=1.0):
-        temporal_tokens = self.temporal_forward(input, alpha=alpha)
-        mid_tokens = self.mid_proj(temporal_tokens)
-        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
+    def train_forward(self, input, target):
+        temporal_tokens = self.temporal_forward(input)  # B x L x D
+        mid_tokens = self.mid_proj(temporal_tokens)  # B x L x d
+        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")  # BL x 1 x D
 
-        target = rearrange(target, "b l k -> (b l) k")
+        target = rearrange(target, "b l k -> (b l) k")  # BL x K
         keep = target[:, 0] != -100
 
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # FIX: Extract native embeddings directly first to preserve exact SpecialTokens logic
+        # Extract native discrete embeddings directly to preserve exact logic
         dec_embs_orig = self.depth_emb(target[:, :-1])
-        
+
+        # Safely extract and inject residual continuous embeddings
         K_minus_1 = dec_embs_orig.shape[1]
         if K_minus_1 > 0:
-            gammas = []
-            betas = []
+            cont_res_list = []
             for i in range(K_minus_1):
                 quantizer = self.cosette.model.rq.vq_layers[i]
                 layer_indices = target[:, i]
@@ -207,43 +207,27 @@ class MARIUS(torch.nn.Module):
 
                 x_res = quantizer.get_codebook_entry(safe_indices, shape=None)
                 continuous_res = self.depth_proj(x_res)
-
-                film_params = self.depth_film(continuous_res)
-                gamma, beta = film_params.chunk(2, dim=-1)
                 
-                v_mask = valid_mask.unsqueeze(-1).to(gamma.dtype)
-                gammas.append(gamma * v_mask)
-                betas.append(beta * v_mask)
+                v_mask = valid_mask.unsqueeze(-1).to(continuous_res.dtype)
+                cont_res_list.append(continuous_res * v_mask)
 
-            gamma_tensor = torch.stack(gammas, dim=1) * alpha
-            beta_tensor = torch.stack(betas, dim=1) * alpha
-
-            # Modulate over the preserved discrete base embeddings
-            dec_embs = dec_embs_orig * (1.0 + gamma_tensor) + beta_tensor
+            continuous_tensor = torch.stack(cont_res_list, dim=1)
+            dec_embs = dec_embs_orig + continuous_tensor
         else:
             dec_embs = dec_embs_orig
 
         dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
-        depth_logits = self.depth_forward(dec_embs)
+
+        depth_logits = self.depth_forward(dec_embs)  # BL x K x V
         return depth_logits, target
 
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
-        
-        if self.training:
-            current_step = self.global_step.item()
-            if current_step < self.warmup_steps:
-                alpha = 0.0
-            else:
-                alpha = min(1.0, (current_step - self.warmup_steps) / self.fade_steps)
-            
-            self.global_step += 1
-        else:
-            alpha = 1.0
 
-        logits, m_target = self.train_forward(input, target, alpha=alpha)
+        logits, m_target = self.train_forward(input, target)
         logits = rearrange(logits, "B k v -> B v k")
         loss = self.criterion(logits, m_target)
+
         return loss, logits
 
     def search(self, batch, n_results):
@@ -256,22 +240,23 @@ class MARIUS(torch.nn.Module):
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        temporal_tokens = self.temporal_forward(input, alpha=1.0)
-        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]
+        temporal_tokens = self.temporal_forward(input)  # B x L x D
+        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]  # B, D
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
-        sequences = mid_tokens[:, None, :]
-        depth_logits = self.depth_forward(sequences)
-        log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)
+        # Initialize the beam search ==============================================
+        sequences = mid_tokens[:, None, :]  # B x 1 x D
+        depth_logits = self.depth_forward(sequences)  # B x 1 x D
+        log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  # B x V
 
-        topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
+        topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  # B x b
 
-        indices = topk_indices.unsqueeze(2)
-        scores = topk_log_probs
-        sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
+        indices = topk_indices.unsqueeze(2)  # Shape: (B, b, 1)
+        scores = topk_log_probs  # Shape: B x b
+        sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
-        # FIX: Directly embed raw predicted indices to protect EOS logic
+        # FIX: Discrete embedding must look up unmodified topk_indices to preserve EOS/Padding
         discrete_new = self.depth_emb(topk_indices)
 
         quantizer = self.cosette.model.rq.vq_layers[0]
@@ -281,23 +266,21 @@ class MARIUS(torch.nn.Module):
 
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
+        
+        v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
+        continuous_new = continuous_new * v_mask
 
-        film_new = self.depth_film(continuous_new)
-        gamma_new, beta_new = film_new.chunk(2, dim=-1)
-        
-        v_mask = valid_mask.unsqueeze(-1).to(gamma_new.dtype)
-        gamma_new = gamma_new * v_mask
-        beta_new = beta_new * v_mask
-        
-        fused_new = discrete_new * (1.0 + gamma_new) + beta_new
-        new_tokens = fused_new.unsqueeze(2)
+        # Residual Addition
+        fused_new = discrete_new + continuous_new
+        new_tokens = fused_new.unsqueeze(2)  # Shape : (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
+        # Start the beam search ===================================================
         for i in range(2, L + 1):
             last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
-            log_probs = F.log_softmax(last_logits, dim=-1)
+            log_probs = F.log_softmax(last_logits, dim=-1)  # B * b x V
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
 
@@ -310,9 +293,9 @@ class MARIUS(torch.nn.Module):
             )
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
-
+            
+            # --- Continuous + Discrete Fusion Loop ---
             flat_topk = topk_indices.view(-1)
-            # FIX: Directly embed raw indices
             flat_discrete = self.depth_emb(flat_topk)
 
             quantizer = self.cosette.model.rq.vq_layers[i - 1]
@@ -322,38 +305,37 @@ class MARIUS(torch.nn.Module):
 
             flat_decoded = quantizer.get_codebook_entry(safe_indices, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
-
-            flat_film = self.depth_film(flat_projected)
-            flat_gamma, flat_beta = flat_film.chunk(2, dim=-1)
             
-            flat_valid = valid_mask.unsqueeze(-1).to(flat_gamma.dtype)
-            flat_gamma = flat_gamma * flat_valid
-            flat_beta = flat_beta * flat_valid
-            
-            flat_fused = flat_discrete * (1.0 + flat_gamma) + flat_beta
+            flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
+            flat_projected = flat_projected * flat_valid
 
+            flat_fused = flat_discrete + flat_projected
             next_tokens = flat_fused.view(B, b, b, 1, D)
+            # ----------------------------------------
+            
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
-
             expanded_scores = expanded_scores.view(B, -1)
             expanded_sequences = expanded_sequences.view(
                 B, -1, expanded_sequences.size(-2), D
             )
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
-            topk_scores, topk_indices_choice = torch.topk(expanded_scores, b, dim=-1)
+            topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
-            sequences = expanded_sequences[arranged, topk_indices_choice]
-            indices = expanded_indices[arranged, topk_indices_choice]
-            scores = topk_scores
+            sequences = expanded_sequences[arranged, topk_indices]
+            indices = expanded_indices[arranged, topk_indices]
+
+            scores = topk_scores  # Shape: (B, b)
 
         if self.filter_preds:
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
-            is_in_query = is_in_query.all(dim=-1).any(dim=-1)
+            is_in_query = is_in_query.all(dim=-1).any(dim=-1)  # Shape B x b
+
             scores[is_in_query] = -torch.inf
-            topk_scores, topk_indices_choice = torch.topk(scores, keep_final, dim=-1)
-            indices = indices[arranged, topk_indices_choice]
+
+            topk_scores, topk_indices = torch.topk(scores, keep_final, dim=-1)
+            indices = indices[arranged, topk_indices]
 
         return indices
