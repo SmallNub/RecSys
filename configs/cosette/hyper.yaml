@@ -12,4 +12,6 @@ loss:
   bias: 0.0
 
 centroids: 
-  kmeans_init: false
+  kmeans_init: true
+  sk_epsilons: [0.005, 0.005, 0.005, 0.005]
+  n_centroids_list: [256, 256, 256, 256]
