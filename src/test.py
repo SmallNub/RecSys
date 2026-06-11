@@ -10,10 +10,9 @@ import pandas as pd
 import pytorch_lightning as L
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
 
 from src.utils.tools import patch_fsspec
-from src.data.datasets import get_items_map, get_quantized
+from src.data.datasets import get_quantized
 
 FILENAMES = {
     "metrics": "metrics.pkl",
@@ -60,7 +59,7 @@ def get_top_cfg(fs, config):
     return cfg, best_checkpoint
 
 
-def get_metrics(cfg, ckpt_path, split, datasets):
+def get_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     patch_fsspec()
 
     datamodule = hydra.utils.instantiate(cfg.data.datamodule, datasets=datasets)
@@ -69,6 +68,12 @@ def get_metrics(cfg, ckpt_path, split, datasets):
     model = hydra.utils.instantiate(cfg["model"])
     n_params = sum(p.numel() for p in model.parameters())
     model.full_hydra_config = cfg
+
+    # Inject diversity context for test split
+    if split == "test" and diversity_context is not None:
+        model.code_to_item = diversity_context["code_to_item"]
+        model.item_embeddings = diversity_context["item_embeddings"]
+        model.popularity_counts = diversity_context["popularity_counts"]
 
     trainer = L.Trainer(accelerator="gpu", precision="bf16-mixed")
 
@@ -81,113 +86,6 @@ def get_metrics(cfg, ckpt_path, split, datasets):
     metrics[0]["n_params"] = n_params
 
     return metrics
-
-
-def get_popularity_counts(fs, cfg):
-    """Count item frequency in training timelines."""
-    train_path = cfg.paths.timelines_tplt.format(
-        category=cfg.data.datasets.category, split="train"
-    )
-    train_df = pd.read_parquet(train_path, filesystem=fs)
-    counts = {}
-    for timeline in train_df["timeline"]:
-        for item in timeline:
-            counts[item] = counts.get(item, 0) + 1
-    return counts
-
-
-def get_diversity_metrics(
-    model,
-    dataset,
-    id_to_item,
-    item_embeddings,  # dict: item_id (str) -> np.array
-    popularity_counts,  # dict: item_id (str) -> int
-    k=10,
-    batch_size=256,
-    device="cuda",
-):
-    """
-    Compute ILD, Gini, and Entropy over top-K recommendations.
-
-    - ILD: mean pairwise cosine distance within each user's top-K list
-    - Gini: inequality of item exposure across all recommendations
-    - Entropy: entropy of item frequency distribution across all recommendations
-    """
-    model.eval()
-    model.to(device)
-
-    all_recommended_items = []  # flat list of all recommended item IDs
-    all_ild_scores = []
-
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    with torch.no_grad():
-        for batch in loader:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
-
-            # indices: B x K x L (K candidates, L depth codes per item)
-            indices = model.net.search(batch, n_results=k)  # B x K x L
-
-            B = indices.shape[0]
-            for b in range(B):
-                # Map code sequences back to item IDs
-                rec_codes = indices[b].cpu().tolist()  # K x L
-                rec_items = []
-                for code in rec_codes:
-                    # Look up item by matching code tuple in quantizer
-                    item_id = id_to_item.get(tuple(code))
-                    if item_id is not None:
-                        rec_items.append(item_id)
-
-                all_recommended_items.extend(rec_items)
-
-                # ILD: mean pairwise cosine distance
-                embs = np.array([
-                    item_embeddings[item] for item in rec_items
-                    if item in item_embeddings
-                ])
-                if len(embs) >= 2:
-                    # Normalize
-                    norms = np.linalg.norm(embs, axis=1, keepdims=True)
-                    embs = embs / (norms + 1e-8)
-                    sim_matrix = embs @ embs.T  # cosine similarity
-                    dist_matrix = 1 - sim_matrix
-                    # Mean of upper triangle (pairwise distances)
-                    n = len(embs)
-                    ild = dist_matrix[np.triu_indices(n, k=1)].mean()
-                    all_ild_scores.append(ild)
-
-    # --- ILD ---
-    mean_ild = float(np.mean(all_ild_scores)) if all_ild_scores else 0.0
-
-    # --- Popularity bias metrics ---
-    # Count how many times each item was recommended
-    rec_counts = {}
-    for item in all_recommended_items:
-        rec_counts[item] = rec_counts.get(item, 0) + 1
-
-    counts = np.array(list(rec_counts.values()), dtype=float)
-    counts_sorted = np.sort(counts)
-    n = len(counts_sorted)
-
-    # Gini coefficient
-    if n > 1:
-        cumulative = np.cumsum(counts_sorted)
-        gini = (2 * np.sum((np.arange(1, n + 1)) * counts_sorted) /
-                (n * cumulative[-1])) - (n + 1) / n
-    else:
-        gini = 0.0
-
-    # Entropy
-    probs = counts / counts.sum()
-    entropy = float(-np.sum(probs * np.log(probs + 1e-8)))
-
-    return {
-        "diversity/ILD": mean_ild,
-        "popularity_bias/Gini": float(gini),
-        "popularity_bias/Entropy": entropy,
-    }
 
 
 def build_code_to_item(fs, cfg):
@@ -216,6 +114,19 @@ def load_item_embeddings(fs, cfg):
     return {row["product_id"]: np.array(row["embedding"]) for _, row in emb_df.iterrows()}
 
 
+def get_popularity_counts(fs, cfg):
+    """Count item frequency in training timelines."""
+    train_path = cfg.paths.timelines_tplt.format(
+        category=cfg.data.datasets.category, split="train"
+    )
+    train_df = pd.read_parquet(train_path, filesystem=fs)
+    counts = {}
+    for timeline in train_df["timeline"]:
+        for item in timeline:
+            counts[item] = counts.get(item, 0) + 1
+    return counts
+
+
 def to_pickle(fs, path, data):
     with fs.open(path, "wb") as f:
         pickle.dump(data, f)
@@ -236,42 +147,22 @@ def main(test_config):
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
-    # 3. Standard accuracy metrics
+    # 3. Build diversity context once (used during test forward pass)
+    print("[INFO] Building diversity context...")
+    diversity_context = {
+        "code_to_item": build_code_to_item(fs, cfg),
+        "item_embeddings": load_item_embeddings(fs, cfg),
+        "popularity_counts": get_popularity_counts(fs, cfg),
+    }
+
+    # 4. Standard accuracy metrics (valid has no diversity)
     valid_metrics = get_metrics(cfg, best_checkpoint, "valid", datasets)
-    test_metrics = get_metrics(cfg, best_checkpoint, "test", datasets)
 
-    # 4. Diversity and popularity bias metrics
-    print("[INFO] Computing diversity and popularity bias metrics...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 5. Test metrics — diversity computed inside Lightning via on_test_epoch_end
+    test_metrics = get_metrics(cfg, best_checkpoint, "test", datasets,
+                               diversity_context=diversity_context)
 
-    model = hydra.utils.instantiate(cfg["model"])
-    ckpt = torch.load(
-        cfg.paths.protocol + "://" + best_checkpoint,
-        map_location=device,
-        weights_only=False,
-    )
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    model.to(device)
-
-    code_to_item = build_code_to_item(fs, cfg)
-    item_embeddings = load_item_embeddings(fs, cfg)
-    popularity_counts = get_popularity_counts(fs, cfg)
-
-    diversity_metrics = get_diversity_metrics(
-        model=model,
-        dataset=datasets["test"],
-        id_to_item=code_to_item,
-        item_embeddings=item_embeddings,
-        popularity_counts=popularity_counts,
-        k=10,
-        batch_size=256,
-        device=device,
-    )
-    print(f"[INFO] Diversity metrics: {diversity_metrics}")
-    test_metrics[0].update(diversity_metrics)
-
-    # 5. Save pickle
+    # 6. Save pickle
     to_pickle(
         fs,
         os.path.join(os.path.dirname(best_checkpoint), FILENAMES["metrics"]),
@@ -282,7 +173,7 @@ def main(test_config):
         },
     )
 
-    # 6. Append to shared summary CSV
+    # 7. Append to shared summary CSV
     summary_path = os.path.join(
         test_config.paths.model_folder_tplt, "results_summary.csv"
     )

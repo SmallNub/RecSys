@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from pytorch_lightning import LightningModule
 
@@ -21,6 +22,15 @@ class LitModule(LightningModule):
         }
 
         self.dcg_denom = torch.log2(torch.arange(1, max(self.Ks) + 1) + 1).view(1, -1)
+
+        # Diversity/popularity context — injected from test.py before trainer.test
+        self.code_to_item = None       # dict: tuple(code) -> item_id
+        self.item_embeddings = None    # dict: item_id -> np.array
+        self.popularity_counts = None  # dict: item_id -> int
+
+        # Accumulators reset each test epoch
+        self._test_rec_items = []
+        self._test_ild_scores = []
 
     @property
     def category(self):
@@ -113,6 +123,83 @@ class LitModule(LightningModule):
                 reduce_fx="mean",
                 add_dataloader_idx=False,
             )
+
+        # Accumulate recommendations for diversity metrics (test only)
+        if split == "test" and self.code_to_item is not None:
+            self._accumulate_diversity(gen)
+
+    def _accumulate_diversity(self, gen):
+        """Accumulate per-batch recommendations for end-of-epoch diversity computation."""
+        # gen: B x K x L
+        B = gen.shape[0]
+        for b in range(B):
+            rec_codes = gen[b].cpu().tolist()  # K x L
+            rec_items = []
+            for code in rec_codes:
+                item_id = self.code_to_item.get(tuple(code))
+                if item_id is not None:
+                    rec_items.append(item_id)
+
+            self._test_rec_items.extend(rec_items)
+
+            # ILD: mean pairwise cosine distance for this user
+            if self.item_embeddings is not None:
+                embs = np.array([
+                    self.item_embeddings[item]
+                    for item in rec_items
+                    if item in self.item_embeddings
+                ])
+                if len(embs) >= 2:
+                    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+                    embs = embs / (norms + 1e-8)
+                    sim_matrix = embs @ embs.T
+                    dist_matrix = 1 - sim_matrix
+                    n = len(embs)
+                    ild = dist_matrix[np.triu_indices(n, k=1)].mean()
+                    self._test_ild_scores.append(float(ild))
+
+    def on_test_epoch_start(self):
+        self._test_rec_items = []
+        self._test_ild_scores = []
+
+    def on_test_epoch_end(self):
+        if self.code_to_item is None:
+            return
+
+        # ILD
+        mean_ild = float(np.mean(self._test_ild_scores)) if self._test_ild_scores else 0.0
+
+        # Popularity bias — count item exposure across all recommendations
+        rec_counts = {}
+        for item in self._test_rec_items:
+            rec_counts[item] = rec_counts.get(item, 0) + 1
+
+        counts = np.array(list(rec_counts.values()), dtype=float)
+        counts_sorted = np.sort(counts)
+        n = len(counts_sorted)
+
+        # Gini
+        if n > 1:
+            gini = (
+                2 * np.sum(np.arange(1, n + 1) * counts_sorted)
+                / (n * counts_sorted.sum())
+            ) - (n + 1) / n
+        else:
+            gini = 0.0
+
+        # Entropy
+        probs = counts / counts.sum()
+        entropy = float(-np.sum(probs * np.log(probs + 1e-8)))
+
+        self.log(f"test/{self.category}/diversity/ILD", mean_ild)
+        self.log(f"test/{self.category}/popularity_bias/Gini", float(gini))
+        self.log(f"test/{self.category}/popularity_bias/Entropy", entropy)
+
+        print(f"[Diversity] ILD={mean_ild:.4f} | Gini={gini:.4f} | Entropy={entropy:.4f}")
+
+        # Reset accumulators
+        self._test_rec_items = []
+        self._test_ild_scores = []
 
     def validation_step(self, batch, batch_idx):
         self._shared_eval_step(batch, "valid")

@@ -477,7 +477,7 @@ def make_cosette_embs(config):
     )
 
 
-@hydra.main(config_path="../configs", config_name="2_train_cosette_hyper", version_base="1.2") #THIS HAS BEEN CHANGED FOR HYPER 
+@hydra.main(config_path="../configs", config_name="2_train_cosette", version_base="1.2") #THIS HAS BEEN CHANGED FOR HYPER 
 def main(config):
     make_cosette_embs(config)
 
