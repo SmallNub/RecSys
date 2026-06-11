@@ -25,16 +25,19 @@ class MARIUS(torch.nn.Module):
         temporal_cfg,
         depth_cfg,
         cosette: CosetteWrapper,
+        tie_embeddings=False,
         filter_preds=False,
-        warmup_steps=15000,   # 15k steps: Pure discrete embedding refinement
-        fade_steps=30000,    # 30k steps: Ultra-smooth continuous integration
+        warmup_steps=15000,   # Steps with COSETTE completely muted
+        fade_steps=30000,    # Steps to linearly transition alpha from 0.0 to 1.0
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
         self.cosette = cosette
+        self.tie_embeddings = tie_embeddings
         
+        # Self-contained schedule properties
         self.warmup_steps = warmup_steps
         self.fade_steps = fade_steps
 
@@ -47,41 +50,33 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Persistent training step buffer
+        # Persistent step tracking state
         self.register_buffer("global_step", torch.tensor(0, dtype=torch.long))
 
-        # Discrete Backbone Embeddings
+        # Original Discrete Backbone Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
             padding_idx=SpecialTokens.PAD.value,
         )
-        self.depth_emb = torch.nn.Embedding(
-            self.depth_cfg.vocab_size,
-            self.depth_cfg.d_model,
-            padding_idx=SpecialTokens.PAD.value,
-        )
 
-        # Continuous Projections
-        self.temp_proj = torch.nn.Linear(
-            self.cosette.model.in_dim, self.temporal_cfg.d_model
-        )
-        self.depth_proj = torch.nn.Linear(
-            self.cosette.model.centroids_dim, self.depth_cfg.d_model
-        )
+        if tie_embeddings:
+            self.depth_emb = self.temp_emb
+        else:
+            self.depth_emb = torch.nn.Embedding(
+                self.depth_cfg.vocab_size,
+                self.depth_cfg.d_model,
+                padding_idx=SpecialTokens.PAD.value,
+            )
 
-        # Dual-Stream Layer Normalization
-        self.temp_ln_discrete = torch.nn.LayerNorm(self.temporal_cfg.d_model)
-        self.temp_ln_continuous = torch.nn.LayerNorm(self.temporal_cfg.d_model)
-        
-        self.depth_ln_discrete = torch.nn.LayerNorm(self.depth_cfg.d_model)
-        self.depth_ln_continuous = torch.nn.LayerNorm(self.depth_cfg.d_model)
-
-        # FiLM Generators
+        # Continuous Projections & FiLM Modulation blocks (No extra LayerNorms added)
+        self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
         self.temp_film = torch.nn.Linear(self.temporal_cfg.d_model, self.temporal_cfg.d_model * 2)
+        
+        self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
         self.depth_film = torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model * 2)
 
-        # Positional Encoding
+        # Original Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
             torch.randn((1, self.temporal_cfg.seq_len, self.temporal_cfg.d_model))
         )
@@ -89,16 +84,11 @@ class MARIUS(torch.nn.Module):
             torch.randn((1, self.depth_cfg.seq_len, self.depth_cfg.d_model))
         )
 
-        # Embedding dropout
+        # Original Embedding dropout
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Output Classification Head
-        self.output_head = torch.nn.Linear(
-            self.depth_cfg.d_model, self.depth_cfg.vocab_size
-        )
-
-        # Transformer Blocks
+        # Original Transformer Structures
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -144,33 +134,36 @@ class MARIUS(torch.nn.Module):
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     def get_param_groups(self):
+        """Restored exact selection rules to protect initial optimizer trajectories"""
         def _select_no_decay(n):
-            return "bias" in n or "norm" in n
+            return "temp_emb" in n or "depth_emb" in n
 
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
+        print("No decay :", len(no_decay))
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input, alpha=1.0):
         B, L, K = input.shape
 
-        discrete_embs = self.temp_emb(input[:, :, 0])
+        # Match Original: Extract discrete tokens across all parallel indices and sum them
+        input_embs = self.temp_emb(input).sum(dim=-2)
+        
+        # Calculate continuous additions via COSETTE
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
-        
-        discrete_embs = self.temp_ln_discrete(discrete_embs)
-        continuous_embs = self.temp_ln_continuous(continuous_embs)
         
         film_params = self.temp_film(continuous_embs)
         gamma, beta = film_params.chunk(2, dim=-1)
         
-        # Smooth scaling via curated internal alpha
+        # Scale modulation parameters with active curriculum value
         gamma = gamma * alpha
         beta = beta * alpha
             
-        input_embs = discrete_embs * (1.0 + gamma) + beta
+        # At alpha=0: input_embs * (1 + 0) + 0 -> evaluates perfectly to pure input_embs
+        input_embs = input_embs * (1.0 + gamma) + beta
 
-        input_embs += self.temp_pos_emb[:, :L, :]
+        input_embs += self.temp_pos_emb[:, : input.shape[1], :]
         input_embs = self.temp_dropout(input_embs)
 
         out = self.temp_tf(
@@ -185,57 +178,64 @@ class MARIUS(torch.nn.Module):
         in_embs = in_embs + self.depth_pos_emb[:, :K, :]
         in_embs = self.depth_dropout(in_embs)
         depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K])
-        logits = self.output_head(depth_preds)
+        
+        # Match Original: Tied weights classification matrix multiplication
+        logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
         return logits
 
     def train_forward(self, input, target, alpha=1.0):
-        temporal_tokens = self.temporal_forward(input, alpha=alpha)
-        mid_tokens = self.mid_proj(temporal_tokens)
-        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
+        temporal_tokens = self.temporal_forward(input, alpha=alpha)  # B x L x D
+        mid_tokens = self.mid_proj(temporal_tokens)  # B x L x d
+        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")  # BL x 1 x d
 
-        target = rearrange(target, "b l k -> (b l) k")
+        target = rearrange(target, "b l k -> (b l) k")  # BL x K
         keep = target[:, 0] != -100
 
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        N, K = target.shape
-        dec_embs_list = []
+        # Match Original: Extract the target sequence baseline directly
+        dec_embs = self.depth_emb(target[:, :-1])
+        
+        N, K_minus_1 = dec_embs.shape[0], dec_embs.shape[1]
+        if K_minus_1 > 0:
+            gammas = []
+            betas = []
+            for i in range(K_minus_1):
+                quantizer = self.cosette.model.rq.vq_layers[i]
+                layer_indices = target[:, i]
 
-        for i in range(K - 1):
-            quantizer = self.cosette.model.rq.vq_layers[i]
-            layer_indices = target[:, i]
+                num_embeddings = getattr(quantizer, "n_centroids", 32000)
+                valid_mask = (layer_indices >= 0) & (layer_indices < num_embeddings)
+                safe_indices = torch.where(valid_mask, layer_indices, torch.zeros_like(layer_indices))
 
-            num_embeddings = getattr(quantizer, "n_centroids", 32000)
-            valid_mask = (layer_indices >= 0) & (layer_indices < num_embeddings)
-            safe_indices = torch.where(valid_mask, layer_indices, torch.zeros_like(layer_indices))
+                x_res = quantizer.get_codebook_entry(safe_indices, shape=None)
+                continuous_res = self.depth_proj(x_res)
 
-            discrete_res = self.depth_emb(safe_indices)
-            x_res = quantizer.get_codebook_entry(safe_indices, shape=None)
-            continuous_res = self.depth_proj(x_res)
+                film_params = self.depth_film(continuous_res)
+                gamma, beta = film_params.chunk(2, dim=-1)
+                
+                # Zero out padding or out-of-bounds tokens
+                v_mask = valid_mask.unsqueeze(-1).to(gamma.dtype)
+                gamma = gamma * v_mask
+                beta = beta * v_mask
 
-            discrete_res = self.depth_ln_discrete(discrete_res)
-            continuous_res = self.depth_ln_continuous(continuous_res)
+                gammas.append(gamma)
+                betas.append(beta)
 
-            film_params = self.depth_film(continuous_res)
-            gamma, beta = film_params.chunk(2, dim=-1)
-            
-            gamma = gamma * alpha
-            beta = beta * alpha
+            gamma_tensor = torch.stack(gammas, dim=1)
+            beta_tensor = torch.stack(betas, dim=1)
 
-            proj_res = discrete_res * (1.0 + gamma) + beta
+            gamma_tensor = gamma_tensor * alpha
+            beta_tensor = beta_tensor * alpha
 
-            v_mask = valid_mask.unsqueeze(-1).to(discrete_res.dtype)
-            proj_res = proj_res * v_mask
-            dec_embs_list.append(proj_res)
+            # Modulate baseline vectors natively without intermediate layer normalizations
+            dec_embs = dec_embs * (1.0 + gamma_tensor) + beta_tensor
 
-        if len(dec_embs_list) > 0:
-            dec_embs = torch.stack(dec_embs_list, dim=1)
-            dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
-        else:
-            dec_embs = mid_tokens
+        # Merge projections (Exactly matching original behavior)
+        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
 
-        depth_logits = self.depth_forward(dec_embs)
+        depth_logits = self.depth_forward(dec_embs)  # BL x K x V
         return depth_logits, target
 
     def get_loss(self, batch):
@@ -258,7 +258,7 @@ class MARIUS(torch.nn.Module):
         return loss, logits
 
     def search(self, batch, n_results):
-        assert self.training is False, "Not in evaluation mode."
+        assert self.training is False, "Not in evaluation mode (dropout)."
 
         input = batch["input"]
         L = batch["target"].shape[-1]
@@ -282,6 +282,7 @@ class MARIUS(torch.nn.Module):
         scores = topk_log_probs
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
 
+        # First layer generation with restored tied structural parameters
         quantizer = self.cosette.model.rq.vq_layers[0]
         num_embeddings = getattr(quantizer, "n_centroids", 32000)
         valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
@@ -290,9 +291,6 @@ class MARIUS(torch.nn.Module):
         discrete_new = self.depth_emb(safe_indices)
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
-
-        discrete_new = self.depth_ln_discrete(discrete_new)
-        continuous_new = self.depth_ln_continuous(continuous_new)
 
         film_new = self.depth_film(continuous_new)
         gamma_new, beta_new = film_new.chunk(2, dim=-1)
@@ -331,9 +329,6 @@ class MARIUS(torch.nn.Module):
             flat_discrete = self.depth_emb(flat_topk)
             flat_decoded = quantizer.get_codebook_entry(flat_topk, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
-
-            flat_discrete = self.depth_ln_discrete(flat_discrete)
-            flat_projected = self.depth_ln_continuous(flat_projected)
 
             flat_film = self.depth_film(flat_projected)
             flat_gamma, flat_beta = flat_film.chunk(2, dim=-1)
