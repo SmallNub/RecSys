@@ -10,3 +10,6 @@ model:
 
 loss:
   bias: 0.0
+
+centroids: 
+  kmeans_init: false

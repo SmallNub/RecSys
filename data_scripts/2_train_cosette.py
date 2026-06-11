@@ -21,7 +21,6 @@ from src.utils.tools import patch_fsspec
 
 
 class LinearDecayScheduler(LRScheduler):
-    # ... (Keep this class exactly the same) ...
     def __init__(self, optimizer, warmup_steps, cooldown_steps, factor=0.1):
         self.optimizer = optimizer
         self.factor = factor
@@ -157,6 +156,12 @@ class Trainer(object):
 
             self._check_nan(loss)
             loss.backward()
+
+            # =================================================================
+            # FIX ADDED HERE: Hyperbolic Gradient Explosion Protection
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # =================================================================
+
             self.optimizer.step()
 
             total_loss += loss.item() / len(iter_data)
@@ -249,7 +254,6 @@ class Trainer(object):
 
 
 class _Dataset(torch.utils.data.IterableDataset):
-    # ... (Keep this class exactly the same) ...
     def __init__(self, timelines, items_to_row, bs, items_cut):
         self.items_to_row = items_to_row
         self.timelines = np.array(
@@ -298,7 +302,6 @@ class _Dataset(torch.utils.data.IterableDataset):
 
 
 class DataLoader:
-    # ... (Keep this class exactly the same) ...
     def __init__(self, items, timelines, bs, cut):
         self.timelines = timelines
         self.items_to_row = {item: i for i, item in enumerate(items)}
