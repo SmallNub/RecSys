@@ -1,1 +1,12 @@
 # @package _global_
+
+optim:
+  lr: 3e-4
+  warmup: 10
+  epochs: 50
+
+model:
+  type: hyper
+
+loss:
+  bias: 0.0
