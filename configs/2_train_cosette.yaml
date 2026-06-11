@@ -1,6 +1,6 @@
 defaults: 
 - _self_
-- cosette: ??? # Will override model, data, ...
+- cosette: default # Will override model, data, ...
 - paths
 - disable_hydra_dirs
 

@@ -36,7 +36,7 @@ for CATEGORY in "${CATEGORIES[@]}"; do
         echo "----------------------------------------"
 
         # Step 1: Train COSETTE
-        python data_scripts/2_train_cosette.py \
+        python data_scripts/2_train_cosette.py cosette=default \
             data.category=${CATEGORY} \
             marker=run${RUN_IDX}
 
