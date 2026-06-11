@@ -20,4 +20,4 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 python data_scripts/2_train_cosette.py cosette=hyper \
   data.category=Beauty
 
-python data_scripts/3_remove_colisions.py data.category=Beauty
+python data_scripts/3_remove_colisions.py cosette=col_hyper data.category=Beauty
