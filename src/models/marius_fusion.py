@@ -51,7 +51,7 @@ class MARIUS(torch.nn.Module):
 
         self.register_buffer("global_step", torch.tensor(0, dtype=torch.long))
 
-        # Discrete Backbone Embeddings
+        # Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -86,7 +86,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Transformers
+        # Transformer
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -126,9 +126,12 @@ class MARIUS(torch.nn.Module):
             ),
         )
 
+        # Projection
         self.mid_proj = torch.nn.Linear(
             self.temporal_cfg.d_model, self.depth_cfg.d_model
         )
+
+        # Loss
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     def get_param_groups(self):
@@ -151,8 +154,10 @@ class MARIUS(torch.nn.Module):
         film_params = self.temp_film(continuous_embs)
         gamma, beta = film_params.chunk(2, dim=-1)
         
-        gamma = gamma * alpha
-        beta = beta * alpha
+        # FIX: Explicitly protect PAD sequence elements from bias drift
+        is_valid = (input[:, :, 0] != SpecialTokens.PAD.value).unsqueeze(-1).to(gamma.dtype)
+        gamma = gamma * alpha * is_valid
+        beta = beta * alpha * is_valid
             
         input_embs = input_embs * (1.0 + gamma) + beta
 
@@ -185,9 +190,10 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        dec_embs = self.depth_emb(target[:, :-1])
+        # FIX: Extract native embeddings directly first to preserve exact SpecialTokens logic
+        dec_embs_orig = self.depth_emb(target[:, :-1])
         
-        K_minus_1 = dec_embs.shape[1]
+        K_minus_1 = dec_embs_orig.shape[1]
         if K_minus_1 > 0:
             gammas = []
             betas = []
@@ -206,19 +212,16 @@ class MARIUS(torch.nn.Module):
                 gamma, beta = film_params.chunk(2, dim=-1)
                 
                 v_mask = valid_mask.unsqueeze(-1).to(gamma.dtype)
-                gamma = gamma * v_mask
-                beta = beta * v_mask
+                gammas.append(gamma * v_mask)
+                betas.append(beta * v_mask)
 
-                gammas.append(gamma)
-                betas.append(beta)
+            gamma_tensor = torch.stack(gammas, dim=1) * alpha
+            beta_tensor = torch.stack(betas, dim=1) * alpha
 
-            gamma_tensor = torch.stack(gammas, dim=1)
-            beta_tensor = torch.stack(betas, dim=1)
-
-            gamma_tensor = gamma_tensor * alpha
-            beta_tensor = beta_tensor * alpha
-
-            dec_embs = dec_embs * (1.0 + gamma_tensor) + beta_tensor
+            # Modulate over the preserved discrete base embeddings
+            dec_embs = dec_embs_orig * (1.0 + gamma_tensor) + beta_tensor
+        else:
+            dec_embs = dec_embs_orig
 
         dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
         depth_logits = self.depth_forward(dec_embs)
@@ -268,20 +271,20 @@ class MARIUS(torch.nn.Module):
         scores = topk_log_probs
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
 
-        # Token 1 Generation Integration
+        # FIX: Directly embed raw predicted indices to protect EOS logic
+        discrete_new = self.depth_emb(topk_indices)
+
         quantizer = self.cosette.model.rq.vq_layers[0]
         num_embeddings = getattr(quantizer, "n_centroids", 32000)
         valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
         safe_indices = torch.where(valid_mask, topk_indices, torch.zeros_like(topk_indices))
 
-        discrete_new = self.depth_emb(safe_indices)
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
 
         film_new = self.depth_film(continuous_new)
         gamma_new, beta_new = film_new.chunk(2, dim=-1)
         
-        # FIXED: Mask modulation scales instead of zeroing out the structural vectors
         v_mask = valid_mask.unsqueeze(-1).to(gamma_new.dtype)
         gamma_new = gamma_new * v_mask
         beta_new = beta_new * v_mask
@@ -292,7 +295,6 @@ class MARIUS(torch.nn.Module):
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
-        # Beam Search Loop Execution
         for i in range(2, L + 1):
             last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)
@@ -309,24 +311,24 @@ class MARIUS(torch.nn.Module):
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
+            flat_topk = topk_indices.view(-1)
+            # FIX: Directly embed raw indices
+            flat_discrete = self.depth_emb(flat_topk)
+
             quantizer = self.cosette.model.rq.vq_layers[i - 1]
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
-            valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
-            safe_indices = torch.where(valid_mask, topk_indices, torch.zeros_like(topk_indices))
+            valid_mask = (flat_topk >= 0) & (flat_topk < num_embeddings)
+            safe_indices = torch.where(valid_mask, flat_topk, torch.zeros_like(flat_topk))
 
-            flat_topk = safe_indices.view(-1)
-            flat_valid = valid_mask.view(-1, 1)
-
-            flat_discrete = self.depth_emb(flat_topk)
-            flat_decoded = quantizer.get_codebook_entry(flat_topk, shape=None)
+            flat_decoded = quantizer.get_codebook_entry(safe_indices, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
 
             flat_film = self.depth_film(flat_projected)
             flat_gamma, flat_beta = flat_film.chunk(2, dim=-1)
             
-            # FIXED: Mask modulation scales dynamically inside beam projections
-            flat_gamma = flat_gamma * flat_valid.to(flat_gamma.dtype)
-            flat_beta = flat_beta * flat_valid.to(flat_beta.dtype)
+            flat_valid = valid_mask.unsqueeze(-1).to(flat_gamma.dtype)
+            flat_gamma = flat_gamma * flat_valid
+            flat_beta = flat_beta * flat_valid
             
             flat_fused = flat_discrete * (1.0 + flat_gamma) + flat_beta
 
