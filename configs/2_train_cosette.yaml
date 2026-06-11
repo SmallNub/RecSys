@@ -4,14 +4,14 @@ defaults:
 - disable_hydra_dirs
 
 optim: 
-  lr: 3e-4
-  warmup: 10
+  lr: 1e-3
+  warmup: 100
   beta2: 0.99
   use_scheduler: true 
   weight_decay: 0 
   dropout_prob: 0.1
   batch_size: 256
-  epochs: 50 # 192 steps/epochs on Arts -> 3125 epochs = 600k steps, adapt to category.
+  epochs: 500 # 192 steps/epochs on Arts -> 3125 epochs = 600k steps, adapt to category.
   eval_step: 100
 
 centroids: 
@@ -29,7 +29,7 @@ loss:
   reconstruction_weight: 1.0
   contrastive_weight: 0.001
   tau: 2 
-  bias: 0.0
+  bias: -8
   freeze_tau: false 
   freeze_bias: false
   sequence_length: 20
