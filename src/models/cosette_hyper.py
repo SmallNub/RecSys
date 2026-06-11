@@ -14,15 +14,12 @@ def lorentz_inner(u, v):
     return -u[..., 0] * v[..., 0] + (u[..., 1:] * v[..., 1:]).sum(dim=-1)
 
 def distance_lorentz(x, y):
-    # FIX: Force float32 to preserve the 1e-7 clamping margin against bfloat16 rounding
     x_f, y_f = x.float(), y.float() 
     inner = lorentz_inner(x_f, y_f)
     inner = torch.clamp(inner, max=-1.0 - 1e-7)
     return torch.acosh(-inner).to(x.dtype)
 
 def project_to_manifold(x, c=1.0):
-    """Forced float32 internally to prevent bfloat16 NaN collapse. 
-    Supports curvature annealing by scaling coordinates by sqrt(c)."""
     x_f = x.float()
     if c != 1.0:
         x_f = x_f * torch.sqrt(torch.tensor(c, dtype=torch.float32, device=x.device))
@@ -31,13 +28,11 @@ def project_to_manifold(x, c=1.0):
     return torch.cat([x0, x_f], dim=-1).to(x.dtype)
 
 def log_map(x, y):
-    # FIX: Force float32 precision
     x_f, y_f = x.float(), y.float()
     inner = lorentz_inner(x_f, y_f)
     inner = torch.clamp(inner, max=-1.0 - 1e-7)
     dist = torch.acosh(-inner)
     
-    # Taylor expansion fallback for stability to avoid 0/0
     sinh_dist = torch.sinh(dist)
     scale = torch.where(dist > 1e-6, dist / torch.clamp(sinh_dist, min=1e-6), 1.0)
     
@@ -45,20 +40,16 @@ def log_map(x, y):
     return (scale.unsqueeze(-1) * v).to(x.dtype)
 
 def exp_map(x, v):
-    # FIX: Force float32 precision
     x_f, v_f = x.float(), v.float()
     norm_v_sq = lorentz_inner(v_f, v_f)
-    # FIX: Clamp to >0 (1e-15) to prevent NaN gradients from sqrt(0)
     norm_v_sq = torch.clamp(norm_v_sq, min=1e-15) 
     norm_v = torch.sqrt(norm_v_sq)
     
-    # Taylor expansion of sinh(x)/x around 0 is 1 + x^2/6
     scale = torch.where(norm_v > 1e-6, torch.sinh(norm_v) / norm_v, 1.0 + norm_v_sq / 6.0)
     out = torch.cosh(norm_v).unsqueeze(-1) * x_f + scale.unsqueeze(-1) * v_f
     return out.to(x.dtype)
 
 def parallel_transport_to_origin(x, v):
-    """Analytically simplified: x -> O transport."""
     x0 = x[..., 0:1]
     v0 = v[..., 0:1]
     factor = v0 / (1.0 + x0)
@@ -68,9 +59,7 @@ def parallel_transport_to_origin(x, v):
     return out
 
 def parallel_transport_from_origin(x, v):
-    """Analytically simplified: O -> x transport."""
     x0 = x[..., 0:1]
-    # v is in T_O, so v_0 is 0. Inner product is just the spatial part.
     inner_xv = (x[..., 1:] * v[..., 1:]).sum(dim=-1, keepdim=True)
     factor = -inner_xv / (1.0 + x0)
     
@@ -136,7 +125,6 @@ def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
 
 
 class VectorQuantizer(nn.Module):
-    """Standard Euclidean Quantizer for Levels 2..N"""
     def __init__(self, n_centroids, centroids_dim, beta=0.25, kmeans_init=False, kmeans_iters=10, sk_epsilon=0.01, sk_iters=100):
         super().__init__()
         self.n_centroids = n_centroids
@@ -158,16 +146,16 @@ class VectorQuantizer(nn.Module):
     def get_codebook(self):
         return self.embedding.weight
 
-    def get_codebook_entry(self, indices, shape=None):
-        z_q = self.embedding(indices)
-        if shape is not None:
-            z_q = z_q.view(shape)
-        return z_q
-
     def init_emb(self, data):
+        if data.shape[0] < self.n_centroids:
+            return
+        
         centers = kmeans(data, self.n_centroids, self.kmeans_iters)
-        self.embedding.weight.data.copy_(centers)
-        self.initted = True
+        
+        # FIX: Guard against silent codebook broadcasting collapse
+        if centers.shape[0] == self.n_centroids:
+            self.embedding.weight.data.copy_(centers)
+            self.initted = True
 
     @staticmethod
     def center_distance_for_constraint(distances):
@@ -210,7 +198,6 @@ class VectorQuantizer(nn.Module):
 # ==========================================
 
 class HyperbolicVectorQuantizer(nn.Module):
-    """Lorentz Quantizer for Level 1 Root Taxonomy."""
     def __init__(self, n_centroids, centroids_dim, beta=0.25, kmeans_init=False, kmeans_iters=10, sk_epsilon=0.01, sk_iters=100):
         super().__init__()
         self.n_centroids = n_centroids
@@ -233,25 +220,30 @@ class HyperbolicVectorQuantizer(nn.Module):
         return self.embedding.weight
 
     def init_emb(self, data_R):
+        if data_R.shape[0] < self.n_centroids:
+            return
+            
         print("Initializing Hyperbolic VQ with KMeans (on R^d projection)...")
         centers = kmeans(data_R, self.n_centroids, self.kmeans_iters)
-        self.embedding.weight.data.copy_(centers)
-        self.initted = True
+        
+        # FIX: Guard against silent codebook broadcasting collapse
+        if centers.shape[0] == self.n_centroids:
+            self.embedding.weight.data.copy_(centers)
+            self.initted = True
+        else:
+            print(f"KMeans only found {centers.shape[0]} clusters. Skipping codebook init this batch.")
 
     def forward(self, x_L, use_sk=True, c=1.0):
         centroids_R = self.embedding.weight 
         centroids_L = project_to_manifold(centroids_R, c=c) 
 
-        # 1. Fast Distance Matrix Matrix Multiplications
         inner = -x_L[:, 0:1] * centroids_L[:, 0:1].t() + torch.matmul(x_L[:, 1:], centroids_L[:, 1:].t())
         
-        # FIX: Correctly clamp the inner product BEFORE applying the negative sign for acosh
         clamped_inner = torch.clamp(inner, max=-1.0 - 1e-5)
         d = torch.acosh(-clamped_inner)
         
         if not use_sk or self.sk_epsilon <= 0:
             indices = torch.argmax(inner, dim=-1)
-            # Distance is now consistently true hyperbolic distance
         else:
             d_centered = VectorQuantizer.center_distance_for_constraint(d)
             Q = sinkhorn_algorithm(d_centered.double(), self.sk_epsilon, self.sk_iters)
@@ -260,12 +252,10 @@ class HyperbolicVectorQuantizer(nn.Module):
         c1_R = self.embedding(indices) 
         c1 = project_to_manifold(c1_R, c=c) 
         
-        # 2. Tangent Extraction
         v_target = log_map(c1, x_L) 
         r_target_L = parallel_transport_to_origin(c1, v_target)
         r_target_E = r_target_L[:, 1:] 
 
-        # 3. Exact Manifold Codebook Losses
         codebook_loss = distance_lorentz(x_L.detach(), c1).mean()
         commitment_loss = distance_lorentz(x_L, c1.detach()).mean()
         loss = codebook_loss + self.beta * commitment_loss
@@ -274,20 +264,17 @@ class HyperbolicVectorQuantizer(nn.Module):
 
 
 class HyperbolicResidualVectorQuantizer(nn.Module):
-    """Hybrid RVQ: L1 = Lorentz, L2..N = Tangent Euclidean"""
     def __init__(self, n_centroids_list, centroids_dim, sk_epsilons, kmeans_init=False, kmeans_iters=100, sk_iters=100):
         super().__init__()
         self.n_centroids_list = n_centroids_list
         self.centroids_dim = centroids_dim
         self.num_quantizers = len(n_centroids_list)
         
-        # Level 1: Hyperbolic Root
         self.hyp_vq = HyperbolicVectorQuantizer(
             n_centroids_list[0], centroids_dim, kmeans_init=kmeans_init, 
             kmeans_iters=kmeans_iters, sk_epsilon=sk_epsilons[0], sk_iters=sk_iters
         )
         
-        # Levels 2..N: Euclidean in Tangent Space
         self.euc_vqs = nn.ModuleList([
             VectorQuantizer(n, centroids_dim, kmeans_init=kmeans_init, kmeans_iters=kmeans_iters, sk_epsilon=eps, sk_iters=sk_iters)
             for n, eps in zip(n_centroids_list[1:], sk_epsilons[1:])
@@ -303,17 +290,13 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         if not self.hyp_vq.initted and self.training:
             self.hyp_vq.init_emb(x)
 
-        # 1. Project base Euclidean vector onto Lorentz Manifold with curvature c
         x_L = project_to_manifold(x, c=c)
-        
-        # 2. Hyperbolic Root Tokenization
         c1, residual_E, loss0, idx0, d0 = self.hyp_vq(x_L, use_sk=use_sk, c=c)
         
         all_losses = [loss0]
         all_indices = [idx0]
         all_distances = [d0]
         
-        # 3. Euclidean Tangent Space Tokenization
         r_hat_E = 0
         for quantizer in self.euc_vqs:
             x_res, loss, indices, distance = quantizer(residual_E, use_sk=use_sk)
@@ -324,15 +307,11 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
             all_indices.append(indices)
             all_distances.append(distance)
             
-        # 4. Reconstruct and Map Back to Manifold
         r_hat_L = torch.cat([torch.zeros_like(r_hat_E[:, 0:1]), r_hat_E], dim=-1)
         v_hat = parallel_transport_from_origin(c1, r_hat_L)
         x_q_L = exp_map(c1, v_hat)
         
-        # Straight-through estimator on the manifold
         x_q_L = x_L + (x_q_L - x_L).detach()
-        
-        # 5. Inverse projection back to flat R^d space for the Decoder
         x_q = x_q_L[:, 1:]
         
         if c != 1.0:
@@ -368,11 +347,9 @@ class SigLIPLoss(torch.nn.Module):
         return loss
 
     def forward(self, xa_L, xb_L, items, timelines):
-        # Pairwise Lorentz Inner Product Matrix
         inner = -xa_L[:, 0:1] * xb_L[:, 0:1].t() + torch.matmul(xa_L[:, 1:], xb_L[:, 1:].t())
         inner = torch.clamp(inner, max=-1.0 - 1e-7)
         dist = torch.acosh(-inner)
-        
         sim = (2.0 / (1.0 + dist)) - 1.0
         
         logits = sim * self.tau.exp() + self.bias
@@ -427,4 +404,36 @@ class COSETTE(torch.nn.Module):
             x_hat = self.decoder(x_q)
 
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
-            loss
+            loss += recon_loss * self.loss_weights["reconstruction"]
+            loss += rq_loss * self.loss_weights["quantization"]
+            metrics["reconstruction_loss"] = recon_loss.item()
+            metrics["quantization_loss"] = rq_loss.item()
+
+        if self.loss_weights["contrastive"] > 0:
+            embeddings = F.embedding(items, self.embeddings)
+            x = self.encoder(embeddings)
+            
+            _, sig_rq_loss, _, _, x_q_L = self.rq(x, use_sk=True, c=c)
+
+            contrastive_loss = self.siglip(x_q_L, x_q_L, items, timelines)
+            loss += sig_rq_loss * self.loss_weights["quantization"]
+            loss += contrastive_loss * self.loss_weights["contrastive"]
+
+            metrics["contrastive_loss"] = contrastive_loss.item()
+            metrics["quantization_loss"] += sig_rq_loss.item()
+            metrics["tau"] = self.siglip.tau.item()
+            metrics["bias"] = self.siglip.bias.item()
+            metrics["n_items_in_batch"] = len(items)
+
+        metrics["manifold_curvature"] = c
+        # FIX: Ensure this return statement is properly indented at the very end of the function!
+        return loss, metrics
+
+    @torch.no_grad()
+    def get_indices(self, embeddings=None, use_sk=False, c=1.0):
+        if embeddings is None:
+            embeddings = self.embeddings
+        x_e = self.encoder(embeddings)
+        
+        _, _, indices, distances, _ = self.rq(x_e, use_sk=use_sk, c=c)
+        return indices, distances
