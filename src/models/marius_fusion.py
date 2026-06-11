@@ -26,16 +26,12 @@ class MARIUS(torch.nn.Module):
         depth_cfg,
         cosette: CosetteWrapper,
         filter_preds=False,
-        cosette_drop_prob=0.4,    # Probability of dropping the entire continuous stream per token
-        cosette_noise_std=0.15,   # Magnitude of feature-space Gaussian noise variation
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
         self.cosette = cosette
-        self.cosette_drop_prob = cosette_drop_prob
-        self.cosette_noise_std = cosette_noise_std
 
         assert (
             self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size
@@ -58,7 +54,7 @@ class MARIUS(torch.nn.Module):
             padding_idx=SpecialTokens.PAD.value,
         )
 
-        # Projections
+        # Continuous Projections
         self.temp_proj = torch.nn.Linear(
             self.cosette.model.in_dim, self.temporal_cfg.d_model
         )
@@ -66,7 +62,7 @@ class MARIUS(torch.nn.Module):
             self.cosette.model.centroids_dim, self.depth_cfg.d_model
         )
 
-        # Dual-Stream Layer Normalization
+        # Dual-Stream Layer Normalization (Protects underlying variance)
         self.temp_ln_discrete = torch.nn.LayerNorm(self.temporal_cfg.d_model)
         self.temp_ln_continuous = torch.nn.LayerNorm(self.temporal_cfg.d_model)
         
@@ -74,10 +70,10 @@ class MARIUS(torch.nn.Module):
         self.depth_ln_continuous = torch.nn.LayerNorm(self.depth_cfg.d_model)
 
         # =========================================================================
-        # FIX: STOCHASTIC GATED FUSION NETWORKS
+        # RADICAL FIX: FEATURE-WISE LINEAR MODULATION (FiLM) GENERATORS
         # =========================================================================
-        self.temp_gate = torch.nn.Linear(self.temporal_cfg.d_model, self.temporal_cfg.d_model)
-        self.depth_gate = torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model)
+        self.temp_film = torch.nn.Linear(self.temporal_cfg.d_model, self.temporal_cfg.d_model * 2)
+        self.depth_film = torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model * 2)
 
         # Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
@@ -159,24 +155,18 @@ class MARIUS(torch.nn.Module):
         discrete_embs = self.temp_ln_discrete(discrete_embs)
         continuous_embs = self.temp_ln_continuous(continuous_embs)
         
-        # FIX: Robust Regularization Execution
+        # Predict Scale and Shift parameters from continuous manifold
+        film_params = self.temp_film(continuous_embs)
+        gamma, beta = film_params.chunk(2, dim=-1)
+        
+        # RADICAL FIX: Complete Modality Obliteration on 50% of batch items
         if self.training:
-            # Variational Feature Distortion
-            if self.cosette_noise_std > 0:
-                noise = torch.randn_like(continuous_embs) * self.cosette_noise_std
-                continuous_embs = continuous_embs + noise
+            batch_mask = (torch.rand((B, 1, 1), device=continuous_embs.device) > 0.5).to(continuous_embs.dtype)
+            gamma = gamma * batch_mask
+            beta = beta * batch_mask
             
-            # Channel Mutex Exclusion Mask
-            mutex_mask = (torch.rand((B, L, 1), device=continuous_embs.device) > self.cosette_drop_prob).to(continuous_embs.dtype)
-            continuous_embs = continuous_embs * mutex_mask
-            
-            # Gated Fusion Blend
-            gate = torch.sigmoid(self.temp_gate(discrete_embs))
-            effective_gate = gate * mutex_mask + (1.0 - mutex_mask)
-            input_embs = effective_gate * discrete_embs + (1.0 - effective_gate) * continuous_embs
-        else:
-            gate = torch.sigmoid(self.temp_gate(discrete_embs))
-            input_embs = gate * discrete_embs + (1.0 - gate) * continuous_embs
+        # Non-additive Modulation: Continuous scales and shifts the discrete backbone
+        input_embs = discrete_embs * (1.0 + gamma) + beta
 
         input_embs += self.temp_pos_emb[:, :L, :]
         input_embs = self.temp_dropout(input_embs)
@@ -225,21 +215,17 @@ class MARIUS(torch.nn.Module):
             discrete_res = self.depth_ln_discrete(discrete_res)
             continuous_res = self.depth_ln_continuous(continuous_res)
 
-            # FIX: Robust Regularization on Hierarchical Residual Paths
+            # Extract Modulation parameters for the depth/hierarchical tree steps
+            film_params = self.depth_film(continuous_res)
+            gamma, beta = film_params.chunk(2, dim=-1)
+            
+            # RADICAL FIX: Enforce independent optimization on 50% of tokens
             if self.training:
-                if self.cosette_noise_std > 0:
-                    noise = torch.randn_like(continuous_res) * self.cosette_noise_std
-                    continuous_res = continuous_res + noise
-                
-                mutex_mask = (torch.rand((N, 1), device=continuous_res.device) > self.cosette_drop_prob).to(continuous_res.dtype)
-                continuous_res = continuous_res * mutex_mask
-                
-                gate = torch.sigmoid(self.depth_gate(discrete_res))
-                effective_gate = gate * mutex_mask + (1.0 - mutex_mask)
-                proj_res = effective_gate * discrete_res + (1.0 - effective_gate) * continuous_res
-            else:
-                gate = torch.sigmoid(self.depth_gate(discrete_res))
-                proj_res = gate * discrete_res + (1.0 - gate) * continuous_res
+                batch_mask = (torch.rand((N, 1), device=continuous_res.device) > 0.5).to(continuous_res.dtype)
+                gamma = gamma * batch_mask
+                beta = beta * batch_mask
+
+            proj_res = discrete_res * (1.0 + gamma) + beta
 
             v_mask = valid_mask.unsqueeze(-1).to(discrete_res.dtype)
             proj_res = proj_res * v_mask
@@ -299,9 +285,10 @@ class MARIUS(torch.nn.Module):
         discrete_new = self.depth_ln_discrete(discrete_new)
         continuous_new = self.depth_ln_continuous(continuous_new)
 
-        # FIX: Inference Fusion Gating Implementation
-        gate_new = torch.sigmoid(self.depth_gate(discrete_new))
-        fused_new = gate_new * discrete_new + (1.0 - gate_new) * continuous_new
+        # Fully deterministic inference execution matching training paths
+        film_new = self.depth_film(continuous_new)
+        gamma_new, beta_new = film_new.chunk(2, dim=-1)
+        fused_new = discrete_new * (1.0 + gamma_new) + beta_new
 
         v_mask = valid_mask.unsqueeze(-1).to(discrete_new.dtype)
         new_tokens = (fused_new * v_mask).unsqueeze(2)  # Shape: (B, b, 1, D)
@@ -341,9 +328,10 @@ class MARIUS(torch.nn.Module):
             flat_discrete = self.depth_ln_discrete(flat_discrete)
             flat_projected = self.depth_ln_continuous(flat_projected)
 
-            # FIX: Inference Loop Fusion Gating Implementation
-            flat_gate = torch.sigmoid(self.depth_gate(flat_discrete))
-            flat_fused = flat_gate * flat_discrete + (1.0 - flat_gate) * flat_projected
+            # Loop inference modulation matching the training manifold
+            flat_film = self.depth_film(flat_projected)
+            flat_gamma, flat_beta = flat_film.chunk(2, dim=-1)
+            flat_fused = flat_discrete * (1.0 + flat_gamma) + flat_beta
 
             next_tokens = (flat_fused * flat_valid.to(flat_discrete.dtype)).view(B, b, b, 1, D)
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
