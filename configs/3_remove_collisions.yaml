@@ -8,7 +8,7 @@ data:
   emb_method: sentence-t5-xl
 
 model:
-  type: euclidean  # euclidean
+  type: hyperbolic  # euclidean # CHANGED
 
 paths:
   ckpt_dir: outputs/checkpoints/cosette

@@ -178,7 +178,7 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         
         # PURE HYPERBOLIC Straight-Through Estimator
         # \hat{z} = z ⊕ (\hat{z} ⊖ z).detach()
-        diff = mobius_add(quantized_sum, -x, c)
+        diff = mobius_add(-x, quantized_sum, c)
         x_q = mobius_add(x, diff.detach(), c)
         
         loss = codebook_loss + self.beta * commitment_loss

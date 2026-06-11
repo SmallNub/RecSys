@@ -3,10 +3,10 @@
 optim:
   lr: 3e-4
   warmup: 10
-  epochs: 50
+  epochs: 500
 
 model:
-  type: hyper
+  type: hyperbolic
 
 loss:
   bias: 0.0
