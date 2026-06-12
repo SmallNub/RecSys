@@ -397,7 +397,11 @@ def make_cosette_embs(config):
         from src.models.cosette_hyper import COSETTE
     else:
         print(">>> INITIALIZING EUCLIDEAN COSETTE <<<")
-        from src.models.cosette import COSETTE
+        version_type = config.model.get("version", "default")
+        if version_type == "default":
+            from src.models.cosette import COSETTE
+        elif version_type == "alt":
+            from src.models.cosette_alt import COSETTE
 
     embeddings_path = config.paths.embeddings_tplt.format(
         emb_method=config.data.emb_method, category=config.data.category
@@ -439,6 +443,7 @@ def make_cosette_embs(config):
             "quantization": 1,
             "reconstruction": config.loss.reconstruction_weight,
             "contrastive": config.loss.contrastive_weight,
+            "latent_consistency": config.loss.get("latent_consistency_weight", 0.0),
         },
         tau=config.loss.tau,
         bias=config.loss.bias,
