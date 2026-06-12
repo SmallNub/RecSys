@@ -149,12 +149,22 @@ class MARIUS(torch.nn.Module):
         # Original discrete extraction
         discrete_embs = self.temp_emb(input).sum(dim=-2)
         
+        # =========================================================================
+        # ADDED: TEMPORAL MODALITY DROPOUT
+        # =========================================================================
+        if self.training:
+            # 20% of the time, zero out the discrete temporal table lookups.
+            # This forces the temporal encoder to logic-route entirely using Cosette projections.
+            mask = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete_embs.dtype)
+            discrete_embs = discrete_embs * mask
+        # =========================================================================
+        
         # Extract Cosette full-state continuous representation
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
-        # Zero-Init addition guarantees safety
-        input_embs = continuous_embs
+        # Combine streams
+        input_embs = discrete_embs + continuous_embs
         
         input_embs += self.temp_pos_emb[:, : input.shape[1], :]
         input_embs = self.temp_dropout(input_embs)
@@ -212,7 +222,18 @@ class MARIUS(torch.nn.Module):
                 cont_res_list.append(continuous_res * v_mask)
 
             continuous_tensor = torch.stack(cont_res_list, dim=1)
-            dec_embs = continuous_tensor
+            
+            # =========================================================================
+            # ADDED: DEPTH MODALITY DROPOUT
+            # =========================================================================
+            if self.training:
+                # 20% of the time, zero out the discrete depth lookups.
+                # This breaks discrete memorization during sub-token auto-regressive decoding.
+                depth_mask = (torch.rand(dec_embs_orig.shape[0], dec_embs_orig.shape[1], 1, device=target.device) > 0.2).to(dec_embs_orig.dtype)
+                dec_embs_orig = dec_embs_orig * depth_mask
+            # =========================================================================
+
+            dec_embs = dec_embs_orig + continuous_tensor
         else:
             dec_embs = dec_embs_orig
 
@@ -256,7 +277,7 @@ class MARIUS(torch.nn.Module):
         scores = topk_log_probs  # Shape: B x b
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
-        # FIX: Discrete embedding must look up unmodified topk_indices to preserve EOS/Padding
+        # Note: Modality Dropout skips during evaluation due to `if self.training:` checks.
         discrete_new = self.depth_emb(topk_indices)
 
         quantizer = self.cosette.model.rq.vq_layers[0]
@@ -271,7 +292,7 @@ class MARIUS(torch.nn.Module):
         continuous_new = continuous_new * v_mask
 
         # Residual Addition
-        fused_new = continuous_new
+        fused_new = discrete_new + continuous_new
         new_tokens = fused_new.unsqueeze(2)  # Shape : (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
@@ -309,7 +330,7 @@ class MARIUS(torch.nn.Module):
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
             flat_projected = flat_projected * flat_valid
 
-            flat_fused = flat_projected
+            flat_fused = flat_discrete + flat_projected
             next_tokens = flat_fused.view(B, b, b, 1, D)
             # ----------------------------------------
             
