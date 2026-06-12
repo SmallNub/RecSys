@@ -19,6 +19,44 @@ class TransformerConfig:
     seq_len: int
 
 
+class EmbeddingAdapter(torch.nn.Module):
+    """
+    Non-linear mapping block that adapts frozen continuous embeddings 
+    to the transformer's tracking space using LayerNorm, GELU, and Residuals.
+    """
+    def __init__(self, in_dim, out_dim, dropout=0.1):
+        super().__init__()
+        self.proj = torch.nn.Linear(in_dim, out_dim)
+        self.norm = torch.nn.LayerNorm(out_dim)
+        self.ffn1 = torch.nn.Linear(out_dim, out_dim * 4)
+        self.act = torch.nn.GELU()
+        self.ffn2 = torch.nn.Linear(out_dim * 4, out_dim)
+        self.dropout = torch.nn.Dropout(dropout)
+        
+        # Zero-initialize layers to guarantee step-0 baseline equivalence.
+        # This allows the model to organically fade-in continuous signals.
+        torch.nn.init.zeros_(self.proj.weight)
+        torch.nn.init.zeros_(self.proj.bias)
+        torch.nn.init.zeros_(self.ffn2.weight)
+        torch.nn.init.zeros_(self.ffn2.bias)
+
+    def forward(self, x):
+        # 1. Project to target model dimension
+        x = self.proj(x)
+        residual = x
+        
+        # 2. Apply Normalization -> Non-linear warping
+        x = self.norm(x)
+        x = self.ffn1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.ffn2(x)
+        x = self.dropout(x)
+        
+        # 3. Residual combination
+        return x + residual
+
+
 class MARIUS(torch.nn.Module):
     def __init__(
         self,
@@ -61,17 +99,18 @@ class MARIUS(torch.nn.Module):
             )
 
         # =========================================================================
-        # FIX: ZERO-INITIALIZED RESIDUAL PROJECTIONS
+        # UPGRADE: NON-LINEAR RESIDUAL ADAPTERS INSTEAD OF SIMPLE LINEAR PROJECTIONS
         # =========================================================================
-        self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
-        self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
-
-        # Initialize to exact zeroes. This guarantees identical step 0 performance
-        # to the baseline, allowing organic gradient-driven fade-in.
-        torch.nn.init.zeros_(self.temp_proj.weight)
-        torch.nn.init.zeros_(self.temp_proj.bias)
-        torch.nn.init.zeros_(self.depth_proj.weight)
-        torch.nn.init.zeros_(self.depth_proj.bias)
+        self.temp_proj = EmbeddingAdapter(
+            in_dim=self.cosette.model.in_dim, 
+            out_dim=self.temporal_cfg.d_model,
+            dropout=self.temporal_cfg.dropout
+        )
+        self.depth_proj = EmbeddingAdapter(
+            in_dim=self.cosette.model.centroids_dim, 
+            out_dim=self.depth_cfg.d_model,
+            dropout=self.depth_cfg.dropout
+        )
 
         # Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
@@ -85,7 +124,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Transformer
+        # Transformer (PyTorch handles interior Residuals and LayerNorms automatically via norm_first)
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -141,6 +180,7 @@ class MARIUS(torch.nn.Module):
         print("No decay :", len(no_decay))
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
 
+        # Note: EmbeddingAdapter parameters will correctly land in decay and receive normal adamw regularization
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input):
@@ -149,17 +189,12 @@ class MARIUS(torch.nn.Module):
         # Original discrete extraction
         discrete_embs = self.temp_emb(input).sum(dim=-2)
         
-        # =========================================================================
-        # ADDED: TEMPORAL MODALITY DROPOUT
-        # =========================================================================
+        # Modality Dropout
         if self.training:
-            # 20% of the time, zero out the discrete temporal table lookups.
-            # This forces the temporal encoder to logic-route entirely using Cosette projections.
             mask = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete_embs.dtype)
             discrete_embs = discrete_embs * mask
-        # =========================================================================
         
-        # Extract Cosette full-state continuous representation
+        # Extract Cosette full-state continuous representation and pass through non-linear block
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
@@ -223,15 +258,10 @@ class MARIUS(torch.nn.Module):
 
             continuous_tensor = torch.stack(cont_res_list, dim=1)
             
-            # =========================================================================
-            # ADDED: DEPTH MODALITY DROPOUT
-            # =========================================================================
+            # Depth Modality Dropout
             if self.training:
-                # 20% of the time, zero out the discrete depth lookups.
-                # This breaks discrete memorization during sub-token auto-regressive decoding.
                 depth_mask = (torch.rand(dec_embs_orig.shape[0], dec_embs_orig.shape[1], 1, device=target.device) > 0.2).to(dec_embs_orig.dtype)
                 dec_embs_orig = dec_embs_orig * depth_mask
-            # =========================================================================
 
             dec_embs = dec_embs_orig + continuous_tensor
         else:
@@ -277,7 +307,6 @@ class MARIUS(torch.nn.Module):
         scores = topk_log_probs  # Shape: B x b
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
-        # Note: Modality Dropout skips during evaluation due to `if self.training:` checks.
         discrete_new = self.depth_emb(topk_indices)
 
         quantizer = self.cosette.model.rq.vq_layers[0]
@@ -291,7 +320,6 @@ class MARIUS(torch.nn.Module):
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
         continuous_new = continuous_new * v_mask
 
-        # Residual Addition
         fused_new = discrete_new + continuous_new
         new_tokens = fused_new.unsqueeze(2)  # Shape : (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
