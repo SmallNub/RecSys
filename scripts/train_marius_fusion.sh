@@ -8,11 +8,11 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 
-# module purge
-# module load 2025
-# module load Anaconda3/2025.06-1
+module purge
+module load 2025
+module load Anaconda3/2025.06-1
 
-# source activate recsys
+source activate recsys
 
 # export $(cat .env | xargs)
 export PYTHONPATH=$PWD:$PYTHONPATH
