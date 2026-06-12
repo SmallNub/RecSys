@@ -32,6 +32,7 @@ trainer:
     save_top_k: 1
     monitor: valid/${data.datasets.category}/HR@10
     mode: max
+    save_weights_only: True
   - _target_: src.utils.callbacks.SaveConfigCallback
   # LOGGING 
   logger:
