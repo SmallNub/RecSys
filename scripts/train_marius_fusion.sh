@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_marius
 #SBATCH --output=scripts/slurm/train_marius%j.log
 #SBATCH --error=scripts/slurm/train_marius%j.err
-#SBATCH --time=0:45:00
+#SBATCH --time=1:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

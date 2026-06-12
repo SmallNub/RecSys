@@ -21,31 +21,29 @@ class TransformerConfig:
 
 class EmbeddingAdapter(torch.nn.Module):
     """
-    Non-linear mapping block that adapts frozen continuous embeddings 
-    to the transformer's tracking space using LayerNorm, GELU, and Residuals.
+    Highly optimized non-linear adapter that warps continuous features.
+    Processes high-dimensional multi-dimensional tensors natively in a single pass.
     """
     def __init__(self, in_dim, out_dim, dropout=0.1):
         super().__init__()
         self.proj = torch.nn.Linear(in_dim, out_dim)
         self.norm = torch.nn.LayerNorm(out_dim)
         self.ffn1 = torch.nn.Linear(out_dim, out_dim * 4)
-        self.act = torch.nn.GELU()
+        self.act = torch.nn.GELU()  # Superior gradient properties over ReLU
         self.ffn2 = torch.nn.Linear(out_dim * 4, out_dim)
         self.dropout = torch.nn.Dropout(dropout)
         
-        # Zero-initialize layers to guarantee step-0 baseline equivalence.
-        # This allows the model to organically fade-in continuous signals.
+        # Maintain zero-init properties to preserve clean baseline fade-in behavior
         torch.nn.init.zeros_(self.proj.weight)
         torch.nn.init.zeros_(self.proj.bias)
         torch.nn.init.zeros_(self.ffn2.weight)
         torch.nn.init.zeros_(self.ffn2.bias)
 
     def forward(self, x):
-        # 1. Project to target model dimension
+        # Linear projection maps last dimension safely regardless of tensor rank
         x = self.proj(x)
         residual = x
         
-        # 2. Apply Normalization -> Non-linear warping
         x = self.norm(x)
         x = self.ffn1(x)
         x = self.act(x)
@@ -53,7 +51,6 @@ class EmbeddingAdapter(torch.nn.Module):
         x = self.ffn2(x)
         x = self.dropout(x)
         
-        # 3. Residual combination
         return x + residual
 
 
@@ -98,9 +95,7 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # =========================================================================
-        # UPGRADE: NON-LINEAR RESIDUAL ADAPTERS INSTEAD OF SIMPLE LINEAR PROJECTIONS
-        # =========================================================================
+        # Non-linear adapters to map continuous features
         self.temp_proj = EmbeddingAdapter(
             in_dim=self.cosette.model.in_dim, 
             out_dim=self.temporal_cfg.d_model,
@@ -124,13 +119,14 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Transformer (PyTorch handles interior Residuals and LayerNorms automatically via norm_first)
+        # Transformers optimized with GELU activations to prevent optimization plateaus
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
                 nhead=self.temporal_cfg.d_model // self.temporal_cfg.d_head,
                 dim_feedforward=self.temporal_cfg.d_model * 4,
                 dropout=self.temporal_cfg.dropout,
+                activation="gelu",
                 batch_first=True,
                 norm_first=True,
             ),
@@ -145,6 +141,7 @@ class MARIUS(torch.nn.Module):
                 nhead=self.depth_cfg.d_model // self.depth_cfg.d_head,
                 dim_feedforward=self.depth_cfg.d_model * 4,
                 dropout=self.depth_cfg.dropout,
+                activation="gelu",
                 batch_first=True,
                 norm_first=True,
             ),
@@ -180,7 +177,6 @@ class MARIUS(torch.nn.Module):
         print("No decay :", len(no_decay))
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
 
-        # Note: EmbeddingAdapter parameters will correctly land in decay and receive normal adamw regularization
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input):
@@ -194,7 +190,7 @@ class MARIUS(torch.nn.Module):
             mask = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete_embs.dtype)
             discrete_embs = discrete_embs * mask
         
-        # Extract Cosette full-state continuous representation and pass through non-linear block
+        # Extract Cosette full-state continuous representation
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
@@ -235,13 +231,13 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # Extract native discrete embeddings directly to preserve exact logic
+        # Extract native discrete embeddings
         dec_embs_orig = self.depth_emb(target[:, :-1])
 
-        # Safely extract and inject residual continuous embeddings
         K_minus_1 = dec_embs_orig.shape[1]
         if K_minus_1 > 0:
-            cont_res_list = []
+            # OPTIMIZATION: Accumulate raw embeddings into a list to vector-project later
+            raw_res_list = []
             for i in range(K_minus_1):
                 quantizer = self.cosette.model.rq.vq_layers[i]
                 layer_indices = target[:, i]
@@ -251,12 +247,15 @@ class MARIUS(torch.nn.Module):
                 safe_indices = torch.where(valid_mask, layer_indices, torch.zeros_like(layer_indices))
 
                 x_res = quantizer.get_codebook_entry(safe_indices, shape=None)
-                continuous_res = self.depth_proj(x_res)
                 
-                v_mask = valid_mask.unsqueeze(-1).to(continuous_res.dtype)
-                cont_res_list.append(continuous_res * v_mask)
+                v_mask = valid_mask.unsqueeze(-1).to(x_res.dtype)
+                raw_res_list.append(x_res * v_mask)
 
-            continuous_tensor = torch.stack(cont_res_list, dim=1)
+            # Stack along depth layer dimension -> Shape: (BL, K_minus_1, centroids_dim)
+            raw_tensor = torch.stack(raw_res_list, dim=1)
+            
+            # CRITICAL PERFORMANCE FIX: Run the adapter exactly ONCE for all positions/layers simultaneously
+            continuous_tensor = self.depth_proj(raw_tensor)
             
             # Depth Modality Dropout
             if self.training:
