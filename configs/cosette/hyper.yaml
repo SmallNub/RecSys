@@ -1,17 +1,12 @@
-# @package _global_
+optim: 
+  lr: 5e-4
 
-optim:
-  lr: 3e-4
-  warmup: 10
-  epochs: 500
+model: 
+  type: hyperbolic 
 
-model:
-  type: hyperbolic
-
-loss:
-  bias: 0.0
+loss: 
+  tau: 1.0 
+  bias: 5.0 
 
 centroids: 
-  kmeans_init: true
-  sk_epsilons: [0.005, 0.005, 0.005, 0.005]
-  n_centroids_list: [256, 256, 256, 256]
+  sk_epsilons: [0., 0., 0., 0.01]
