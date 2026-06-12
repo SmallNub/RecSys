@@ -152,12 +152,9 @@ class MARIUS(torch.nn.Module):
         # Extract Cosette full-state continuous representation
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
-        print("TEMP")
-        print(discrete_embs.norm(dim=-1).mean())
-        print(continuous_embs.norm(dim=-1).mean())
 
         # Zero-Init addition guarantees safety
-        input_embs = discrete_embs #+ continuous_embs
+        input_embs = continuous_embs
         
         input_embs += self.temp_pos_emb[:, : input.shape[1], :]
         input_embs = self.temp_dropout(input_embs)
@@ -215,7 +212,7 @@ class MARIUS(torch.nn.Module):
                 cont_res_list.append(continuous_res * v_mask)
 
             continuous_tensor = torch.stack(cont_res_list, dim=1)
-            dec_embs = dec_embs_orig #+ continuous_tensor
+            dec_embs = continuous_tensor
         else:
             dec_embs = dec_embs_orig
 
@@ -235,9 +232,6 @@ class MARIUS(torch.nn.Module):
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode (dropout)."
-        print("WEIGHTS")
-        print(self.temp_proj.weight.norm())
-        print(self.depth_proj.weight.norm())
 
         input = batch["input"]
         L = batch["target"].shape[-1]
@@ -272,15 +266,12 @@ class MARIUS(torch.nn.Module):
 
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
-        print("NORMS")
-        print(discrete_new.norm(dim=-1).mean())
-        print(continuous_new.norm(dim=-1).mean())
         
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
         continuous_new = continuous_new * v_mask
 
         # Residual Addition
-        fused_new = discrete_new #+ continuous_new
+        fused_new = continuous_new
         new_tokens = fused_new.unsqueeze(2)  # Shape : (B, b, 1, D)
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
@@ -318,7 +309,7 @@ class MARIUS(torch.nn.Module):
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
             flat_projected = flat_projected * flat_valid
 
-            flat_fused = flat_discrete #+ flat_projected
+            flat_fused = flat_projected
             next_tokens = flat_fused.view(B, b, b, 1, D)
             # ----------------------------------------
             
