@@ -8,11 +8,11 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 
-module purge
-module load 2025
-module load Anaconda3/2025.06-1
+# module purge
+# module load 2025
+# module load Anaconda3/2025.06-1
 
-source activate recsys
+# source activate recsys
 
 # export $(cat .env | xargs)
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -35,9 +35,9 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
-python src/train.py experiment=${EXPERIMENT} \
-    data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col \
-    model.net.cosette.model_path=outputs/checkpoints/cosette/${COSETTE_TIMESTAMP}/last_model.pth
+# python src/train.py experiment=${EXPERIMENT} \
+#     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col \
+#     model.net.cosette.model_path=outputs/checkpoints/cosette/${COSETTE_TIMESTAMP}/last_model.pth
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"
 LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
