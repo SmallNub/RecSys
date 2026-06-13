@@ -185,23 +185,14 @@ def debug_code_lookup(model, batch, code_to_item, device):
 
     model.net.filter_preds = original_filter
 
-    sample_code = tuple(gen[0][0].cpu().tolist())
-    print(f"[DEBUG] gen shape: {gen.shape}")
-    print(f"[DEBUG] gen dtype: {gen.dtype}")
-    print(f"[DEBUG] gen min/max: {gen.min().item()}/{gen.max().item()}")
-    print(f"[DEBUG] Sample gen code (user 0, item 0): {sample_code}")
-    print(f"[DEBUG] code_to_item size: {len(code_to_item)}")
-    sample_keys = list(code_to_item.keys())[:3]
-    print(f"[DEBUG] Sample code_to_item keys: {sample_keys}")
-    print(f"[DEBUG] Match found: {sample_code in code_to_item}")
-    key_arr = np.array(list(code_to_item.keys()))
-    print(f"[DEBUG] code_to_item key min/max per level: {key_arr.min(axis=0)}/{key_arr.max(axis=0)}")
-
-    # Count how many of the 10 recommended codes map to real items
-    hits = 0
-    for code in gen[0].cpu().tolist():
-        if tuple(code) in code_to_item:
-            hits += 1
+    offset = 2  # len(SpecialTokens)
+    sample_code_raw = tuple(gen[0][0].cpu().tolist())
+    sample_code = tuple(c - offset for c in sample_code_raw)
+    print(f"[DEBUG] Sample raw token code: {sample_code_raw}")
+    print(f"[DEBUG] Sample centroid code (after offset): {sample_code}")
+    print(f"[DEBUG] Match in code_to_item: {sample_code in code_to_item}")
+    hits = sum(1 for code in gen[0].cpu().tolist()
+            if tuple(c - offset for c in code) in code_to_item)
     print(f"[DEBUG] Codes mapping to real items (user 0): {hits}/10")
 
 

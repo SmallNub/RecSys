@@ -130,12 +130,9 @@ class LitModule(LightningModule):
             self._accumulate_diversity(batch)
 
     def _accumulate_diversity(self, batch):
-        """
-        Re-run search with filter_preds=False to get clean codebook codes
-        that reliably map back to real items via code_to_item.
-        Using the filtered gen causes misses because beam search explores
-        invalid codebook combinations when filtering out seen items.
-        """
+        from src.models import SpecialTokens
+        offset = len(SpecialTokens)  # 2
+
         original_filter = self.net.filter_preds
         self.net.filter_preds = False
 
@@ -144,29 +141,19 @@ class LitModule(LightningModule):
 
         self.net.filter_preds = original_filter
 
-        # Temporary debug — remove after confirming
-        if not hasattr(self, '_div_debug_done'):
-            self._div_debug_done = True
-            sample_code = tuple(gen_clean[0][0].cpu().tolist())
-            print(f"[DIV DEBUG] gen_clean shape: {gen_clean.shape}")
-            print(f"[DIV DEBUG] gen_clean min/max: {gen_clean.min().item()}/{gen_clean.max().item()}")
-            print(f"[DIV DEBUG] Sample code: {sample_code}")
-            print(f"[DIV DEBUG] Match in code_to_item: {sample_code in self.code_to_item}")
-            hits = sum(1 for code in gen_clean[0].cpu().tolist() if tuple(code) in self.code_to_item)
-            print(f"[DIV DEBUG] Codes mapping to real items (user 0): {hits}/10")
-
         B = gen_clean.shape[0]
         for b in range(B):
             rec_codes = gen_clean[b].cpu().tolist()  # K x L
             rec_items = []
             for code in rec_codes:
-                item_id = self.code_to_item.get(tuple(code))
+                # Subtract special token offset to get raw centroid indices
+                centroid_code = tuple(c - offset for c in code)
+                item_id = self.code_to_item.get(centroid_code)
                 if item_id is not None:
                     rec_items.append(item_id)
 
             self._test_rec_items.extend(rec_items)
 
-            # ILD: mean pairwise cosine distance for this user
             if self.item_embeddings is not None:
                 embs = np.array([
                     self.item_embeddings[item]
