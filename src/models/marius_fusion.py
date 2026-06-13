@@ -20,10 +20,6 @@ class TransformerConfig:
 
 
 class EmbeddingAdapter(torch.nn.Module):
-    """
-    Non-linear adapter initialized normally to ensure its continuous 
-    signal is active and expressive from step 0.
-    """
     def __init__(self, in_dim, out_dim, dropout=0.1):
         super().__init__()
         self.proj = torch.nn.Linear(in_dim, out_dim)
@@ -33,7 +29,6 @@ class EmbeddingAdapter(torch.nn.Module):
         self.ffn2 = torch.nn.Linear(out_dim * 4, out_dim)
         self.dropout = torch.nn.Dropout(dropout)
         
-        # Standard initialization to prevent the model from ignoring this layer early on
         torch.nn.init.kaiming_uniform_(self.proj.weight, a=0.436)
         torch.nn.init.kaiming_uniform_(self.ffn2.weight, a=0.436)
 
@@ -75,7 +70,7 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Discrete Embeddings
+        # Baseline Discrete Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -105,18 +100,16 @@ class MARIUS(torch.nn.Module):
         )
 
         # =========================================================================
-        # UPGRADE: CONCATENATION FUSION LAYERS (Forces Cross-Modality Interaction)
+        # UPGRADE: Contextual Vector Gating Networks (Zero-Initialized)
+        # Uses the discrete sequence token context to dynamically gate dimensions.
         # =========================================================================
-        self.temp_fusion = torch.nn.Sequential(
-            torch.nn.Linear(self.temporal_cfg.d_model * 2, self.temporal_cfg.d_model),
-            torch.nn.GELU(),
-            torch.nn.LayerNorm(self.temporal_cfg.d_model)
-        )
-        self.depth_fusion = torch.nn.Sequential(
-            torch.nn.Linear(self.depth_cfg.d_model * 2, self.depth_cfg.d_model),
-            torch.nn.GELU(),
-            torch.nn.LayerNorm(self.depth_cfg.d_model)
-        )
+        self.temp_gate_net = torch.nn.Linear(self.temporal_cfg.d_model, self.temporal_cfg.d_model)
+        self.depth_gate_net = torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model)
+        
+        torch.nn.init.zeros_(self.temp_gate_net.weight)
+        torch.nn.init.zeros_(self.temp_gate_net.bias)
+        torch.nn.init.zeros_(self.depth_gate_net.weight)
+        torch.nn.init.zeros_(self.depth_gate_net.bias)
 
         # Positional Encoding
         self.temp_pos_emb = torch.nn.Parameter(
@@ -130,7 +123,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Transformers (GELU enabled)
+        # Transformers (GELU backbones)
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -190,16 +183,16 @@ class MARIUS(torch.nn.Module):
 
         discrete_embs = self.temp_emb(input).sum(dim=-2)
         
-        # INCREASED MODALITY DROPOUT: Force reliance on continuous features
         if self.training:
-            mask = (torch.rand(B, L, 1, device=input.device) > 0.4).to(discrete_embs.dtype)
+            mask = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete_embs.dtype)
             discrete_embs = discrete_embs * mask
         
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
-        # Early fusion via feature concatenation
-        input_embs = self.temp_fusion(torch.cat([discrete_embs, continuous_embs], dim=-1))
+        # Dynamic Contextual Vector Gating
+        gate = torch.tanh(self.temp_gate_net(discrete_embs))
+        input_embs = discrete_embs + gate * continuous_embs
         
         input_embs += self.temp_pos_emb[:, : input.shape[1], :]
         input_embs = self.temp_dropout(input_embs)
@@ -252,11 +245,12 @@ class MARIUS(torch.nn.Module):
             continuous_tensor = self.depth_proj(raw_tensor)
             
             if self.training:
-                depth_mask = (torch.rand(dec_embs_orig.shape[0], dec_embs_orig.shape[1], 1, device=target.device) > 0.4).to(dec_embs_orig.dtype)
+                depth_mask = (torch.rand(dec_embs_orig.shape[0], dec_embs_orig.shape[1], 1, device=target.device) > 0.2).to(dec_embs_orig.dtype)
                 dec_embs_orig = dec_embs_orig * depth_mask
 
-            # Early fusion via feature concatenation
-            dec_embs = self.depth_fusion(torch.cat([dec_embs_orig, continuous_tensor], dim=-1))
+            # Dynamic Contextual Vector Gating
+            gate = torch.tanh(self.depth_gate_net(dec_embs_orig))
+            dec_embs = dec_embs_orig + gate * continuous_tensor
         else:
             dec_embs = dec_embs_orig
 
@@ -308,8 +302,9 @@ class MARIUS(torch.nn.Module):
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
         continuous_new = continuous_new * v_mask
 
-        # Balanced fusion calculation mirroring the training setup
-        fused_new = self.depth_fusion(torch.cat([discrete_new, continuous_new], dim=-1))
+        # Search Fusion: Layer 0 Token
+        gate_new = torch.tanh(self.depth_gate_net(discrete_new))
+        fused_new = discrete_new + gate_new * continuous_new
         new_tokens = fused_new.unsqueeze(2)  
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
@@ -345,8 +340,9 @@ class MARIUS(torch.nn.Module):
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
             flat_projected = flat_projected * flat_valid
 
-            # Inference-side fusion layer alignment
-            flat_fused = self.depth_fusion(torch.cat([flat_discrete, flat_projected], dim=-1))
+            # Search Fusion: Dynamic generation steps
+            flat_gate = torch.tanh(self.depth_gate_net(flat_discrete))
+            flat_fused = flat_discrete + flat_gate * flat_projected
             next_tokens = flat_fused.view(B, b, b, 1, D)
             
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
