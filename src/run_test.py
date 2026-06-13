@@ -139,7 +139,7 @@ def get_popularity_counts(fs, cfg):
 # Metric computation
 # ---------------------------------------------------------------------------
 
-def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None, debug=False):
+def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     """
     Run standard accuracy metrics and optionally diversity metrics.
     diversity_context is only used for split='test'.
@@ -153,11 +153,11 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None, debug=F
     n_params = sum(p.numel() for p in model.parameters())
     model.full_hydra_config = cfg
 
+    # Inject diversity context for test split
     if split == "test" and diversity_context is not None:
         model.code_to_item = diversity_context["code_to_item"]
         model.item_embeddings = diversity_context["item_embeddings"]
         model.popularity_counts = diversity_context["popularity_counts"]
-        model._debug_diversity = debug
 
     trainer = L.Trainer(accelerator="gpu", precision="bf16-mixed")
     fn = trainer.validate if split == "valid" else trainer.test
@@ -172,20 +172,37 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None, debug=F
     return metrics
 
 
-def debug_code_lookup(model, gen, code_to_item):
-    """Print debug info about code lookup to diagnose zero diversity metrics."""
+def debug_code_lookup(model, batch, code_to_item, device):
+    """
+    Print debug info about code lookup using filter_preds=False
+    to get clean codebook codes.
+    """
+    original_filter = model.net.filter_preds
+    model.net.filter_preds = False
+
+    with torch.no_grad():
+        gen = model.net.search(batch, n_results=10)
+
+    model.net.filter_preds = original_filter
+
     sample_code = tuple(gen[0][0].cpu().tolist())
     print(f"[DEBUG] gen shape: {gen.shape}")
     print(f"[DEBUG] gen dtype: {gen.dtype}")
+    print(f"[DEBUG] gen min/max: {gen.min().item()}/{gen.max().item()}")
     print(f"[DEBUG] Sample gen code (user 0, item 0): {sample_code}")
     print(f"[DEBUG] code_to_item size: {len(code_to_item)}")
     sample_keys = list(code_to_item.keys())[:3]
     print(f"[DEBUG] Sample code_to_item keys: {sample_keys}")
     print(f"[DEBUG] Match found: {sample_code in code_to_item}")
-    # Check value ranges
-    print(f"[DEBUG] gen min/max: {gen.min().item()}/{gen.max().item()}")
     key_arr = np.array(list(code_to_item.keys()))
     print(f"[DEBUG] code_to_item key min/max per level: {key_arr.min(axis=0)}/{key_arr.max(axis=0)}")
+
+    # Count how many of the 10 recommended codes map to real items
+    hits = 0
+    for code in gen[0].cpu().tolist():
+        if tuple(code) in code_to_item:
+            hits += 1
+    print(f"[DEBUG] Codes mapping to real items (user 0): {hits}/10")
 
 
 def to_pickle(fs, path, data):
@@ -234,6 +251,7 @@ def main(test_config: DictConfig):
         print("[INFO] Skipping diversity context — no quantization (SASRec++ mode).")
         diversity_context = None
 
+    # 4. Debug mode — run one forward pass and inspect code lookup, then exit
     if debug:
         if not uses_quantization:
             print("[DEBUG] No quantization — skipping code lookup debug.")
@@ -242,11 +260,7 @@ def main(test_config: DictConfig):
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model = hydra.utils.instantiate(cfg["model"])
             model.full_hydra_config = cfg
-            ckpt = torch.load(
-                ckpt_path,  # plain path, no protocol prefix
-                map_location=device,
-                weights_only=False,
-            )
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["state_dict"])
             model.eval()
             model.to(device)
@@ -256,18 +270,18 @@ def main(test_config: DictConfig):
             batch = next(iter(loader))
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
-            with torch.no_grad():
-                gen = model.net.search(batch, n_results=10)
-            debug_code_lookup(model, gen, diversity_context["code_to_item"])
+
+            debug_code_lookup(model, batch, diversity_context["code_to_item"], device)
+
         print("[DEBUG] Exiting after debug pass. Re-run without debug=true for full metrics.")
         return
 
-    # 4. Run metrics
+    # 5. Run metrics
     valid_metrics = run_metrics(cfg, ckpt_path, "valid", datasets)
     test_metrics = run_metrics(cfg, ckpt_path, "test", datasets,
                                diversity_context=diversity_context)
 
-    # 5. Save pickle
+    # 6. Save pickle
     to_pickle(
         fs,
         os.path.join(os.path.dirname(ckpt_path), FILENAMES["metrics"]),
@@ -278,7 +292,7 @@ def main(test_config: DictConfig):
         },
     )
 
-    # 6. Append to shared summary CSV
+    # 7. Append to shared summary CSV
     summary_path = os.path.join(
         test_config.paths.model_folder_tplt, "results_summary.csv"
     )
