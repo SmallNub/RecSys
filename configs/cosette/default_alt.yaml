@@ -4,6 +4,6 @@ model:
   version: "alt"
 
 loss:
-  reconstruction_l1_weight: 0.1
+  reconstruction_l1_weight: 0.05
   latent_consistency_weight: 0.1
-  latent_consistency_l1_weight: 0.01
+  latent_consistency_l1_weight: 0.005
