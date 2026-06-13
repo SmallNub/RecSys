@@ -21,7 +21,7 @@ export WANDB_MODE=offline
 RUN_DIRECTORY="MARIUS_small_260611_144729"
 
 # Set to true for debug mode (one forward pass, no full metrics)
-DEBUG=false
+DEBUG=true
 
 python src/run_test.py \
     run_directory=${RUN_DIRECTORY} \
