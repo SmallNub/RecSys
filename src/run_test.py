@@ -1,9 +1,3 @@
-"""
-Standalone test script — loads specific checkpoints and runs metrics.
-Usage:
-    python src/run_test.py run_directory=MARIUS_small_2026-06-08_13-43-08
-    python src/run_test.py run_directory=MARIUS_small_2026-06-08_13-43-08 debug=true
-"""
 import json
 import os
 import pickle

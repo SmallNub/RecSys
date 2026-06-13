@@ -2,7 +2,7 @@
 #SBATCH --job-name=run_test
 #SBATCH --output=scripts/slurm/run_test_%j.log
 #SBATCH --error=scripts/slurm/run_test_%j.err
-#SBATCH --time=2:00:00
+#SBATCH --time=5:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -18,21 +18,31 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export WANDB_MODE=offline
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"
-DEBUG=false
 
-for RUN_DIR in ${MARIUS_BASE_DIR}/*/; do
-    RUN_DIRECTORY=$(basename ${RUN_DIR%/})
+# Set to a specific run directory to test just one, or leave empty to loop all
+RUN_DIRECTORY=""
+
+run_test() {
+    local RUN_DIR=$1
     echo "========================================"
-    echo ">>> Testing: ${RUN_DIRECTORY}"
+    echo ">>> Testing: ${RUN_DIR}"
     echo "========================================"
 
-    python src/run_test.py \
-        run_directory=${RUN_DIRECTORY} \
-        debug=${DEBUG}
+    python src/test.py run_directory=${RUN_DIR}
 
     if [ $? -ne 0 ]; then
-        echo "[WARNING] Failed for ${RUN_DIRECTORY}, continuing..."
+        echo "[WARNING] Failed for ${RUN_DIR}, continuing..."
     fi
-done
+}
+
+if [ -n "${RUN_DIRECTORY}" ]; then
+    # Single checkpoint mode
+    run_test ${RUN_DIRECTORY}
+else
+    # Loop through all checkpoints
+    for RUN_DIR in ${MARIUS_BASE_DIR}/*/; do
+        run_test $(basename ${RUN_DIR%/})
+    done
+fi
 
 echo "All runs complete."

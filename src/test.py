@@ -74,6 +74,7 @@ def get_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
         model.code_to_item = diversity_context["code_to_item"]
         model.item_embeddings = diversity_context["item_embeddings"]
         model.popularity_counts = diversity_context["popularity_counts"]
+        model.n_centroids = diversity_context["n_centroids"]
 
     trainer = L.Trainer(accelerator="gpu", precision="bf16-mixed")
 
@@ -89,7 +90,7 @@ def get_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
 
 
 def build_code_to_item(fs, cfg):
-    """Build reverse mapping: tuple(code) -> item_id from the quantized parquet."""
+    """Build reverse mapping: tuple(centroid_code) -> item_id from the quantized parquet."""
     quant_path = cfg.paths.semantic_ids_tplt.format(
         emb_method=cfg.data.datasets.emb_id,
         category=cfg.data.datasets.category,
@@ -102,6 +103,18 @@ def build_code_to_item(fs, cfg):
         code = tuple(int(row[c]) for c in code_cols)
         code_to_item[code] = item_id
     return code_to_item
+
+
+def get_n_centroids(cfg):
+    """Extract n_centroids per level from the saved config."""
+    try:
+        n = cfg.data.datasets.get("n_centroids", None)
+        if n is not None:
+            return n
+    except Exception:
+        pass
+    print("[INFO] n_centroids not found in config, defaulting to 256.")
+    return 256
 
 
 def load_item_embeddings(fs, cfg):
@@ -147,13 +160,22 @@ def main(test_config):
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
-    # 3. Build diversity context once (used during test forward pass)
-    print("[INFO] Building diversity context...")
-    diversity_context = {
-        "code_to_item": build_code_to_item(fs, cfg),
-        "item_embeddings": load_item_embeddings(fs, cfg),
-        "popularity_counts": get_popularity_counts(fs, cfg),
-    }
+    # 3. Build diversity context (only if quantization is used i.e. MARIUS, not SASRec++)
+    uses_quantization = (
+        cfg.data.datasets.get("quant_id") is not None
+        and cfg.data.datasets.get("emb_id") is not None
+    )
+    if uses_quantization:
+        print("[INFO] Building diversity context...")
+        diversity_context = {
+            "code_to_item": build_code_to_item(fs, cfg),
+            "item_embeddings": load_item_embeddings(fs, cfg),
+            "popularity_counts": get_popularity_counts(fs, cfg),
+            "n_centroids": get_n_centroids(cfg),
+        }
+    else:
+        print("[INFO] Skipping diversity context — no quantization (SASRec++ mode).")
+        diversity_context = None
 
     # 4. Standard accuracy metrics (valid has no diversity)
     valid_metrics = get_metrics(cfg, best_checkpoint, "valid", datasets)
