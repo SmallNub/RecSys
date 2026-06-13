@@ -165,7 +165,7 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     metrics = fn(
         model,
         datamodule=datamodule,
-        ckpt_path=cfg.paths.protocol + "://" + ckpt_path,
+        ckpt_path=ckpt_path,
     )
     metrics[0]["n_params"] = n_params
 
