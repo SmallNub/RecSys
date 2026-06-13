@@ -395,6 +395,11 @@ class COSETTE(torch.nn.Module):
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
+            if self.loss_weights.get("reconstruction_l1_loss", 0) > 0:
+                recon_l1_loss = F.l1_loss(x_hat, embeddings, reduction="mean")
+                loss += recon_l1_loss * self.loss_weights.get("reconstruction_l1_loss", 0)
+                metrics["reconstruction_l1_loss"] = recon_l1_loss.item()
+
             # 3. Latent Consistency Loss (New Addition)
             if self.loss_weights.get("latent_consistency", 0) > 0:
                 # Re-encode the reconstructed embedding
@@ -406,6 +411,11 @@ class COSETTE(torch.nn.Module):
 
                 loss += latent_cons_loss * self.loss_weights["latent_consistency"]
                 metrics["latent_consistency_loss"] = latent_cons_loss.item()
+
+                if self.loss_weights.get("latent_consistency_l1_loss", 0) > 0:
+                    latent_cons_l1_loss = F.l1_loss(x_tilde, x_q.detach(), reduction="mean")
+                    loss += latent_cons_l1_loss * self.loss_weights.get("latent_consistency_l1_loss", 0)
+                    metrics["latent_consistency_l1_loss"] = latent_cons_l1_loss.item()
 
         # 3. Contrastive training.
         # Encode the items in the timelines

@@ -444,6 +444,8 @@ def make_cosette_embs(config):
             "reconstruction": config.loss.reconstruction_weight,
             "contrastive": config.loss.contrastive_weight,
             "latent_consistency": config.loss.get("latent_consistency_weight", 0.0),
+            "latent_consistency_l1_loss": config.loss.get("latent_consistency_l1_weight", 0.0),
+            "reconstruction_l1_loss": config.loss.get("reconstruction_l1_weight", 0.0),
         },
         tau=config.loss.tau,
         bias=config.loss.bias,
