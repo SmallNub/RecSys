@@ -70,7 +70,7 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Baseline Discrete Embeddings
+        # Baseline Discrete Token Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -87,7 +87,7 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Adapters
+        # Continuous feature adapters
         self.temp_proj = EmbeddingAdapter(
             in_dim=self.cosette.model.in_dim, 
             out_dim=self.temporal_cfg.d_model,
@@ -99,19 +99,7 @@ class MARIUS(torch.nn.Module):
             dropout=self.depth_cfg.dropout
         )
 
-        # =========================================================================
-        # UPGRADE: Contextual Vector Gating Networks (Zero-Initialized)
-        # Uses the discrete sequence token context to dynamically gate dimensions.
-        # =========================================================================
-        self.temp_gate_net = torch.nn.Linear(self.temporal_cfg.d_model, self.temporal_cfg.d_model)
-        self.depth_gate_net = torch.nn.Linear(self.depth_cfg.d_model, self.depth_cfg.d_model)
-        
-        torch.nn.init.zeros_(self.temp_gate_net.weight)
-        torch.nn.init.zeros_(self.temp_gate_net.bias)
-        torch.nn.init.zeros_(self.depth_gate_net.weight)
-        torch.nn.init.zeros_(self.depth_gate_net.bias)
-
-        # Positional Encoding
+        # Positional Encodings
         self.temp_pos_emb = torch.nn.Parameter(
             torch.randn((1, self.temporal_cfg.seq_len, self.temporal_cfg.d_model))
         )
@@ -119,13 +107,14 @@ class MARIUS(torch.nn.Module):
             torch.randn((1, self.depth_cfg.seq_len, self.depth_cfg.d_model))
         )
 
-        # Embedding dropout
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Transformers (GELU backbones)
-        self.temp_tf = torch.nn.TransformerEncoder(
-            encoder_layer=torch.nn.TransformerEncoderLayer(
+        # =========================================================================
+        # RESEARCH UPGRADE: Convert Transformers to Decoders for Cross-Attention
+        # =========================================================================
+        self.temp_tf = torch.nn.TransformerDecoder(
+            decoder_layer=torch.nn.TransformerDecoderLayer(
                 d_model=self.temporal_cfg.d_model,
                 nhead=self.temporal_cfg.d_model // self.temporal_cfg.d_head,
                 dim_feedforward=self.temporal_cfg.d_model * 4,
@@ -134,13 +123,12 @@ class MARIUS(torch.nn.Module):
                 batch_first=True,
                 norm_first=True,
             ),
-            enable_nested_tensor=False,
             num_layers=self.temporal_cfg.n_layers,
             norm=torch.nn.LayerNorm(self.temporal_cfg.d_model),
         )
 
-        self.depth_tf = torch.nn.TransformerEncoder(
-            encoder_layer=torch.nn.TransformerEncoderLayer(
+        self.depth_tf = torch.nn.TransformerDecoder(
+            decoder_layer=torch.nn.TransformerDecoderLayer(
                 d_model=self.depth_cfg.d_model,
                 nhead=self.depth_cfg.d_model // self.depth_cfg.d_head,
                 dim_feedforward=self.depth_cfg.d_model * 4,
@@ -149,7 +137,6 @@ class MARIUS(torch.nn.Module):
                 batch_first=True,
                 norm_first=True,
             ),
-            enable_nested_tensor=False,
             num_layers=self.depth_cfg.n_layers,
             norm=torch.nn.LayerNorm(self.depth_cfg.d_model),
         )
@@ -190,26 +177,32 @@ class MARIUS(torch.nn.Module):
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
-        # Dynamic Contextual Vector Gating
-        gate = torch.tanh(self.temp_gate_net(discrete_embs))
-        input_embs = discrete_embs + gate * continuous_embs
-        
-        input_embs += self.temp_pos_emb[:, : input.shape[1], :]
-        input_embs = self.temp_dropout(input_embs)
+        # Prepare pristine discrete queries
+        tgt = discrete_embs + self.temp_pos_emb[:, :L, :]
+        tgt = self.temp_dropout(tgt)
 
+        # Cross-Attention cleanly maps continuous memory to pristine discrete spaces
         out = self.temp_tf(
-            input_embs,
-            mask=self.causal_mask[:L, :L],
-            src_key_padding_mask=input[:, :, 0] == SpecialTokens.PAD.value,
+            tgt=tgt,
+            memory=continuous_embs,
+            tgt_mask=self.causal_mask[:L, :L],
+            memory_mask=self.causal_mask[:L, :L],
+            tgt_key_padding_mask=input[:, :, 0] == SpecialTokens.PAD.value,
+            memory_key_padding_mask=input[:, :, 0] == SpecialTokens.PAD.value,
         )
         return out
 
-    def depth_forward(self, in_embs):
-        K = in_embs.shape[1]
-        in_embs = in_embs + self.depth_pos_emb[:, :K, :]
-        in_embs = self.depth_dropout(in_embs)
+    def depth_forward(self, tgt, memory):
+        K = tgt.shape[1]
+        tgt = tgt + self.depth_pos_emb[:, :K, :]
+        tgt = self.depth_dropout(tgt)
 
-        depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K])
+        depth_preds = self.depth_tf(
+            tgt=tgt,
+            memory=memory,
+            tgt_mask=self.causal_mask[:K, :K],
+            memory_mask=self.causal_mask[:K, :K]
+        )
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
         return logits
 
@@ -225,8 +218,11 @@ class MARIUS(torch.nn.Module):
         target = target[keep]
 
         dec_embs_orig = self.depth_emb(target[:, :-1])
-
         K_minus_1 = dec_embs_orig.shape[1]
+        
+        # Target sequence remains purely discrete inputs
+        tgt = torch.cat([mid_tokens, dec_embs_orig], dim=1)
+
         if K_minus_1 > 0:
             raw_res_list = []
             for i in range(K_minus_1):
@@ -244,18 +240,14 @@ class MARIUS(torch.nn.Module):
             raw_tensor = torch.stack(raw_res_list, dim=1)
             continuous_tensor = self.depth_proj(raw_tensor)
             
-            if self.training:
-                depth_mask = (torch.rand(dec_embs_orig.shape[0], dec_embs_orig.shape[1], 1, device=target.device) > 0.2).to(dec_embs_orig.dtype)
-                dec_embs_orig = dec_embs_orig * depth_mask
-
-            # Dynamic Contextual Vector Gating
-            gate = torch.tanh(self.depth_gate_net(dec_embs_orig))
-            dec_embs = dec_embs_orig + gate * continuous_tensor
+            # Causal alignment trick: prepend dummy token to shift cross-attention indices safely
+            dummy_zero = torch.zeros((continuous_tensor.shape[0], 1, continuous_tensor.shape[2]), 
+                                     device=continuous_tensor.device, dtype=continuous_tensor.dtype)
+            memory = torch.cat([dummy_zero, continuous_tensor], dim=1)
         else:
-            dec_embs = dec_embs_orig
+            memory = torch.zeros((tgt.shape[0], 1, tgt.shape[2]), device=tgt.device, dtype=tgt.dtype)
 
-        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
-        depth_logits = self.depth_forward(dec_embs)  
+        depth_logits = self.depth_forward(tgt, memory)  
         return depth_logits, target
 
     def get_loss(self, batch):
@@ -280,8 +272,10 @@ class MARIUS(torch.nn.Module):
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
-        sequences = mid_tokens[:, None, :]  
-        depth_logits = self.depth_forward(sequences)  
+        sequences = mid_tokens[:, None, :]  # (B, 1, D)
+        memory = torch.zeros((B, 1, D), device=sequences.device, dtype=sequences.dtype) # (B, 1, D)
+        
+        depth_logits = self.depth_forward(sequences, memory)  
         log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  
 
         topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  
@@ -289,6 +283,7 @@ class MARIUS(torch.nn.Module):
         indices = topk_indices.unsqueeze(2)  
         scores = topk_log_probs  
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  
+        memory = memory.unsqueeze(1).repeat(1, b, 1, 1)        
 
         discrete_new = self.depth_emb(topk_indices)
 
@@ -300,18 +295,19 @@ class MARIUS(torch.nn.Module):
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
-        continuous_new = continuous_new * v_mask
+        continuous_new = continuous_new * v_mask 
 
-        # Search Fusion: Layer 0 Token
-        gate_new = torch.tanh(self.depth_gate_net(discrete_new))
-        fused_new = discrete_new + gate_new * continuous_new
-        new_tokens = fused_new.unsqueeze(2)  
-        sequences = torch.concat([sequences, new_tokens], dim=2)
+        # Track matching beam memory sequences
+        sequences = torch.concat([sequences, discrete_new.unsqueeze(2)], dim=2) 
+        memory = torch.concat([memory, continuous_new.unsqueeze(2)], dim=2)       
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
+            last_logits = self.depth_forward(
+                tgt=sequences.view(B * b, i, D),
+                memory=memory.view(B * b, i, D)
+            )[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)  
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
@@ -325,6 +321,7 @@ class MARIUS(torch.nn.Module):
             )
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
+            expanded_memory = memory.unsqueeze(2).repeat(1, 1, b, 1, 1)
             
             flat_topk = topk_indices.view(-1)
             flat_discrete = self.depth_emb(flat_topk)
@@ -340,23 +337,27 @@ class MARIUS(torch.nn.Module):
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
             flat_projected = flat_projected * flat_valid
 
-            # Search Fusion: Dynamic generation steps
-            flat_gate = torch.tanh(self.depth_gate_net(flat_discrete))
-            flat_fused = flat_discrete + flat_gate * flat_projected
-            next_tokens = flat_fused.view(B, b, b, 1, D)
+            next_tokens = flat_discrete.view(B, b, b, 1, D)
+            next_mem = flat_projected.view(B, b, b, 1, D)
             
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
+            expanded_memory = torch.cat([expanded_memory, next_mem], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
             expanded_scores = expanded_scores.view(B, -1)
+            
             expanded_sequences = expanded_sequences.view(
                 B, -1, expanded_sequences.size(-2), D
+            )
+            expanded_memory = expanded_memory.view(
+                B, -1, expanded_memory.size(-2), D
             )
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
             sequences = expanded_sequences[arranged, topk_indices]
+            memory = expanded_memory[arranged, topk_indices]
             indices = expanded_indices[arranged, topk_indices]
             scores = topk_scores  
 
