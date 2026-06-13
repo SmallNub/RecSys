@@ -24,7 +24,7 @@ class LitModule(LightningModule):
         self.dcg_denom = torch.log2(torch.arange(1, max(self.Ks) + 1) + 1).view(1, -1)
 
         # Diversity/popularity context — injected from test.py before trainer.test
-        self.code_to_item = None       # dict: tuple(code) -> item_id
+        self.code_to_item = None       # dict: tuple(centroid_code) -> item_id
         self.item_embeddings = None    # dict: item_id -> np.array
         self.popularity_counts = None  # dict: item_id -> int
         self.n_centroids = None        # int: number of centroids per level
@@ -125,43 +125,33 @@ class LitModule(LightningModule):
                 add_dataloader_idx=False,
             )
 
-        # Accumulate recommendations for diversity metrics (test only)
-        # Pass batch so we can re-run search with filter_preds=False
+        # Accumulate gen directly for diversity metrics (test only).
+        # gen already has filter_preds applied and contains valid token IDs
+        # in range [2, 1025] which decode correctly to centroid indices.
         if split == "test" and self.code_to_item is not None:
-            self._accumulate_diversity(batch)
+            self._accumulate_diversity(gen)
 
     def _decode_token_to_centroid(self, code):
         """
         Decode model token IDs back to raw centroid indices.
-        Token IDs are encoded as: token_id = centroid_idx + offset + level * n_centroids
-        where offset = len(SpecialTokens) = 2.
+        Encoding: token_id = centroid_idx + special_token_offset + level * n_centroids
+        Decoding: centroid_idx = token_id - special_token_offset - level * n_centroids
         """
         from src.models import SpecialTokens
-        offset = len(SpecialTokens)
-        n_centroids = self.n_centroids
+        offset = len(SpecialTokens)  # 2
         return tuple(
-            c - offset - (level * n_centroids)
+            c - offset - (level * self.n_centroids)
             for level, c in enumerate(code)
         )
 
-    def _accumulate_diversity(self, batch):
+    def _accumulate_diversity(self, gen):
         """
-        Re-run search with filter_preds=False to get clean codebook codes
-        that reliably map back to real items via code_to_item.
-        Using the filtered gen causes misses because beam search explores
-        invalid codebook combinations when filtering out seen items.
+        Accumulate per-batch recommendations for end-of-epoch diversity computation.
+        gen: B x K x L — token IDs from search() with filter_preds applied.
         """
-        original_filter = self.net.filter_preds
-        self.net.filter_preds = False
-
-        with torch.no_grad():
-            gen_clean = self.net.search(batch, n_results=10)
-
-        self.net.filter_preds = original_filter
-
-        B = gen_clean.shape[0]
+        B = gen.shape[0]
         for b in range(B):
-            rec_codes = gen_clean[b].cpu().tolist()  # K x L
+            rec_codes = gen[b].cpu().tolist()  # K x L
             rec_items = []
             for code in rec_codes:
                 centroid_code = self._decode_token_to_centroid(code)

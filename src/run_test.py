@@ -111,18 +111,12 @@ def build_code_to_item(fs, cfg):
 
 def get_n_centroids(cfg):
     """Extract n_centroids per level from the saved config."""
-    # Saved in the COSETTE config under centroids.n_centroids_list
-    # The quant parquet name encodes it e.g. COSETTE_SIGLIP_Beauty_256x4_...
-    # Fall back to 256 if not directly available
     try:
         n = cfg.data.datasets.get("n_centroids", None)
         if n is not None:
             return n
     except Exception:
         pass
-    # Parse from quant_id name: e.g. COSETTE_SIGLIP_Beauty_20260608_134308_run1-col
-    # The COSETTE yaml sets n_centroids_list: [256, 256, 256, 256]
-    # Since it's not saved directly in the MARIUS config, default to 256
     print("[INFO] n_centroids not found in config, defaulting to 256.")
     return 256
 
@@ -193,19 +187,14 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
 
 def debug_code_lookup(model, batch, code_to_item, n_centroids, device):
     """
-    Print debug info about code lookup using filter_preds=False
-    to get clean codebook codes.
+    Print debug info about code lookup using the actual gen output
+    from search() with filter_preds enabled (same as during test_step).
     """
     from src.models import SpecialTokens
-    offset = len(SpecialTokens)
-
-    original_filter = model.net.filter_preds
-    model.net.filter_preds = False
+    offset = len(SpecialTokens)  # 2
 
     with torch.no_grad():
         gen = model.net.search(batch, n_results=10)
-
-    model.net.filter_preds = original_filter
 
     sample_code_raw = tuple(gen[0][0].cpu().tolist())
     sample_code = tuple(
