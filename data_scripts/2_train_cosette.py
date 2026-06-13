@@ -390,6 +390,10 @@ def make_cosette_embs(config):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     config.ckpt_dir = os.path.join(config.ckpt_dir, timestamp)
 
+    # Maximize H100 execution performance by unlocking TF32 Tensor Cores
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # --- HYBRID TOGGLE: Dynamic Model Import ---
     model_type = config.model.get("type", "euclidean")
     if model_type == "hyperbolic":

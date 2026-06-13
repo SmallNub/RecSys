@@ -37,12 +37,11 @@ class MLPLayers(nn.Module):
 def kmeans(samples, num_clusters, num_iters=10):
     """
     Pure PyTorch GPU-accelerated implementation of KMeans.
-    Maintains full compatibility with autocast/mixed precision tracking.
+    Runs entirely in float32/TF32 space for maximum H100 performance.
     """
     device = samples.device
     orig_dtype = samples.dtype
 
-    # Convert to float32 internally for numerical stability during distance calculations
     x = samples.float()
     num_samples = x.size(0)
 
@@ -51,55 +50,53 @@ def kmeans(samples, num_clusters, num_iters=10):
             f"Number of samples ({num_samples}) must be greater than or equal to num_clusters ({num_clusters})"
         )
 
-    # 1. Randomly initialize centroids from existing samples
     permutation = torch.randperm(num_samples, device=device)
     centroids = x[permutation[:num_clusters]].clone()
 
     for _ in range(num_iters):
-        # 2. Compute pairwise L2 distances: ||x - c||^2 = ||x||^2 + ||c||^2 - 2 * <x, c>
+        # Optimized pairwise L2 distance using H100 Tensor Cores via torch.matmul
         dists = (
             torch.sum(x**2, dim=1, keepdim=True)
             + torch.sum(centroids**2, dim=1, keepdim=True).t()
             - 2 * torch.matmul(x, centroids.t())
         )
 
-        # 3. Assign each sample to its closest centroid
         labels = torch.argmin(dists, dim=-1)
 
-        # 4. Update centroids using vectorized index accumulation
         counts = torch.bincount(labels, minlength=num_clusters).view(-1, 1).float()
         
         sum_centroids = torch.zeros_like(centroids)
         sum_centroids.index_add_(0, labels, x)
 
-        # Handle empty clusters: if count is 0, preserve the old centroid location
         centroids = torch.where(counts > 0, sum_centroids / counts.clamp(min=1), centroids)
 
     return centroids.to(dtype=orig_dtype)
 
 
-@torch.compile(dynamic=True)
-@torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     """
-    Optimized Sinkhorn implementation. 
-    @torch.compile fuses the python loop into a single CUDA execution block,
-    completely eliminating the CPU-to-GPU kernel launch bottleneck.
+    Log-space stable Sinkhorn execution.
+    By performing normalization using logsumexp, we completely avoid numerical underflow.
+    This eliminates the double precision (.double()) requirement, keeping execution 
+    in fast Tensor Core paths.
     """
-    Q = torch.exp(-distances / epsilon)
+    device = distances.device
+    dtype = distances.dtype
+    B, K = distances.shape
 
-    B = Q.shape[0]  # number of samples to assign
-    K = Q.shape[1]  # how many centroids per block
+    # Process entirely within log space
+    log_Q = -distances / epsilon
+    
+    log_B = torch.log(torch.tensor(B, device=device, dtype=dtype))
+    log_K = torch.log(torch.tensor(K, device=device, dtype=dtype))
 
-    # Make the matrix sum to 1 once at the beginning
-    Q = Q / Q.sum()
+    for _ in range(sinkhorn_iterations):
+        # Row normalization
+        log_Q = log_Q - torch.logsumexp(log_Q, dim=1, keepdim=True) - log_B
+        # Column normalization
+        log_Q = log_Q - torch.logsumexp(log_Q, dim=0, keepdim=True) - log_K
 
-    for it in range(sinkhorn_iterations):
-        # Combined operations: Reduces memory read/writes and cuts allocations in half
-        Q = Q / (torch.sum(Q, dim=1, keepdim=True) * B)
-        Q = Q / (torch.sum(Q, dim=0, keepdim=True) * K)
-
-    return Q * B
+    return torch.exp(log_Q) * B
 
 
 class VectorQuantizer(nn.Module):
@@ -168,7 +165,7 @@ class VectorQuantizer(nn.Module):
         if not self.initted and self.training:
             self.init_emb(latent)
 
-        # Calculate L2 Norm between latent space and embedded weights
+        # Vectorized L2 Norm leveraging H100 fast matmul subroutines
         d = (
             torch.sum(latent**2, dim=1, keepdim=True)
             + torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
@@ -179,7 +176,7 @@ class VectorQuantizer(nn.Module):
             indices = torch.argmin(d, dim=-1)
         else:
             d = self.center_distance_for_constraint(d)
-            d = d.double()
+            # Native FP32/BF16 execution path instead of the double precision trap
             Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
             if torch.isnan(Q).any() or torch.isinf(Q).any():
                 print("Sinkhorn Algorithm returns nan/inf values.")
@@ -187,12 +184,10 @@ class VectorQuantizer(nn.Module):
 
         x_q = self.embedding(indices).view(x.shape)
 
-        # Compute losses for embedding
         commitment_loss = F.mse_loss(x_q.detach(), x)
         codebook_loss = F.mse_loss(x_q, x.detach())
         loss = codebook_loss + self.beta * commitment_loss
 
-        # Straight-through estimator trick to preserve gradients
         x_q = x + (x_q - x).detach()
         indices = indices.view(x.shape[:-1])
 
@@ -279,16 +274,16 @@ class SigLIPLoss(torch.nn.Module):
 
     def _siglip_loss(self, logits, items, timelines):
         with torch.no_grad():
+            # Memory layout optimization to prevent excessive device tensor allocations
             mask = torch.full(
                 (len(items), len(items)),
-                -1,
-                dtype=torch.float32,
+                -1.0,
+                dtype=logits.dtype,
                 device=self.tau.device,
             )
-            pos = (items[:, None, None] == timelines[None, :, :]).any(axis=2)
-            pos = pos.to(
-                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            )
+            # Streamlined timeline broadcast matching
+            pos = (items[:, None, None] == timelines[None, :, :]).any(dim=2)
+            pos = pos.to(dtype=logits.dtype)
             pos = torch.matmul(pos, pos.T) > 0
             mask[pos] = 1.0
 
@@ -375,7 +370,6 @@ class COSETTE(torch.nn.Module):
         loss = 0.0
         metrics = defaultdict(float)
 
-        # Classic reconstruction LOSS
         if self.loss_weights.get("reconstruction", 0) > 0:
             idxs = torch.randint(
                 0,
@@ -385,12 +379,10 @@ class COSETTE(torch.nn.Module):
             )
             embeddings = F.embedding(idxs, self.embeddings)
 
-            # 1. Forward Pass
             x = self.encoder(embeddings)
             x_q, rq_loss, _, _ = self.rq(x, use_sk=True)
             x_hat = self.decoder(x_q)
 
-            # 2. Base Reconstruction Loss
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
             loss += recon_loss * self.loss_weights["reconstruction"]
             loss += rq_loss * self.loss_weights["quantization"]
@@ -403,7 +395,6 @@ class COSETTE(torch.nn.Module):
                 loss += recon_l1_loss * self.loss_weights.get("reconstruction_l1_loss", 0)
                 metrics["reconstruction_l1_loss"] = recon_l1_loss.item()
 
-            # 3. Latent Consistency Loss
             if self.loss_weights.get("latent_consistency", 0) > 0:
                 x_tilde = self.encoder(x_hat)
                 latent_cons_loss = F.mse_loss(x_tilde, x_q.detach(), reduction="mean")
@@ -416,7 +407,6 @@ class COSETTE(torch.nn.Module):
                     loss += latent_cons_l1_loss * self.loss_weights.get("latent_consistency_l1_loss", 0)
                     metrics["latent_consistency_l1_loss"] = latent_cons_l1_loss.item()
 
-        # 4. Contrastive training
         if self.loss_weights.get("contrastive", 0) > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
