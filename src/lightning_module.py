@@ -27,6 +27,7 @@ class LitModule(LightningModule):
         self.code_to_item = None       # dict: tuple(code) -> item_id
         self.item_embeddings = None    # dict: item_id -> np.array
         self.popularity_counts = None  # dict: item_id -> int
+        self.n_centroids = None        # int: number of centroids per level
 
         # Accumulators reset each test epoch
         self._test_rec_items = []
@@ -129,10 +130,27 @@ class LitModule(LightningModule):
         if split == "test" and self.code_to_item is not None:
             self._accumulate_diversity(batch)
 
-    def _accumulate_diversity(self, batch):
+    def _decode_token_to_centroid(self, code):
+        """
+        Decode model token IDs back to raw centroid indices.
+        Token IDs are encoded as: token_id = centroid_idx + offset + level * n_centroids
+        where offset = len(SpecialTokens) = 2.
+        """
         from src.models import SpecialTokens
-        offset = len(SpecialTokens)  # 2
+        offset = len(SpecialTokens)
+        n_centroids = self.n_centroids
+        return tuple(
+            c - offset - (level * n_centroids)
+            for level, c in enumerate(code)
+        )
 
+    def _accumulate_diversity(self, batch):
+        """
+        Re-run search with filter_preds=False to get clean codebook codes
+        that reliably map back to real items via code_to_item.
+        Using the filtered gen causes misses because beam search explores
+        invalid codebook combinations when filtering out seen items.
+        """
         original_filter = self.net.filter_preds
         self.net.filter_preds = False
 
@@ -146,14 +164,14 @@ class LitModule(LightningModule):
             rec_codes = gen_clean[b].cpu().tolist()  # K x L
             rec_items = []
             for code in rec_codes:
-                # Subtract special token offset to get raw centroid indices
-                centroid_code = tuple(c - offset for c in code)
+                centroid_code = self._decode_token_to_centroid(code)
                 item_id = self.code_to_item.get(centroid_code)
                 if item_id is not None:
                     rec_items.append(item_id)
 
             self._test_rec_items.extend(rec_items)
 
+            # ILD: mean pairwise cosine distance for this user
             if self.item_embeddings is not None:
                 embs = np.array([
                     self.item_embeddings[item]
