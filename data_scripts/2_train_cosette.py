@@ -3,7 +3,6 @@ import os
 import random
 from collections import defaultdict
 from math import ceil
-from uuid import uuid4
 from datetime import datetime
 
 import fsspec
@@ -127,7 +126,7 @@ class Trainer(object):
             c = 1.0
 
         total_loss = 0
-        
+
         model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"
         desc_str = f"[{model_name}] Train {epoch_idx}"
         if self.is_hyper:
@@ -461,7 +460,6 @@ def make_cosette_embs(config):
         sk_epsilons=config.centroids.sk_epsilons,
         sk_iters=config.centroids.sk_iters,
     )
-    model = torch.compile(model)
 
     print("Model : ", model)
     quant_method = make_name(config, timestamp)
