@@ -220,6 +220,36 @@ class Trainer(object):
         torch.save(state, ckpt_path, pickle_protocol=4)
         self.logger.info(f"Saving current: {ckpt_path}")
 
+    def fit(self, train_data):
+        model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"
+        print(f"\n{'='*60}")
+        print(f">>>> STARTING {model_name} TRAINING LOOP <<<<")
+        print(f"{'='*60}\n")
+
+        for epoch_idx in range(self.epochs):
+            train_loss, metrics = self._train_epoch(train_data, epoch_idx)
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            wandb.log(
+                {
+                    "epoch": epoch_idx,
+                    "train_loss": train_loss,
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    **metrics,
+                }
+            )
+
+            if (epoch_idx + 1) % self.eval_step == 0:
+                print("=" * 100)
+                print(">>>> EVALUATING <<<<")
+                metrics = self._valid_epoch()
+                wandb.log({"epoch": epoch_idx, **metrics})
+
+        self._save_checkpoint(epoch_idx, ckpt_file=self.last_ckpt)
+        return os.path.join(self.local_dir, self.last_ckpt)
+
 
 class _Dataset(torch.utils.data.IterableDataset):
     def __init__(self, timelines, items_to_row, bs, items_cut):
