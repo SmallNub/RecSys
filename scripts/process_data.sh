@@ -18,12 +18,13 @@ source activate recsys
 
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
+# CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
+CATEGORIES=("Beauty")
 
-python scripts/download_data.py --year 2014 --categories "${CATEGORIES[@]}"
+python scripts/download_data.py --year 2023 --categories "${CATEGORIES[@]}"
 
 python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 \
-    categories="[Beauty,Sports_and_Outdoors,Toys_and_Games,Movies_and_TV,Video_Games]" \
+    categories="[Beauty]" \
     paths.skip_download=true
 
 for CATEGORY in "${CATEGORIES[@]}"; do
