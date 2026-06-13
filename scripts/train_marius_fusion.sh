@@ -2,17 +2,17 @@
 #SBATCH --job-name=train_marius
 #SBATCH --output=scripts/slurm/train_marius%j.log
 #SBATCH --error=scripts/slurm/train_marius%j.err
-#SBATCH --time=0:45:00
+#SBATCH --time=1:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 
-# module purge
-# module load 2025
-# module load Anaconda3/2025.06-1
+module purge
+module load 2025
+module load Anaconda3/2025.06-1
 
-# source activate recsys
+source activate recsys
 
 # export $(cat .env | xargs)
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -35,9 +35,9 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
-# python src/train.py experiment=${EXPERIMENT} \
-#     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col \
-#     model.net.cosette.model_path=outputs/checkpoints/cosette/${COSETTE_TIMESTAMP}/last_model.pth
+python src/train.py experiment=${EXPERIMENT} \
+    data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col \
+    model.net.cosette.model_path=outputs/checkpoints/cosette/${COSETTE_TIMESTAMP}/last_model.pth
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"
 LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
@@ -51,3 +51,7 @@ RUN=$(basename "${LATEST_MARIUS_RUN}")
 echo "Running evaluation on latest experiment directory: ${RUN}"
 
 python src/test.py run_directory="${RUN}"
+
+# cat scripts/slurm/train_marius23686210.log base
+# cat scripts/slurm/train_marius23725128.log -cos
+# cat scripts/slurm/train_marius23726400.log -emb

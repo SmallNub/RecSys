@@ -86,11 +86,11 @@ def main(config):
     if model_type == "hyperbolic":
         print("\n>>> LOADING HYPERBOLIC COSETTE FOR COLLISION RESOLUTION <<<")
         from src.models.cosette_hyper import COSETTE
-        prefix = "COSETTE_HYPER_SIGLIP"
+        prefix = "COSETTE_HYPER"
     else:
         print("\n>>> LOADING EUCLIDEAN COSETTE FOR COLLISION RESOLUTION <<<")
         from src.models.cosette import COSETTE
-        prefix = "COSETTE_SIGLIP"
+        prefix = "COSETTE"
 
     # --- HYBRID TOGGLE: Dynamic Naming ---
     latest_dir_name = get_latest_timestamp_dir(config.paths.ckpt_dir).name

@@ -1,0 +1,9 @@
+# @package _global_
+
+model:
+  version: "alt"
+
+loss:
+  reconstruction_l1_weight: 0.1
+  latent_consistency_weight: 0.1
+  latent_consistency_l1_weight: 0.01

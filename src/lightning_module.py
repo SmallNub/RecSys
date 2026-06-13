@@ -125,15 +125,28 @@ class LitModule(LightningModule):
             )
 
         # Accumulate recommendations for diversity metrics (test only)
+        # Pass batch so we can re-run search with filter_preds=False
         if split == "test" and self.code_to_item is not None:
-            self._accumulate_diversity(gen)
+            self._accumulate_diversity(batch)
 
-    def _accumulate_diversity(self, gen):
-        """Accumulate per-batch recommendations for end-of-epoch diversity computation."""
-        # gen: B x K x L
-        B = gen.shape[0]
+    def _accumulate_diversity(self, batch):
+        """
+        Re-run search with filter_preds=False to get clean codebook codes
+        that reliably map back to real items via code_to_item.
+        Using the filtered gen causes misses because beam search explores
+        invalid codebook combinations when filtering out seen items.
+        """
+        original_filter = self.net.filter_preds
+        self.net.filter_preds = False
+
+        with torch.no_grad():
+            gen_clean = self.net.search(batch, n_results=10)
+
+        self.net.filter_preds = original_filter
+
+        B = gen_clean.shape[0]
         for b in range(B):
-            rec_codes = gen[b].cpu().tolist()  # K x L
+            rec_codes = gen_clean[b].cpu().tolist()  # K x L
             rec_items = []
             for code in rec_codes:
                 item_id = self.code_to_item.get(tuple(code))

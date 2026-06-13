@@ -6,3 +6,4 @@ defaults:
 enforce_filtering: True
 
 run_directory: ??? # Folder name, will be concatenated to paths.model_folder_tplt
+debug: false

@@ -379,7 +379,7 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
 
 def make_name(config, timestamp):
     model_type = config.model.get("type", "euclidean")
-    prefix = "COSETTE_HYPER_SIGLIP" if model_type == "hyperbolic" else "COSETTE_SIGLIP"
+    prefix = "COSETTE_HYPER" if model_type == "hyperbolic" else "COSETTE"
     name = f"{prefix}_{config.data.category}_{timestamp}"
     if config.marker is not None:
         name += f"_{config.marker}"
@@ -397,7 +397,11 @@ def make_cosette_embs(config):
         from src.models.cosette_hyper import COSETTE
     else:
         print(">>> INITIALIZING EUCLIDEAN COSETTE <<<")
-        from src.models.cosette import COSETTE
+        version_type = config.model.get("version", "default")
+        if version_type == "default":
+            from src.models.cosette import COSETTE
+        elif version_type == "alt":
+            from src.models.cosette_alt import COSETTE
 
     embeddings_path = config.paths.embeddings_tplt.format(
         emb_method=config.data.emb_method, category=config.data.category
@@ -439,6 +443,9 @@ def make_cosette_embs(config):
             "quantization": 1,
             "reconstruction": config.loss.reconstruction_weight,
             "contrastive": config.loss.contrastive_weight,
+            "latent_consistency": config.loss.get("latent_consistency_weight", 0.0),
+            "latent_consistency_l1_loss": config.loss.get("latent_consistency_l1_weight", 0.0),
+            "reconstruction_l1_loss": config.loss.get("reconstruction_l1_weight", 0.0),
         },
         tau=config.loss.tau,
         bias=config.loss.bias,
