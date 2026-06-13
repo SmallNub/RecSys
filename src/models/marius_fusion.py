@@ -40,7 +40,7 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Basic Discrete Embeddings
+        # Clean Discrete Token Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -57,7 +57,7 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Simple Linear Projections for Cosette Features
+        # Baseline Linear Projections for Continuous Feature Fusion
         self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
         self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
 
@@ -71,7 +71,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Standard, Clean PyTorch Transformer Encoders
+        # Native PyTorch Encoders
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -100,15 +100,22 @@ class MARIUS(torch.nn.Module):
             norm=torch.nn.LayerNorm(self.depth_cfg.d_model),
         )
 
-        # Standard Causal Masks
+        # VECTORIZATION FIX: Pre-register the static temporal causal mask
         self.register_buffer(
             "temp_causal_mask",
             torch.triu(torch.ones((self.temporal_cfg.seq_len, self.temporal_cfg.seq_len), dtype=torch.bool), diagonal=1),
         )
-        self.register_buffer(
-            "depth_causal_mask",
-            torch.triu(torch.ones((self.depth_cfg.seq_len, self.depth_cfg.seq_len), dtype=torch.bool), diagonal=1),
-        )
+
+        # VECTORIZATION FIX: Pre-compile all possible depth cross-attention masks to GPU memory
+        # Since depth sequence length grows step-by-step during search, we store each matrix size directly.
+        for n in range(1, self.depth_cfg.seq_len + 2):
+            mask = torch.ones((2 * n, 2 * n), dtype=torch.bool)
+            causal_tril = torch.tril(torch.ones((n, n), dtype=torch.bool))
+            mask[:n, :n] = ~causal_tril
+            mask[:n, n:] = True
+            mask[n:, :n] = ~causal_tril
+            mask[n:, n:] = ~causal_tril
+            self.register_buffer(f"depth_static_mask_step_{n}", mask)
 
         self.mid_proj = torch.nn.Linear(self.temporal_cfg.d_model, self.depth_cfg.d_model)
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -131,7 +138,7 @@ class MARIUS(torch.nn.Module):
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
-        # BACK TO BASICS: Direct element-wise addition keeps sequence length at L
+        # Element-wise addition keeps sequence footprint at exactly L
         x = discrete_embs + continuous_embs + self.temp_pos_emb[:, :L, :]
         x = self.temp_dropout(x)
         
@@ -146,25 +153,15 @@ class MARIUS(torch.nn.Module):
         return temporal_out
 
     def depth_forward(self, tgt, memory):
-        K = tgt.shape[1]
-        tgt = tgt + self.depth_pos_emb[:, :K, :]
-        tgt = self.depth_dropout(tgt)
+        N = tgt.shape[1]  # Because memory and tgt are perfectly aligned symmetrical blocks
 
-        # Standard concatenated encoder block execution for depth pathway
         unified_depth = torch.cat([memory, tgt], dim=1)
-        B, M_len, _ = memory.shape
-        total_depth_len = M_len + K
-        
-        depth_mask = torch.ones((total_depth_len, total_depth_len), dtype=torch.bool, device=tgt.device)
-        causal_tril = torch.tril(torch.ones((max(M_len, K), max(M_len, K)), dtype=torch.bool, device=tgt.device))
-        
-        depth_mask[:M_len, :M_len] = ~causal_tril[:M_len, :M_len]
-        depth_mask[:M_len, M_len:] = True
-        depth_mask[M_len:, :M_len] = ~causal_tril[:K, :M_len]
-        depth_mask[M_len:, M_len:] = ~causal_tril[:K, :K]
+
+        # Zero-allocation mask acquisition via static lookup table
+        depth_mask = getattr(self, f"depth_static_mask_step_{N}")
 
         depth_preds = self.depth_tf(unified_depth, mask=depth_mask)
-        depth_preds = depth_preds[:, M_len:, :] 
+        depth_preds = depth_preds[:, N:, :]  # Extract target slice predictions
 
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
         return logits
