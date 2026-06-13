@@ -218,36 +218,47 @@ def main(test_config: DictConfig):
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
-    # 3. Build diversity context
-    print("[INFO] Building diversity context...")
-    diversity_context = {
-        "code_to_item": build_code_to_item(fs, cfg),
-        "item_embeddings": load_item_embeddings(fs, cfg),
-        "popularity_counts": get_popularity_counts(fs, cfg),
-    }
+    # 3. Build diversity context (only if quantization is used i.e. MARIUS, not SASRec++)
+    uses_quantization = (
+        cfg.data.datasets.get("quant_id") is not None
+        and cfg.data.datasets.get("emb_id") is not None
+    )
+    if uses_quantization:
+        print("[INFO] Building diversity context...")
+        diversity_context = {
+            "code_to_item": build_code_to_item(fs, cfg),
+            "item_embeddings": load_item_embeddings(fs, cfg),
+            "popularity_counts": get_popularity_counts(fs, cfg),
+        }
+    else:
+        print("[INFO] Skipping diversity context — no quantization (SASRec++ mode).")
+        diversity_context = None
 
     if debug:
-        print("[DEBUG] Running one forward pass to inspect code lookup...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = hydra.utils.instantiate(cfg["model"])
-        model.full_hydra_config = cfg
-        ckpt = torch.load(
-            cfg.paths.protocol + "://" + ckpt_path,
-            map_location=device,
-            weights_only=False,
-        )
-        model.load_state_dict(ckpt["state_dict"])
-        model.eval()
-        model.to(device)
+        if not uses_quantization:
+            print("[DEBUG] No quantization — skipping code lookup debug.")
+        else:
+            print("[DEBUG] Running one forward pass to inspect code lookup...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = hydra.utils.instantiate(cfg["model"])
+            model.full_hydra_config = cfg
+            ckpt = torch.load(
+                cfg.paths.protocol + "://" + ckpt_path,
+                map_location=device,
+                weights_only=False,
+            )
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
+            model.to(device)
 
-        from torch.utils.data import DataLoader
-        loader = DataLoader(datasets["test"], batch_size=4, shuffle=False)
-        batch = next(iter(loader))
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
-        with torch.no_grad():
-            gen = model.net.search(batch, n_results=10)
-        debug_code_lookup(model, gen, diversity_context["code_to_item"])
+            from torch.utils.data import DataLoader
+            loader = DataLoader(datasets["test"], batch_size=4, shuffle=False)
+            batch = next(iter(loader))
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
+            with torch.no_grad():
+                gen = model.net.search(batch, n_results=10)
+            debug_code_lookup(model, gen, diversity_context["code_to_item"])
         print("[DEBUG] Exiting after debug pass. Re-run without debug=true for full metrics.")
         return
 
