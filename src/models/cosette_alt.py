@@ -35,14 +35,9 @@ class MLPLayers(nn.Module):
 
 
 def kmeans(samples, num_clusters, num_iters=10):
-    """
-    Pure PyTorch GPU implementation of KMeans. 
-    Eliminates CPU-GPU data transfers entirely.
-    """
     device = samples.device
     orig_dtype = samples.dtype
 
-    # Run math in float32 for stable distance calculations
     x = samples.float()
     num_samples = x.size(0)
 
@@ -51,12 +46,10 @@ def kmeans(samples, num_clusters, num_iters=10):
             f"Number of samples ({num_samples}) must be >= num_clusters ({num_clusters})"
         )
 
-    # Fast uniform-at-random initialization directly on GPU
     permutation = torch.randperm(num_samples, device=device)
     centroids = x[permutation[:num_clusters]].clone()
 
     for _ in range(num_iters):
-        # Compute pairwise L2 distances matrix efficiently
         dists = (
             torch.sum(x**2, dim=1, keepdim=True)
             + torch.sum(centroids**2, dim=1, keepdim=True).t()
@@ -76,22 +69,13 @@ def kmeans(samples, num_clusters, num_iters=10):
 
 @torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
-    """
-    Blazing fast FP32/BF16 Sinkhorn using shift-invariance.
-    Fuses normalization loops into single operations.
-    """
     B, K = distances.shape
 
-    # Shift-Invariance Trick: Subtracting the minimum guarantees all values are <= 0.
-    # This bounds torch.exp to the range (0, 1], completely preventing FP32 overflow 
-    # without needing slow .double() casting.
+    # Shift-Invariance Trick: Prevents exponent overflow without using slow double precision
     shifted_dists = distances - distances.min()
     Q = torch.exp(-shifted_dists / epsilon)
-
-    # Initial global normalization
     Q /= (Q.sum() + 1e-12)
 
-    # Fused divisions minimize kernel launches and memory bandwidth bottlenecks
     for _ in range(sinkhorn_iterations):
         Q /= (torch.sum(Q, dim=1, keepdim=True) * B + 1e-12)
         Q /= (torch.sum(Q, dim=0, keepdim=True) * K + 1e-12)
@@ -168,7 +152,6 @@ class VectorQuantizer(nn.Module):
             indices = torch.argmin(d, dim=-1)
         else:
             d = self.center_distance_for_constraint(d)
-            # Extracted .double() entirely. Keeping native precision.
             Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
             if torch.isnan(Q).any() or torch.isinf(Q).any():
                 print("Sinkhorn Algorithm returns nan/inf values.")
@@ -293,7 +276,7 @@ class COSETTE(torch.nn.Module):
         sk_iters=100,
     ):
         super(COSETTE, self).__init__()
-        # Use safe .get methods to handle empty input dicts safely
+        # Use safe .get methods to prevent KeyError crashes with empty runtime dictionaries
         self.loss_weights = loss_weights if loss_weights is not None else {}
 
         self.in_dim = in_dim
@@ -333,6 +316,7 @@ class COSETTE(torch.nn.Module):
         loss = 0.0
         metrics = defaultdict(float)
 
+        # --- RECONSTRUCTION COMPLEX LOSSES ---
         if self.loss_weights.get("reconstruction", 0) > 0:
             idxs = torch.randint(0, self.embeddings.shape[0], (len(timelines),), device=self.embeddings.device)
             embeddings = F.embedding(idxs, self.embeddings)
@@ -341,13 +325,36 @@ class COSETTE(torch.nn.Module):
             x_q, rq_loss, _, _ = self.rq(x, use_sk=True)
             x_hat = self.decoder(x_q)
 
+            # 1. Base MSE Reconstruction Loss
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
             loss += recon_loss * self.loss_weights["reconstruction"]
-            loss += rq_loss * self.loss_weights["quantization"]
+            loss += rq_loss * self.loss_weights.get("quantization", 0)
 
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
+            # 2. Reconstruction L1 Loss
+            if self.loss_weights.get("reconstruction_l1_loss", 0) > 0:
+                recon_l1_loss = F.l1_loss(x_hat, embeddings, reduction="mean")
+                loss += recon_l1_loss * self.loss_weights.get("reconstruction_l1_loss", 0)
+                metrics["reconstruction_l1_loss"] = recon_l1_loss.item()
+
+            # 3. Latent Consistency Losses
+            if self.loss_weights.get("latent_consistency", 0) > 0:
+                x_tilde = self.encoder(x_hat)
+
+                # Latent Consistency MSE
+                latent_cons_loss = F.mse_loss(x_tilde, x_q.detach(), reduction="mean")
+                loss += latent_cons_loss * self.loss_weights["latent_consistency"]
+                metrics["latent_consistency_loss"] = latent_cons_loss.item()
+
+                # Latent Consistency L1
+                if self.loss_weights.get("latent_consistency_l1_loss", 0) > 0:
+                    latent_cons_l1_loss = F.l1_loss(x_tilde, x_q.detach(), reduction="mean")
+                    loss += latent_cons_l1_loss * self.loss_weights.get("latent_consistency_l1_loss", 0)
+                    metrics["latent_consistency_l1_loss"] = latent_cons_l1_loss.item()
+
+        # --- CONTRASTIVE LOSS MATRIX ---
         if self.loss_weights.get("contrastive", 0) > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
@@ -355,7 +362,7 @@ class COSETTE(torch.nn.Module):
 
             contrastive_loss = self.siglip(x_q, x_q, items, timelines)
 
-            loss += sig_rq_loss * self.loss_weights["quantization"]
+            loss += sig_rq_loss * self.loss_weights.get("quantization", 0)
             loss += contrastive_loss * self.loss_weights["contrastive"]
 
             metrics["contrastive_loss"] = contrastive_loss.item()

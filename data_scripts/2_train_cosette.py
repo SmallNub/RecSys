@@ -228,10 +228,10 @@ class Trainer(object):
         print(f"{'='*60}\n")
 
         for epoch_idx in range(self.epochs):
+            train_loss, metrics = self._train_epoch(train_data, epoch_idx)
+
             if self.scheduler is not None:
                 self.scheduler.step()
-
-            train_loss, metrics = self._train_epoch(train_data, epoch_idx)
 
             wandb.log(
                 {
@@ -460,6 +460,7 @@ def make_cosette_embs(config):
         sk_epsilons=config.centroids.sk_epsilons,
         sk_iters=config.centroids.sk_iters,
     )
+    model = torch.compile(model)
 
     print("Model : ", model)
     quant_method = make_name(config, timestamp)
