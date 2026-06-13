@@ -243,7 +243,7 @@ def main(test_config: DictConfig):
             model = hydra.utils.instantiate(cfg["model"])
             model.full_hydra_config = cfg
             ckpt = torch.load(
-                cfg.paths.protocol + "://" + ckpt_path,
+                ckpt_path,  # plain path, no protocol prefix
                 map_location=device,
                 weights_only=False,
             )
