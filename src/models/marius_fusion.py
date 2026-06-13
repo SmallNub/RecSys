@@ -71,7 +71,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Standard baseline PyTorch Encoders (Enables native SDPA / FlashAttention)
+        # Standard baseline PyTorch Encoders
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -131,7 +131,6 @@ class MARIUS(torch.nn.Module):
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
-        # Element-wise addition preserves the original sequence length L
         x = discrete_embs + continuous_embs + self.temp_pos_emb[:, :L, :]
         x = self.temp_dropout(x)
         
@@ -141,7 +140,6 @@ class MARIUS(torch.nn.Module):
         return self.temp_tf(src=x, mask=mask, src_key_padding_mask=padding_mask)
 
     def depth_forward(self, tgt):
-        # Native autoregressive handling over a single unified sequence dimension
         seq_len = tgt.shape[1]
         tgt = tgt + self.depth_pos_emb[:, :seq_len, :]
         tgt = self.depth_dropout(tgt)
@@ -149,7 +147,6 @@ class MARIUS(torch.nn.Module):
         mask = self.depth_causal_mask[:seq_len, :seq_len]
         depth_preds = self.depth_tf(tgt, mask=mask)
 
-        # Return logits for all elements following the prefix token context
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
         return logits
 
@@ -164,7 +161,6 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        # Extract standard discrete depth embeddings
         dec_embs_orig = self.depth_emb(target[:, :-1])
         K_minus_1 = dec_embs_orig.shape[1]
 
@@ -182,12 +178,10 @@ class MARIUS(torch.nn.Module):
                 v_mask = valid_mask.unsqueeze(-1).to(x_res.dtype)
                 raw_res_list.append(x_res * v_mask)
 
-            # Symmetrical feature fusion directly in the depth dimension
             raw_tensor = torch.stack(raw_res_list, dim=1)
             continuous_depth_embs = self.depth_proj(raw_tensor)
             depth_embs = dec_embs_orig + continuous_depth_embs
             
-            # Prepend temporal prefix token context
             tgt = torch.cat([mid_tokens, depth_embs], dim=1)
         else:
             tgt = mid_tokens
@@ -198,8 +192,12 @@ class MARIUS(torch.nn.Module):
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
         logits, m_target = self.train_forward(input, target)
+        
         logits = rearrange(logits, "B k v -> B v k")
-        loss = self.criterion(logits[:, :, 1:], m_target)  # Shift past prefix context token
+        
+        # CRASH FIX: Removed the [:, :, 1:] slice. 
+        # Both logits and m_target are exactly length K now.
+        loss = self.criterion(logits, m_target)  
         return loss, logits
 
     def search(self, batch, n_results):
@@ -216,7 +214,6 @@ class MARIUS(torch.nn.Module):
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
-        # Initialize sequence using only the prefix token context
         sequences = mid_tokens[:, None, :]  
         
         depth_logits = self.depth_forward(sequences)  
@@ -239,7 +236,6 @@ class MARIUS(torch.nn.Module):
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
         
-        # Fuse the first continuous codebook centroid element-wise
         fused_new = discrete_new + (continuous_new * v_mask)
         sequences = torch.concat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
@@ -271,7 +267,6 @@ class MARIUS(torch.nn.Module):
             flat_projected = self.depth_proj(flat_decoded)
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
             
-            # Symmetrical element-wise fusion step inside search loops
             flat_fused = flat_discrete + (flat_projected * flat_valid)
             next_tokens = flat_fused.view(B, b, b, 1, D)
             
