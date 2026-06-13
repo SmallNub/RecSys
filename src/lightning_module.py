@@ -144,6 +144,17 @@ class LitModule(LightningModule):
 
         self.net.filter_preds = original_filter
 
+        # Temporary debug — remove after confirming
+        if not hasattr(self, '_div_debug_done'):
+            self._div_debug_done = True
+            sample_code = tuple(gen_clean[0][0].cpu().tolist())
+            print(f"[DIV DEBUG] gen_clean shape: {gen_clean.shape}")
+            print(f"[DIV DEBUG] gen_clean min/max: {gen_clean.min().item()}/{gen_clean.max().item()}")
+            print(f"[DIV DEBUG] Sample code: {sample_code}")
+            print(f"[DIV DEBUG] Match in code_to_item: {sample_code in self.code_to_item}")
+            hits = sum(1 for code in gen_clean[0].cpu().tolist() if tuple(code) in self.code_to_item)
+            print(f"[DIV DEBUG] Codes mapping to real items (user 0): {hits}/10")
+
         B = gen_clean.shape[0]
         for b in range(B):
             rec_codes = gen_clean[b].cpu().tolist()  # K x L
