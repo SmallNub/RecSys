@@ -379,7 +379,7 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
 
 def make_name(config, timestamp):
     model_type = config.model.get("type", "euclidean")
-    prefix = "COSETTE_HYPER_SIGLIP" if model_type == "hyperbolic" else "COSETTE_SIGLIP"
+    prefix = "COSETTE_HYPER" if model_type == "hyperbolic" else "COSETTE"
     name = f"{prefix}_{config.data.category}_{timestamp}"
     if config.marker is not None:
         name += f"_{config.marker}"
