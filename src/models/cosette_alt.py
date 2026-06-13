@@ -345,7 +345,7 @@ class COSETTE(torch.nn.Module):
         self.embeddings = (
             torch.nn.Parameter(embs_block, requires_grad=False)
             if embs_block is not None
-            : None
+            else None
         )
 
         self.encoder = MLPLayers(layers=self.encode_layer_dims, dropout=self.dropout)
