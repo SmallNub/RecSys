@@ -4,4 +4,4 @@ model:
   version: "alt"
 
 loss:
-  latent_consistency_weight: 0.1
+  latent_consistency_weight: 1.0
