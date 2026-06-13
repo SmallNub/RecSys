@@ -40,7 +40,7 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Clean Discrete Token Embeddings
+        # Discrete Token Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -57,7 +57,7 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Baseline Linear Projections for Continuous Feature Fusion
+        # Lightweight projections for Continuous Feature Fusion
         self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
         self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
 
@@ -71,7 +71,7 @@ class MARIUS(torch.nn.Module):
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Native PyTorch Encoders
+        # Standard baseline PyTorch Encoders (Enables native SDPA / FlashAttention)
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -100,22 +100,15 @@ class MARIUS(torch.nn.Module):
             norm=torch.nn.LayerNorm(self.depth_cfg.d_model),
         )
 
-        # VECTORIZATION FIX: Pre-register the static temporal causal mask
+        # Native Standard Causal Masks
         self.register_buffer(
             "temp_causal_mask",
             torch.triu(torch.ones((self.temporal_cfg.seq_len, self.temporal_cfg.seq_len), dtype=torch.bool), diagonal=1),
         )
-
-        # VECTORIZATION FIX: Pre-compile all possible depth cross-attention masks to GPU memory
-        # Since depth sequence length grows step-by-step during search, we store each matrix size directly.
-        for n in range(1, self.depth_cfg.seq_len + 2):
-            mask = torch.ones((2 * n, 2 * n), dtype=torch.bool)
-            causal_tril = torch.tril(torch.ones((n, n), dtype=torch.bool))
-            mask[:n, :n] = ~causal_tril
-            mask[:n, n:] = True
-            mask[n:, :n] = ~causal_tril
-            mask[n:, n:] = ~causal_tril
-            self.register_buffer(f"depth_static_mask_step_{n}", mask)
+        self.register_buffer(
+            "depth_causal_mask",
+            torch.triu(torch.ones((self.depth_cfg.seq_len, self.depth_cfg.seq_len), dtype=torch.bool), diagonal=1),
+        )
 
         self.mid_proj = torch.nn.Linear(self.temporal_cfg.d_model, self.depth_cfg.d_model)
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -138,31 +131,25 @@ class MARIUS(torch.nn.Module):
         decoded_features = self.cosette.decode(input)
         continuous_embs = self.temp_proj(decoded_features)
 
-        # Element-wise addition keeps sequence footprint at exactly L
+        # Element-wise addition preserves the original sequence length L
         x = discrete_embs + continuous_embs + self.temp_pos_emb[:, :L, :]
         x = self.temp_dropout(x)
         
         padding_mask = input[:, :, 0] == SpecialTokens.PAD.value
         mask = self.temp_causal_mask[:L, :L]
 
-        temporal_out = self.temp_tf(
-            src=x,
-            mask=mask,
-            src_key_padding_mask=padding_mask
-        )
-        return temporal_out
+        return self.temp_tf(src=x, mask=mask, src_key_padding_mask=padding_mask)
 
-    def depth_forward(self, tgt, memory):
-        N = tgt.shape[1]  # Because memory and tgt are perfectly aligned symmetrical blocks
+    def depth_forward(self, tgt):
+        # Native autoregressive handling over a single unified sequence dimension
+        seq_len = tgt.shape[1]
+        tgt = tgt + self.depth_pos_emb[:, :seq_len, :]
+        tgt = self.depth_dropout(tgt)
 
-        unified_depth = torch.cat([memory, tgt], dim=1)
+        mask = self.depth_causal_mask[:seq_len, :seq_len]
+        depth_preds = self.depth_tf(tgt, mask=mask)
 
-        # Zero-allocation mask acquisition via static lookup table
-        depth_mask = getattr(self, f"depth_static_mask_step_{N}")
-
-        depth_preds = self.depth_tf(unified_depth, mask=depth_mask)
-        depth_preds = depth_preds[:, N:, :]  # Extract target slice predictions
-
+        # Return logits for all elements following the prefix token context
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
         return logits
 
@@ -177,10 +164,9 @@ class MARIUS(torch.nn.Module):
         mid_tokens = mid_tokens[keep]
         target = target[keep]
 
+        # Extract standard discrete depth embeddings
         dec_embs_orig = self.depth_emb(target[:, :-1])
         K_minus_1 = dec_embs_orig.shape[1]
-        
-        tgt = torch.cat([mid_tokens, dec_embs_orig], dim=1)
 
         if K_minus_1 > 0:
             raw_res_list = []
@@ -196,23 +182,24 @@ class MARIUS(torch.nn.Module):
                 v_mask = valid_mask.unsqueeze(-1).to(x_res.dtype)
                 raw_res_list.append(x_res * v_mask)
 
+            # Symmetrical feature fusion directly in the depth dimension
             raw_tensor = torch.stack(raw_res_list, dim=1)
-            continuous_tensor = self.depth_proj(raw_tensor)
+            continuous_depth_embs = self.depth_proj(raw_tensor)
+            depth_embs = dec_embs_orig + continuous_depth_embs
             
-            dummy_zero = torch.zeros((continuous_tensor.shape[0], 1, continuous_tensor.shape[2]), 
-                                     device=continuous_tensor.device, dtype=continuous_tensor.dtype)
-            memory = torch.cat([dummy_zero, continuous_tensor], dim=1)
+            # Prepend temporal prefix token context
+            tgt = torch.cat([mid_tokens, depth_embs], dim=1)
         else:
-            memory = torch.zeros((tgt.shape[0], 1, tgt.shape[2]), device=tgt.device, dtype=tgt.dtype)
+            tgt = mid_tokens
 
-        depth_logits = self.depth_forward(tgt, memory)  
+        depth_logits = self.depth_forward(tgt)  
         return depth_logits, target
 
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
         logits, m_target = self.train_forward(input, target)
         logits = rearrange(logits, "B k v -> B v k")
-        loss = self.criterion(logits, m_target)
+        loss = self.criterion(logits[:, :, 1:], m_target)  # Shift past prefix context token
         return loss, logits
 
     def search(self, batch, n_results):
@@ -229,10 +216,10 @@ class MARIUS(torch.nn.Module):
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
+        # Initialize sequence using only the prefix token context
         sequences = mid_tokens[:, None, :]  
-        memory = torch.zeros((B, 1, D), device=sequences.device, dtype=sequences.dtype) 
         
-        depth_logits = self.depth_forward(sequences, memory)  
+        depth_logits = self.depth_forward(sequences)  
         log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  
 
         topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  
@@ -240,7 +227,6 @@ class MARIUS(torch.nn.Module):
         indices = topk_indices.unsqueeze(2)  
         scores = topk_log_probs  
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  
-        memory = memory.unsqueeze(1).repeat(1, b, 1, 1)        
 
         discrete_new = self.depth_emb(topk_indices)
 
@@ -252,18 +238,15 @@ class MARIUS(torch.nn.Module):
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
-        continuous_new = continuous_new * v_mask 
-
-        sequences = torch.concat([sequences, discrete_new.unsqueeze(2)], dim=2)  
-        memory = torch.concat([memory, continuous_new.unsqueeze(2)], dim=2)       
+        
+        # Fuse the first continuous codebook centroid element-wise
+        fused_new = discrete_new + (continuous_new * v_mask)
+        sequences = torch.concat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            last_logits = self.depth_forward(
-                tgt=sequences.view(B * b, i, D),
-                memory=memory.view(B * b, i, D)
-            )[:, -1, :]
+            last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)  
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
@@ -275,7 +258,6 @@ class MARIUS(torch.nn.Module):
             expanded_indices = torch.cat([expanded_indices, topk_indices.unsqueeze(-1)], dim=3)
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
-            expanded_memory = memory.unsqueeze(2).repeat(1, 1, b, 1, 1)
             
             flat_topk = topk_indices.view(-1)
             flat_discrete = self.depth_emb(flat_topk)
@@ -287,27 +269,23 @@ class MARIUS(torch.nn.Module):
 
             flat_decoded = quantizer.get_codebook_entry(safe_indices, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
-            
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
-            flat_projected = flat_projected * flat_valid
-
-            next_tokens = flat_discrete.view(B, b, b, 1, D)
-            next_mem = flat_projected.view(B, b, b, 1, D)
+            
+            # Symmetrical element-wise fusion step inside search loops
+            flat_fused = flat_discrete + (flat_projected * flat_valid)
+            next_tokens = flat_fused.view(B, b, b, 1, D)
             
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
-            expanded_memory = torch.cat([expanded_memory, next_mem], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
             expanded_scores = expanded_scores.view(B, -1)
             
             expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
-            expanded_memory = expanded_memory.view(B, -1, expanded_memory.size(-2), D)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
             sequences = expanded_sequences[arranged, topk_indices]
-            memory = expanded_memory[arranged, topk_indices]
             indices = expanded_indices[arranged, topk_indices]
             scores = topk_scores  
 
