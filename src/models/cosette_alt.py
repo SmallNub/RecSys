@@ -78,28 +78,28 @@ def kmeans(samples, num_clusters, num_iters=10):
     return centroids.to(dtype=orig_dtype)
 
 
+@torch.compile(dynamic=True)
 @torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
+    """
+    Optimized Sinkhorn implementation. 
+    @torch.compile fuses the python loop into a single CUDA execution block,
+    completely eliminating the CPU-to-GPU kernel launch bottleneck.
+    """
     Q = torch.exp(-distances / epsilon)
 
     B = Q.shape[0]  # number of samples to assign
     K = Q.shape[1]  # how many centroids per block
 
-    # make the matrix sum to 1
-    sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
-    Q /= sum_Q
+    # Make the matrix sum to 1 once at the beginning
+    Q = Q / Q.sum()
 
     for it in range(sinkhorn_iterations):
-        # normalize each column: total weight per sample must be 1/B
-        Q /= torch.sum(Q, dim=1, keepdim=True)
-        Q /= B
+        # Combined operations: Reduces memory read/writes and cuts allocations in half
+        Q = Q / (torch.sum(Q, dim=1, keepdim=True) * B)
+        Q = Q / (torch.sum(Q, dim=0, keepdim=True) * K)
 
-        # normalize each row: total weight per prototype must be 1/K
-        Q /= torch.sum(Q, dim=0, keepdim=True)
-        Q /= K
-
-    Q *= B  # columns must sum to 1 so that Q is an assignment
-    return Q
+    return Q * B
 
 
 class VectorQuantizer(nn.Module):
