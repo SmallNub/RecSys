@@ -17,12 +17,22 @@ source activate recsys
 export PYTHONPATH=$PWD:$PYTHONPATH
 export WANDB_MODE=offline
 
-# Set to the run directory you want to test
-RUN_DIRECTORY="MARIUS_small_260611_144729"
-
-# Set to true for debug mode (one forward pass, no full metrics)
+MARIUS_BASE_DIR="outputs/checkpoints/marius"
 DEBUG=false
 
-python src/run_test.py \
-    run_directory=${RUN_DIRECTORY} \
-    debug=${DEBUG}
+for RUN_DIR in ${MARIUS_BASE_DIR}/*/; do
+    RUN_DIRECTORY=$(basename ${RUN_DIR%/})
+    echo "========================================"
+    echo ">>> Testing: ${RUN_DIRECTORY}"
+    echo "========================================"
+
+    python src/run_test.py \
+        run_directory=${RUN_DIRECTORY} \
+        debug=${DEBUG}
+
+    if [ $? -ne 0 ]; then
+        echo "[WARNING] Failed for ${RUN_DIRECTORY}, continuing..."
+    fi
+done
+
+echo "All runs complete."
