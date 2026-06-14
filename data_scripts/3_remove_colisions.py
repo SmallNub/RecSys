@@ -89,7 +89,10 @@ def main(config):
         prefix = "COSETTE_HYPER"
     else:
         print("\n>>> LOADING EUCLIDEAN COSETTE FOR COLLISION RESOLUTION <<<")
-        from src.models.cosette import COSETTE
+        if config.model.get("version", "default") == "default":
+            from src.models.cosette import COSETTE
+        else:
+            from src.models.cosette_alt import COSETTE
         prefix = "COSETTE"
 
     # --- HYBRID TOGGLE: Dynamic Naming ---

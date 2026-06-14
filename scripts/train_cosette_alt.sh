@@ -21,4 +21,4 @@ export HYDRA_FULL_ERROR=1
 python data_scripts/2_train_cosette.py cosette=default_alt \
   data.category=Beauty
 
-python data_scripts/3_remove_colisions.py data.category=Beauty
+python data_scripts/3_remove_colisions.py cosette=col_alt data.category=Beauty
