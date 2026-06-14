@@ -57,7 +57,6 @@ def kmeans(samples, num_clusters, num_iters=10):
     x = samples.float()
     num_samples = x.size(0)
 
-    # Dynamic padding to safeguard batch tails smaller than cluster requirements
     if num_samples < num_clusters:
         repeats = (num_clusters // num_samples) + 1
         x = x.repeat(repeats, 1)
@@ -109,6 +108,7 @@ class VectorQuantizer(nn.Module):
         kmeans_iters=10,
         sk_epsilon=0.01,
         sk_iters=100,
+        attn_temp=1.0,
     ):
         super().__init__()
         self.n_centroids = n_centroids
@@ -118,6 +118,7 @@ class VectorQuantizer(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilon = sk_epsilon
         self.sk_iters = sk_iters
+        self.attn_temp = attn_temp
 
         self.embedding = nn.Embedding(self.n_centroids, self.centroids_dim)
         if not kmeans_init:
@@ -158,7 +159,7 @@ class VectorQuantizer(nn.Module):
         if not self.initted and self.training:
             self.init_emb(latent)
 
-        # Standard distance tracking used for distance matrix output reporting
+        # Base geometric L2 distances (retained for metric calculations and alternate routing structures)
         d = (
             torch.sum(latent**2, dim=1, keepdim=True)
             + torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
@@ -166,27 +167,36 @@ class VectorQuantizer(nn.Module):
         )
 
         if use_attn:
-            # --- UPGRADE: CROSS-ATTENTION CODEBOOK LOOKUP ---
-            # Query: latents | Key & Value: Codebook Embeddings
-            scale = 1.0 / (self.centroids_dim ** 0.5)
-            attn_scores = torch.matmul(latent, self.embedding.weight.t()) * scale
-            attn_probs = F.softmax(attn_scores, dim=-1)
+            # --- FIX: QK-NORMALIZATION (COSINE ATTENTION MULTIPLICATION) ---
+            # Normalizing prevents magnitude scaling shifts from generating steep exponential exploding logits.
+            latent_norm = F.normalize(latent, dim=-1)
+            embed_norm = F.normalize(self.embedding.weight, dim=-1)
             
-            x_q_soft = torch.matmul(attn_probs, self.embedding.weight).view(x.shape)
+            attn_scores = torch.matmul(latent_norm, embed_norm.t()) / self.attn_temp
             
-            indices = torch.argmax(attn_scores, dim=-1)
-            x_q_hard = self.embedding(indices).view(x.shape)
-            
-            # Straight-Through Gradient Routing through attention distribution
-            x_q = x_q_soft + (x_q_hard - x_q_soft).detach()
+            if self.training:
+                # Native straight-through routing via discrete gumbel configuration
+                x_q_one_hot = F.gumbel_softmax(attn_scores, tau=self.attn_temp, hard=True, dim=-1)
+                indices = torch.argmax(x_q_one_hot, dim=-1)
+                x_q = torch.matmul(x_q_one_hot, self.embedding.weight).view(x.shape)
+            else:
+                indices = torch.argmax(attn_scores, dim=-1)
+                x_q = self.embedding(indices).view(x.shape)
+
+            # --- FIX: DECOUPLED ATTENTION LOSS TRACKING ---
+            # Bypassing hard codebook MSE updates eliminates the internal gradient conflict spikes.
+            commitment_loss = F.mse_loss(x_q.detach(), x)
+            loss = self.beta * commitment_loss
 
         elif not use_sk or self.sk_epsilon <= 0:
-            # --- VANILLA EUCLIDEAN LOOKUP ---
             indices = torch.argmin(d, dim=-1)
             x_q = self.embedding(indices).view(x.shape)
             x_q = x + (x_q - x).detach()
+            
+            commitment_loss = F.mse_loss(x_q.detach(), x)
+            codebook_loss = F.mse_loss(x_q, x.detach())
+            loss = codebook_loss + self.beta * commitment_loss
         else:
-            # --- SINKHORN ALGORITHM LOOKUP ---
             d_norm = self.center_distance_for_constraint(d)
             Q = sinkhorn_algorithm(d_norm, self.sk_epsilon, self.sk_iters)
             if torch.isnan(Q).any() or torch.isinf(Q).any():
@@ -195,11 +205,9 @@ class VectorQuantizer(nn.Module):
             x_q = self.embedding(indices).view(x.shape)
             x_q = x + (x_q - x).detach()
 
-        # Compute commitment boundaries based on output selection targets
-        x_q_hard_flat = self.embedding(indices).view(x.shape)
-        commitment_loss = F.mse_loss(x_q_hard_flat.detach(), x)
-        codebook_loss = F.mse_loss(x_q_hard_flat, x.detach())
-        loss = codebook_loss + self.beta * commitment_loss
+            commitment_loss = F.mse_loss(x_q.detach(), x)
+            codebook_loss = F.mse_loss(x_q, x.detach())
+            loss = codebook_loss + self.beta * commitment_loss
 
         indices = indices.view(x.shape[:-1])
         return x_q, loss, indices, d
@@ -214,6 +222,7 @@ class ResidualVectorQuantizer(nn.Module):
         kmeans_init=False,
         kmeans_iters=100,
         sk_iters=100,
+        attn_temp=1.0,
     ):
         super().__init__()
         self.n_centroids_list = n_centroids_list
@@ -223,6 +232,7 @@ class ResidualVectorQuantizer(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilons = sk_epsilons
         self.sk_iters = sk_iters
+        self.attn_temp = attn_temp
         self.vq_layers = nn.ModuleList(
             [
                 VectorQuantizer(
@@ -232,6 +242,7 @@ class ResidualVectorQuantizer(nn.Module):
                     kmeans_iters=self.kmeans_iters,
                     sk_epsilon=sk_epsilon,
                     sk_iters=sk_iters,
+                    attn_temp=self.attn_temp,
                 )
                 for n_centroids, sk_epsilon in zip(n_centroids_list, sk_epsilons)
             ]
@@ -283,7 +294,6 @@ class SigLIPLoss(torch.nn.Module):
 
         logsig = F.logsigmoid(mask * logits)
         
-        # Guard rails to prevent divide-by-zero NaN if no paired arrays exist
         denominator = (mask == 1).sum(dim=1).clamp(min=1)
         loss = -(logsig.sum(dim=1) / denominator).mean()
         return loss
@@ -313,6 +323,7 @@ class COSETTE(torch.nn.Module):
         kmeans_iters=100,
         sk_epsilons=None,
         sk_iters=100,
+        attn_temp=1.0,
     ):
         super(COSETTE, self).__init__()
         self.loss_weights = loss_weights if loss_weights is not None else {}
@@ -326,13 +337,13 @@ class COSETTE(torch.nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilons = sk_epsilons
         self.sk_iters = sk_iters
+        self.attn_temp = attn_temp
 
         self.encode_layer_dims = [self.in_dim] + self.layers
         self.decode_layer_dims = self.encode_layer_dims[::-1]
 
         self.embeddings = torch.nn.Parameter(embs_block, requires_grad=False) if embs_block is not None else None
 
-        # Modern Pre-LN Residual Modules
         self.encoder = ModernResidualMLP(layers=self.encode_layer_dims, dropout=self.dropout, apply_final_ln=True)
         self.decoder = ModernResidualMLP(layers=self.decode_layer_dims, dropout=self.dropout, apply_final_ln=False)
 
@@ -343,6 +354,7 @@ class COSETTE(torch.nn.Module):
             kmeans_iters=self.kmeans_iters,
             sk_epsilons=self.sk_epsilons,
             sk_iters=self.sk_iters,
+            attn_temp=self.attn_temp,
         )
 
         if self.loss_weights.get("contrastive", 0) > 0:
@@ -355,7 +367,6 @@ class COSETTE(torch.nn.Module):
         loss = 0.0
         metrics = defaultdict(float)
 
-        # --- RECONSTRUCTION COMPLEX LOSSES ---
         if self.loss_weights.get("reconstruction", 0) > 0:
             idxs = torch.randint(0, self.embeddings.shape[0], (len(timelines),), device=self.embeddings.device)
             embeddings = F.embedding(idxs, self.embeddings)
@@ -387,7 +398,6 @@ class COSETTE(torch.nn.Module):
                     loss += latent_cons_l1_loss * self.loss_weights.get("latent_consistency_l1_loss", 0)
                     metrics["latent_consistency_l1_loss"] = latent_cons_l1_loss.item()
 
-        # --- CONTRASTIVE LOSS MATRIX ---
         if self.loss_weights.get("contrastive", 0) > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
