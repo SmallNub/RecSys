@@ -4,14 +4,14 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class ResidualMLPBlock(nn.Module):
+class LinearBlock(nn.Module):
     def __init__(self, input_dim, output_dim, dropout=0.0):
         super().__init__()
         self.ln = nn.LayerNorm(input_dim)
         self.linear = nn.Linear(input_dim, output_dim)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
-        
+
         if input_dim != output_dim:
             self.shortcut = nn.Linear(input_dim, output_dim)
         else:
@@ -26,15 +26,15 @@ class ResidualMLPBlock(nn.Module):
         return x + residual
 
 
-class ModernResidualMLP(nn.Module):
+class MLPBlock(nn.Module):
     def __init__(self, layers, dropout=0.0, apply_final_ln=False):
         super().__init__()
         self.layers = layers
         self.blocks = nn.ModuleList()
-        
+
         for input_size, output_size in zip(self.layers[:-1], self.layers[1:]):
-            self.blocks.append(ResidualMLPBlock(input_size, output_size, dropout))
-            
+            self.blocks.append(LinearBlock(input_size, output_size, dropout))
+
         self.final_ln = nn.LayerNorm(layers[-1]) if apply_final_ln else nn.Identity()
 
     def forward(self, x):
@@ -79,15 +79,14 @@ def kmeans(samples, num_clusters, num_iters=10):
 @torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     B, K = distances.shape
-    M = -distances / (epsilon + 1e-8)
-    M = M - torch.max(M, dim=-1, keepdim=True)[0]
-    
-    Q = torch.exp(M)
-    Q = Q / (Q.sum() + 1e-12)
+
+    shifted_dists = distances - distances.min()
+    Q = torch.exp(-shifted_dists / epsilon)
+    Q /= (Q.sum() + 1e-12)
 
     for _ in range(sinkhorn_iterations):
-        Q = Q / (torch.sum(Q, dim=1, keepdim=True) * B + 1e-12)
-        Q = Q / (torch.sum(Q, dim=0, keepdim=True) * K + 1e-12)
+        Q /= (torch.sum(Q, dim=1, keepdim=True) * B + 1e-12)
+        Q /= (torch.sum(Q, dim=0, keepdim=True) * K + 1e-12)
 
     return Q * B
 
@@ -145,29 +144,7 @@ class VectorQuantizer(nn.Module):
         amplitude = (max_distance - middle).clamp(min=1e-5)
         return (distances - middle) / amplitude
 
-    def _revive_dead_vectors(self, latent, indices):
-        """
-        UPGRADE: Automatically finds unused vectors from the 256 pool
-        and resets them to high-density input spaces.
-        """
-        used_indices = torch.unique(indices)
-        if len(used_indices) < self.n_centroids:
-            all_indices = torch.arange(self.n_centroids, device=latent.device)
-            # Find which indices were completely untouched
-            mask = torch.ones(self.n_centroids, dtype=torch.bool, device=latent.device)
-            mask[used_indices] = False
-            dead_indices = all_indices[mask]
-            
-            num_dead = dead_indices.shape[0]
-            if num_dead > 0:
-                # Sample random active latents to occupy the dead spaces
-                perm = torch.randperm(latent.shape[0], device=latent.device)[:num_dead]
-                if perm.shape[0] == num_dead:
-                    # Inject a subtle bit of noise to prevent direct replication clone loops
-                    noise = torch.randn_like(latent[perm]) * 0.02
-                    self.embedding.weight.data[dead_indices] = latent[perm] + noise
-
-    def forward(self, x, use_sk=False):
+    def forward(self, x, use_sk=True):
         latent = x.view(-1, self.centroids_dim)
 
         if not self.initted and self.training:
@@ -182,28 +159,21 @@ class VectorQuantizer(nn.Module):
         if not use_sk or self.sk_epsilon <= 0:
             indices = torch.argmin(d, dim=-1)
         else:
-            d_norm = self.center_distance_for_constraint(d)
-            Q = sinkhorn_algorithm(d_norm, self.sk_epsilon, self.sk_iters)
-            
+            d = self.center_distance_for_constraint(d)
+            Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
             if torch.isnan(Q).any() or torch.isinf(Q).any():
-                indices = torch.argmin(d, dim=-1)
-            else:
-                indices = torch.argmax(Q, dim=-1)
-
-        # Run vector revival during active training phases
-        if self.training:
-            self._revive_dead_vectors(latent, indices)
+                print("Sinkhorn Algorithm returns nan/inf values.")
+            indices = torch.argmax(Q, dim=-1)
 
         x_q = self.embedding(indices).view(x.shape)
-        
-        # Straight-Through Estimator (STE)
-        x_q = x + (x_q - x).detach()
 
         commitment_loss = F.mse_loss(x_q.detach(), x)
         codebook_loss = F.mse_loss(x_q, x.detach())
         loss = codebook_loss + self.beta * commitment_loss
 
+        x_q = x + (x_q - x).detach()
         indices = indices.view(x.shape[:-1])
+
         return x_q, loss, indices, d
 
 
@@ -225,7 +195,6 @@ class ResidualVectorQuantizer(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilons = sk_epsilons
         self.sk_iters = sk_iters
-        
         self.vq_layers = nn.ModuleList(
             [
                 VectorQuantizer(
@@ -239,9 +208,6 @@ class ResidualVectorQuantizer(nn.Module):
                 for n_centroids, sk_epsilon in zip(n_centroids_list, sk_epsilons)
             ]
         )
-        
-        # UPGRADE: Scalers prevent deeper residuals from collapsing under extreme precision shrinkage
-        self.level_scalers = nn.Parameter(torch.ones(self.num_quantizers))
 
     def get_codebook(self):
         all_codebook = []
@@ -250,25 +216,17 @@ class ResidualVectorQuantizer(nn.Module):
             all_codebook.append(codebook)
         return torch.stack(all_codebook)
 
-    def forward(self, x, use_sk=False):
+    def forward(self, x, use_sk=True):
         all_losses = []
         all_indices = []
         all_distances = []
 
         x_q = 0
         residual = x
-        
-        for i, quantizer in enumerate(self.vq_layers):
-            # Scale the incoming residual dynamically for this specific tier
-            scaled_residual = residual * self.level_scalers[i]
-            
-            x_res, loss, indices, distance = quantizer(scaled_residual, use_sk=use_sk)
-            
-            # Unscale back out to prevent structural distortion downstream
-            x_res_unscaled = x_res / self.level_scalers[i]
-            
-            residual = residual - x_res_unscaled
-            x_q = x_q + x_res_unscaled
+        for quantizer in self.vq_layers:
+            x_res, loss, indices, distance = quantizer(residual, use_sk=use_sk)
+            residual = residual - x_res
+            x_q = x_q + x_res
 
             all_losses.append(loss)
             all_indices.append(indices)
@@ -296,6 +254,7 @@ class SigLIPLoss(torch.nn.Module):
             mask[pos] = 1.0
 
         logsig = F.logsigmoid(mask * logits)
+
         denominator = (mask == 1).sum(dim=1).clamp(min=1)
         loss = -(logsig.sum(dim=1) / denominator).mean()
         return loss
@@ -344,8 +303,9 @@ class COSETTE(torch.nn.Module):
 
         self.embeddings = torch.nn.Parameter(embs_block, requires_grad=False) if embs_block is not None else None
 
-        self.encoder = ModernResidualMLP(layers=self.encode_layer_dims, dropout=self.dropout, apply_final_ln=True)
-        self.decoder = ModernResidualMLP(layers=self.decode_layer_dims, dropout=self.dropout, apply_final_ln=False)
+        # Upgraded to Modern Residual Modules; Encoder gains a normalizing boundary for VQ stability
+        self.encoder = MLPBlock(layers=self.encode_layer_dims, dropout=self.dropout, apply_final_ln=True)
+        self.decoder = MLPBlock(layers=self.decode_layer_dims, dropout=self.dropout, apply_final_ln=False)
 
         self.rq = ResidualVectorQuantizer(
             n_centroids_list=self.n_centroids_list,
@@ -360,20 +320,22 @@ class COSETTE(torch.nn.Module):
             self.siglip = SigLIPLoss(tau=tau, bias=bias, freeze_tau=freeze_tau, freeze_bias=freeze_bias)
 
     @torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
-    def training_loss(self, items, timelines, use_sk=False):
+    def training_loss(self, items, timelines):
         assert self.embeddings is not None, "Embeddings must be provided for training."
 
         loss = 0.0
         metrics = defaultdict(float)
 
+        # --- RECONSTRUCTION COMPLEX LOSSES ---
         if self.loss_weights.get("reconstruction", 0) > 0:
             idxs = torch.randint(0, self.embeddings.shape[0], (len(timelines),), device=self.embeddings.device)
             embeddings = F.embedding(idxs, self.embeddings)
 
             x = self.encoder(embeddings)
-            x_q, rq_loss, _, _ = self.rq(x, use_sk=use_sk)
+            x_q, rq_loss, _, _ = self.rq(x, use_sk=True)
             x_hat = self.decoder(x_q)
 
+            # 1. Base MSE Reconstruction Loss
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
             loss += recon_loss * self.loss_weights["reconstruction"]
             loss += rq_loss * self.loss_weights.get("quantization", 0)
@@ -381,26 +343,32 @@ class COSETTE(torch.nn.Module):
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
+            # 2. Reconstruction L1 Loss
             if self.loss_weights.get("reconstruction_l1_loss", 0) > 0:
                 recon_l1_loss = F.l1_loss(x_hat, embeddings, reduction="mean")
                 loss += recon_l1_loss * self.loss_weights.get("reconstruction_l1_loss", 0)
                 metrics["reconstruction_l1_loss"] = recon_l1_loss.item()
 
+            # 3. Latent Consistency Losses
             if self.loss_weights.get("latent_consistency", 0) > 0:
                 x_tilde = self.encoder(x_hat)
+
+                # Latent Consistency MSE
                 latent_cons_loss = F.mse_loss(x_tilde, x_q.detach(), reduction="mean")
                 loss += latent_cons_loss * self.loss_weights["latent_consistency"]
                 metrics["latent_consistency_loss"] = latent_cons_loss.item()
 
+                # Latent Consistency L1
                 if self.loss_weights.get("latent_consistency_l1_loss", 0) > 0:
                     latent_cons_l1_loss = F.l1_loss(x_tilde, x_q.detach(), reduction="mean")
                     loss += latent_cons_l1_loss * self.loss_weights.get("latent_consistency_l1_loss", 0)
                     metrics["latent_consistency_l1_loss"] = latent_cons_l1_loss.item()
 
+        # --- CONTRASTIVE LOSS MATRIX ---
         if self.loss_weights.get("contrastive", 0) > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
-            x_q, sig_rq_loss, _, _ = self.rq(x, use_sk=use_sk)
+            x_q, sig_rq_loss, _, _ = self.rq(x, use_sk=True)
 
             contrastive_loss = self.siglip(x_q, x_q, items, timelines)
 
