@@ -36,11 +36,11 @@ def main(cfg: DictConfig) -> Optional[float]:
         "viewfs",
         "file",
     ], "This code has only been tested for viewfs:// and file://."
-    filesystem = (
-        pyarrow.fs.FileSystem.from_uri("viewfs://root")[0]
-        if cfg.paths.protocol == "viewfs"
-        else None
-    )
+    # filesystem = (
+    #     pyarrow.fs.FileSystem.from_uri("viewfs://root")[0]
+    #     if cfg.paths.protocol == "viewfs"
+    #     else None
+    # )
 
     name = f"{cfg.task_name}_{now_to_str()}"
 
@@ -50,6 +50,8 @@ def main(cfg: DictConfig) -> Optional[float]:
     torch.set_float32_matmul_precision(cfg.get("fp32_matmul_precision", "high"))
     # Disable MHA Fast path (in this version it can NaN because of left-padding)
     torch.backends.mha.set_fastpath_enabled(False)
+
+    L.seed_everything(cfg.seed, workers=True)
 
     log.info("Instantiating datasets")
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)

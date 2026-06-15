@@ -7,6 +7,7 @@ defaults:
 # task name, determines output directory path
 task_name: ??? # Overriden by experiment selection
 date: ${now:%y%m%d}_${now:%H%M%S}
+seed: 0
 
 trainer: 
   _target_: pytorch_lightning.Trainer
@@ -57,9 +58,6 @@ model: # Lightning Module for Training
     _partial_: true
     warmup_steps: ???
     cosine_steps: ${eval:'${trainer.max_steps} - ${model.scheduler.warmup_steps}'}
-
-
-
 
 data: 
   datasets: 

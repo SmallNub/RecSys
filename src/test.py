@@ -8,7 +8,6 @@ import hydra
 import numpy as np
 import pandas as pd
 import pytorch_lightning as L
-import torch
 from omegaconf import OmegaConf
 
 from src.utils.tools import patch_fsspec
@@ -152,6 +151,8 @@ def main(test_config):
 
     # 1. Get config and checkpoint from previous run
     cfg, best_checkpoint = get_top_cfg(fs, test_config)
+
+    L.seed_everything(cfg.seed, workers=True)
 
     if test_config.enforce_filtering:
         cfg.model.net.filter_preds = True

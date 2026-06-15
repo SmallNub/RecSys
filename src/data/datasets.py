@@ -1,11 +1,9 @@
 import pickle
 import random
-
 import fsspec
 import hydra
 import pandas as pd
-import torch
-from torch.utils.data import IterableDataset, Dataset
+from torch.utils.data import Dataset
 
 from src.models import SpecialTokens
 from src.utils.tools import patch_fsspec
@@ -14,7 +12,6 @@ from src.utils.tools import patch_fsspec
 def get_quantized(fs, path):
     df = pd.read_parquet(path, filesystem=fs)
     df = df.set_index("product_id")
-    # Reorder : make sure to have L0, L1...
     sorted_cols = sorted([col for col in df.columns if col.startswith("L")])
     df = df[sorted_cols]
     return df
@@ -27,30 +24,29 @@ def get_items_map(fs, path):
     m = {}
     m["item_to_id"] = {item: i + len(SpecialTokens) for i, item in enumerate(items)}
     m["id_to_item"] = {id: item for item, id in m["item_to_id"].items()}
-
     return m
 
 
 COL_ORDER = ["user_id", "timeline", "rating", "timestamp"]
 
 
-class TrainDataset(IterableDataset):
-    def __init__(self, df, pp_cfg):
-        # NOTE: total_len removed from here entirely
+class TrainDataset(Dataset):
+    def __init__(self, df, pp_cfg, total_len):
         self.df = df
         self.pp_cls = hydra.utils.get_class(pp_cfg.pop("_cls_"))
         self.pp = self.pp_cls(**pp_cfg)
+        self.total_len = total_len
         self.df_len = len(df)
         self.values = df.values
 
-    def __iter__(self):
-        # Infinite generator: let workers stream random items seamlessly.
-        # PyTorch Lightning will decide when to stop based on limit_train_batches.
-        while True:
-            idx = random.randint(0, self.df_len - 1)
-            row_vals = self.values[idx]
-            row = {k: row_vals[i] for i, k in enumerate(COL_ORDER)}
-            yield self.pp(row)
+    def __len__(self):
+        return self.total_len
+
+    def __getitem__(self, idx):
+        random_idx = random.randint(0, self.df_len - 1)
+        row_vals = self.values[random_idx]
+        row = {k: row_vals[i] for i, k in enumerate(COL_ORDER)}
+        return self.pp(row)
 
 
 class EvalDataset(Dataset):
@@ -59,10 +55,10 @@ class EvalDataset(Dataset):
         self.pp_cls = hydra.utils.get_class(pp_cfg.pop("_cls_"))
         self.pp = self.pp_cls(**pp_cfg)
         self.records = self.df.to_dict("records")
-        
+
     def __len__(self):
         return len(self.records)
-        
+
     def __getitem__(self, idx):
         return self.pp(self.records[idx])
 
@@ -72,8 +68,7 @@ def make_datasets(
     quant_id,
     category,
     prepro_cfg,
-    total_len,  # Retained in signature so your existing pipeline doesn't break
-    num_workers,
+    total_len,
     paths,
     which=["train", "valid"],
 ):
@@ -106,12 +101,13 @@ def make_datasets(
         path = paths.timelines_tplt.format(category=category, split=split)
 
         if split == "train":
+            assert (
+                total_len is not None
+            ), "total_len must be specified for the training dataset."
             df = pd.read_parquet(path, filesystem=fs).reset_index()[COL_ORDER]
             df = df[df.timeline.apply(len) > 1]
-            # Passed without total_len parameter
-            datasets["train"] = TrainDataset(df, pp_cfg)
+            datasets["train"] = TrainDataset(df, pp_cfg, total_len)
         else:
-            # Just read the dataframe
             df = pd.read_parquet(path, filesystem=fs).reset_index()[COL_ORDER]
             df = df[df.timeline.apply(len) > 1]
             datasets[split] = EvalDataset(df, pp_cfg)

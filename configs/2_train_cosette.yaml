@@ -4,6 +4,8 @@ defaults:
 - paths
 - disable_hydra_dirs
 
+seed: 0
+
 optim: 
   lr: 1e-3
   warmup: 100

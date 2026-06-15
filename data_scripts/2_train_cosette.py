@@ -19,6 +19,25 @@ from tqdm import tqdm
 from src.utils.tools import patch_fsspec
 
 
+def set_global_seed(seed: int):
+    """Seeds all main process random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def worker_init_fn(worker_id):
+    """Ensures every DataLoader worker gets a unique, deterministic random seed."""
+    # PyTorch automatically gives each worker a unique base seed based on the main seed
+    base_seed = torch.initial_seed() % (2**32)
+    worker_seed = base_seed + worker_id
+
+    # Re-seed the Python and Numpy generators inside the worker process
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 class LinearDecayScheduler(LRScheduler):
     def __init__(self, optimizer, warmup_steps, cooldown_steps, factor=0.1):
         self.optimizer = optimizer
@@ -313,9 +332,10 @@ class DataLoader:
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
+            worker_init_fn=worker_init_fn,
         )
 
-    def _collate_fn(self, batch):  
+    def _collate_fn(self, batch):
         assert len(batch) == 1, "Batch size should be 1"
         return batch[0]
 
@@ -389,6 +409,8 @@ def make_name(config, timestamp):
 
 
 def make_cosette_embs(config):
+    set_global_seed(config.seed)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     config.ckpt_dir = os.path.join(config.ckpt_dir, timestamp)
 
