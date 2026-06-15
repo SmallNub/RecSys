@@ -24,7 +24,7 @@ class TransformerConfig:
 
 
 # =========================================================
-# RoPE (Optimized, Cached, Type-Safe)
+# RoPE (Fixed Shaping & Cached)
 # =========================================================
 
 class RoPE:
@@ -39,10 +39,13 @@ class RoPE:
             return self._cache[key]
 
         t = torch.arange(seq_len, device=device)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))  # (seq_len, head_dim // 2)
 
-        cos = freqs.cos()
-        sin = freqs.sin()
+        # Concatenate freqs to match the full head_dim for chunk-based rotate_half
+        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, head_dim)
+
+        cos = emb.cos()
+        sin = emb.sin()
 
         self._cache[key] = (cos, sin)
         return cos, sin
@@ -165,7 +168,6 @@ class MARIUS(nn.Module):
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
-        # Safe fallback configurations retained from original
         if self.temporal_cfg.emb_dropout is None:
             self.temporal_cfg.emb_dropout = self.temporal_cfg.dropout
         if self.depth_cfg.emb_dropout is None:
@@ -324,7 +326,6 @@ class MARIUS(nn.Module):
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
-        # Autoregressive decoding loop preserved line-for-line
         for i in range(2, L + 1):
             last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)  
