@@ -136,21 +136,19 @@ class CosetteWrapper(nn.Module):
     @torch.no_grad()
     def decode(self, indices: torch.Tensor) -> torch.Tensor:
         """
-        Decodes codebook discrete IDs back into continuous reconstruction latents via the MLP.
+        Converts discrete IDs back to their continuous, unquantized representation
+        by summing vectors across all active quantizers, skipping the MLP decoder.
         """
         codebook_embs = self.get_codebook_embeddings(indices)
 
-        # Sum vectors across all active quantizers
+        # Sum vectors directly across all active quantizers (unquantized representation)
         x_q = codebook_embs.sum(dim=-2)
-
-        # Pass combined components through the Decoder MLP
-        reconstructed_latents = self.model.decoder(x_q)
 
         # Multiplicative masking instead of mutating tensor assignments
         valid_rows = (indices >= 0).all(dim=-1, keepdim=True)
-        reconstructed_latents = reconstructed_latents * valid_rows.to(reconstructed_latents.dtype)
+        unquantized_latents = x_q * valid_rows.to(x_q.dtype)
 
-        return reconstructed_latents
+        return unquantized_latents
 
     @torch.no_grad()
     def get_codebooks(self) -> torch.Tensor:

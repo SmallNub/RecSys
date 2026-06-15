@@ -15,6 +15,7 @@ module load Anaconda3/2025.06-1
 source activate recsys
 
 export PYTHONPATH=$PWD:$PYTHONPATH
+export HYDRA_FULL_ERROR=1
 
 # CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
 CATEGORIES=("Toys_and_Games" "Movies_and_TV" "Video_Games")

@@ -57,8 +57,8 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Lightweight projections for Continuous Feature Fusion
-        self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
+        # Both projection layers now dynamically pull from self.cosette.model.centroids_dim
+        self.temp_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.temporal_cfg.d_model)
         self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
 
         self.temp_pos_emb = torch.nn.Parameter(
@@ -127,13 +127,13 @@ class MARIUS(torch.nn.Module):
         if self.training:
             mask = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete_embs.dtype)
             discrete_embs = discrete_embs * mask
-        
-        decoded_features = self.cosette.decode(input)
-        continuous_embs = self.temp_proj(decoded_features)
+
+        unquantized_features = self.cosette.decode(input)
+        continuous_embs = self.temp_proj(unquantized_features)
 
         x = discrete_embs + continuous_embs + self.temp_pos_emb[:, :L, :]
         x = self.temp_dropout(x)
-        
+
         padding_mask = input[:, :, 0] == SpecialTokens.PAD.value
         mask = self.temp_causal_mask[:L, :L]
 
@@ -153,9 +153,9 @@ class MARIUS(torch.nn.Module):
     def train_forward(self, input, target):
         temporal_tokens = self.temporal_forward(input)  
         mid_tokens = self.mid_proj(temporal_tokens)  
-        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")  
+        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
 
-        target = rearrange(target, "b l k -> (b l) k")  
+        target = rearrange(target, "b l k -> (b l) k")
         keep = target[:, 0] != -100
 
         mid_tokens = mid_tokens[keep]
@@ -181,7 +181,7 @@ class MARIUS(torch.nn.Module):
             raw_tensor = torch.stack(raw_res_list, dim=1)
             continuous_depth_embs = self.depth_proj(raw_tensor)
             depth_embs = dec_embs_orig + continuous_depth_embs
-            
+
             tgt = torch.cat([mid_tokens, depth_embs], dim=1)
         else:
             tgt = mid_tokens
@@ -192,11 +192,8 @@ class MARIUS(torch.nn.Module):
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
         logits, m_target = self.train_forward(input, target)
-        
+
         logits = rearrange(logits, "B k v -> B v k")
-        
-        # CRASH FIX: Removed the [:, :, 1:] slice. 
-        # Both logits and m_target are exactly length K now.
         loss = self.criterion(logits, m_target)  
         return loss, logits
 
@@ -215,7 +212,7 @@ class MARIUS(torch.nn.Module):
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
         sequences = mid_tokens[:, None, :]  
-        
+
         depth_logits = self.depth_forward(sequences)  
         log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  
 
@@ -235,7 +232,7 @@ class MARIUS(torch.nn.Module):
         raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
-        
+
         fused_new = discrete_new + (continuous_new * v_mask)
         sequences = torch.concat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
@@ -254,7 +251,7 @@ class MARIUS(torch.nn.Module):
             expanded_indices = torch.cat([expanded_indices, topk_indices.unsqueeze(-1)], dim=3)
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
-            
+
             flat_topk = topk_indices.view(-1)
             flat_discrete = self.depth_emb(flat_topk)
 
@@ -266,15 +263,15 @@ class MARIUS(torch.nn.Module):
             flat_decoded = quantizer.get_codebook_entry(safe_indices, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
-            
+
             flat_fused = flat_discrete + (flat_projected * flat_valid)
             next_tokens = flat_fused.view(B, b, b, 1, D)
-            
+
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
             expanded_scores = expanded_scores.view(B, -1)
-            
+
             expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
@@ -286,7 +283,7 @@ class MARIUS(torch.nn.Module):
 
         if self.filter_preds:
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
-            is_in_query = is_in_query.all(dim=-1).any(dim=-1)  
+            is_in_query = is_in_query.all(dim=-1).any(dim=-1)
             scores[is_in_query] = -torch.inf
             topk_scores, topk_indices = torch.topk(scores, keep_final, dim=-1)
             indices = indices[arranged, topk_indices]

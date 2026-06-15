@@ -69,6 +69,7 @@ def make_datasets(
     category,
     prepro_cfg,
     total_len,
+    num_workers,  # Legacy argument
     paths,
     which=["train", "valid"],
 ):
