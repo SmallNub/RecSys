@@ -39,10 +39,10 @@ class RoPE:
             return self._cache[key]
 
         t = torch.arange(seq_len, device=device)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))  # (seq_len, head_dim // 2)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
 
-        # Concatenate freqs to match the full head_dim for chunk-based rotate_half
-        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, head_dim)
+        # Concatenate freqs to match full head_dim for chunk-based rotate_half
+        emb = torch.cat((freqs, freqs), dim=-1)
 
         cos = emb.cos()
         sin = emb.sin()
@@ -63,24 +63,26 @@ def apply_rope(x, cos, sin):
 
 
 # =========================================================
-# GQA + SDPA Attention
+# GQA + SDPA Attention (With Conditional RoPE toggle)
 # =========================================================
 
 class Attention(nn.Module):
-    def __init__(self, d_model, d_head):
+    def __init__(self, d_model, d_head, use_rope=True):
         super().__init__()
         self.d_model = d_model
         self.d_head = d_head
+        self.use_rope = use_rope
 
         self.n_heads = d_model // d_head
-        self.n_kv_heads = max(1, self.n_heads // 4)  # Grouped Query Attention (GQA)
+        self.n_kv_heads = max(1, self.n_heads // 4)
 
         self.q_proj = nn.Linear(d_model, self.n_heads * d_head, bias=False)
         self.k_proj = nn.Linear(d_model, self.n_kv_heads * d_head, bias=False)
         self.v_proj = nn.Linear(d_model, self.n_kv_heads * d_head, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-        self.rope = RoPE(d_head)
+        if self.use_rope:
+            self.rope = RoPE(d_head)
 
     def forward(self, x, attn_mask=None, is_causal=False):
         B, L, _ = x.shape
@@ -98,9 +100,10 @@ class Attention(nn.Module):
             k = k.repeat_interleave(repeat, dim=1)
             v = v.repeat_interleave(repeat, dim=1)
 
-        cos, sin = self.rope.get(L, x.device)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        if self.use_rope:
+            cos, sin = self.rope.get(L, x.device)
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
 
         y = F.scaled_dot_product_attention(
             q, k, v,
@@ -134,10 +137,10 @@ class SwiGLU(nn.Module):
 # =========================================================
 
 class Block(nn.Module):
-    def __init__(self, d_model, d_head):
+    def __init__(self, d_model, d_head, use_rope=True):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
-        self.attn = Attention(d_model, d_head)
+        self.attn = Attention(d_model, d_head, use_rope=use_rope)
         self.norm2 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model)
 
@@ -148,7 +151,7 @@ class Block(nn.Module):
 
 
 # =========================================================
-# MARIUS (OPTIMIZED CORE)
+# MARIUS
 # =========================================================
 
 class MARIUS(nn.Module):
@@ -159,6 +162,7 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
+        label_smoothing=0.1,  # Added label smoothing parameter
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -192,17 +196,21 @@ class MARIUS(nn.Module):
         self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
         self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
 
-        # Transformer Stacks
+        # Transformer Stacks (Temporal retains RoPE, Depth disables RoPE)
         self.temp_tf = nn.ModuleList([
-            Block(temporal_cfg.d_model, temporal_cfg.d_head) for _ in range(temporal_cfg.n_layers)
+            Block(temporal_cfg.d_model, temporal_cfg.d_head, use_rope=True) 
+            for _ in range(temporal_cfg.n_layers)
         ])
 
         self.depth_tf = nn.ModuleList([
-            Block(depth_cfg.d_model, depth_cfg.d_head) for _ in range(depth_cfg.n_layers)
+            Block(depth_cfg.d_model, depth_cfg.d_head, use_rope=False) 
+            for _ in range(depth_cfg.n_layers)
         ])
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        
+        # CrossEntropyLoss configured with label smoothing to stabilize ranking metrics
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
 
     def get_param_groups(self):
         def _select_no_decay(n):
@@ -222,10 +230,9 @@ class MARIUS(nn.Module):
         continuous = self.temp_proj(self.cosette.decode(input))
         x = self.dropout_t(discrete + continuous)
 
-        # Build combined 4D mask for SDPA (True = Attend, False = Mask Out)
-        valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)  # (B, L)
-        causal_mask = torch.tril(torch.ones(L, L, device=input.device, dtype=torch.bool))  # (L, L)
-        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(0).unsqueeze(1)  # (B, 1, L, L)
+        valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)
+        causal_mask = torch.tril(torch.ones(L, L, device=input.device, dtype=torch.bool))
+        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(0).unsqueeze(1)
 
         for blk in self.temp_tf:
             x = blk(x, attn_mask=combined_mask, is_causal=False)
@@ -282,7 +289,7 @@ class MARIUS(nn.Module):
         return self.criterion(logits, tgt), logits
 
     # =========================================================
-    # SEARCH (FULLY IMPLEMENTED & RETAINED)
+    # SEARCH
     # =========================================================
 
     def search(self, batch, n_results):
