@@ -1,24 +1,16 @@
 # @package _global_
-# MARIUS config for small datasets (~10k items: Video Games, Beauty)
-# Enhanced with Deduped Path Search and Bridge Multi-Layer Fusions
+# MARIUS clean baseline configuration for stable convergence on small datasets
 
-task_name: MARIUS_fusion
+task_name: MARIUS_clean_baseline
 
-# Runtime configuration overrides for train.yaml
 trainer:
-  max_steps: 40_000
+  max_steps: 20_000
   val_check_interval: 2_000
 
 model:
   net:
     _target_: src.models.marius_fusion.MARIUS
-    
-    # LOSS & TEMPERATURE SCALE RE-CALIBRATION
-    contrastive_weight: 0.25        
-    entropy_weight: 0.0             
-    contrastive_temperature: 0.07
-    softmax_temperature: 0.12       # OPTIMIZED: Marginally widened to complement length penalties
-    label_smoothing: 0.0           
+    filter_preds: true 
 
     temporal_cfg:
       _target_: src.models.marius_fusion.TransformerConfig
@@ -27,7 +19,7 @@ model:
       n_layers: 2
       d_head: 64
       d_model: 256
-      dropout: 0.3                  
+      dropout: 0.2                  
       emb_dropout: 0.1              
     depth_cfg:
       _target_: src.models.marius_fusion.TransformerConfig
@@ -41,11 +33,10 @@ model:
     cosette:
       _target_: src.models.cosette_wrapper.CosetteWrapper
       model_path: ???
-    filter_preds: true 
   mode: "generative"
   
-  # OPTIMIZER SETTINGS
   optimizer: 
+    tensor_layout: true
     lr: 0.0005
     weight_decay: 0.01              
   scheduler: 

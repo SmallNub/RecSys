@@ -164,7 +164,7 @@ class DepthBlock(nn.Module):
 
 
 # =========================================================
-# MARIUS
+# MARIUS (Clean Baseline Edition)
 # =========================================================
 
 class MARIUS(nn.Module):
@@ -175,21 +175,12 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.0,           
-        contrastive_weight=0.2,         
-        entropy_weight=0.0,            
-        contrastive_temperature=0.07,
-        softmax_temperature=0.10,       
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.cosette = cosette
         self.filter_preds = filter_preds
-        self.contrastive_weight = contrastive_weight
-        self.entropy_weight = entropy_weight
-        self.contrastive_temperature = contrastive_temperature
-        self.softmax_temperature = softmax_temperature
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
@@ -198,6 +189,7 @@ class MARIUS(nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
+        # Base Embeddings (Restored 1:1 scale ratios)
         self.temp_emb = nn.Embedding(
             temporal_cfg.vocab_size,
             temporal_cfg.d_model,
@@ -231,28 +223,9 @@ class MARIUS(nn.Module):
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
         self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
-        self.mid_proj = nn.Sequential(
-            nn.Linear(temporal_cfg.d_model, depth_cfg.d_model),
-            nn.LayerNorm(depth_cfg.d_model),
-            nn.GELU(),
-            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
-        )
-        
-        self.query_norm_layer = nn.LayerNorm(depth_cfg.d_model)
-        self.seq_norm_layer = nn.LayerNorm(depth_cfg.d_model)
-
-        self.seq_contrastive_head = nn.Sequential(
-            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
-            nn.GELU(),
-            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
-        )
-        self.query_contrastive_head = nn.Sequential(
-            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
-            nn.GELU(),
-            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
-        )
-
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
+        # Unified bridge layer for direct gradient highway connection
+        self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
     def get_param_groups(self):
         def _select_no_decay(n):
@@ -264,7 +237,7 @@ class MARIUS(nn.Module):
     def temporal_forward(self, input):
         B, L, K = input.shape
 
-        discrete = self.temp_emb(input).sum(dim=-2) * (self.temporal_cfg.d_model ** 0.5)
+        discrete = self.temp_emb(input).sum(dim=-2)
         if self.training:
             drop = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete.dtype)
             discrete = discrete * drop
@@ -292,13 +265,7 @@ class MARIUS(nn.Module):
             x = blk(x, attn_mask=None, is_causal=True)
 
         hidden_states = self.depth_final_norm(x)
-        
-        norm_hidden = F.normalize(hidden_states, p=2, dim=-1)
-        norm_weight = F.normalize(self.depth_emb.weight, p=2, dim=-1)
-        
-        logits = torch.einsum("bld,vd->blv", norm_hidden, norm_weight)
-        logits = logits / self.softmax_temperature
-        
+        logits = torch.matmul(hidden_states, self.depth_emb.weight.T)
         return logits, hidden_states
 
     def train_forward(self, input, target):
@@ -312,7 +279,7 @@ class MARIUS(nn.Module):
         mid = mid[keep]
         target = target[keep]
 
-        dec = self.depth_emb(target[:, :-1]) * (self.depth_cfg.d_model ** 0.5)
+        dec = self.depth_emb(target[:, :-1])
         K = dec.shape[1]
 
         if K > 0:
@@ -340,38 +307,12 @@ class MARIUS(nn.Module):
 
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
-        logits, hidden_states, mid_queries, tgt = self.train_forward(inp, tgt)
-        
+        logits, _, _, tgt = self.train_forward(inp, tgt)
         logits_rearranged = rearrange(logits, "b l v -> b v l")
-        ce_loss = self.criterion(logits_rearranged, tgt)
-        
-        total_loss = ce_loss
-
-        if self.contrastive_weight > 0.0:
-            seq_embeddings = hidden_states[:, -1, :]
-            query_embeddings = mid_queries.squeeze(1)
-            
-            seq_embeddings_isolated = seq_embeddings.detach()
-            
-            query_normed = self.query_norm_layer(query_embeddings)
-            seq_normed = self.seq_norm_layer(seq_embeddings_isolated)
-            
-            query_projected = self.query_contrastive_head(query_normed)
-            seq_projected = self.seq_contrastive_head(seq_normed)
-            
-            query_final = F.normalize(query_projected, p=2, dim=-1)
-            seq_final = F.normalize(seq_projected, p=2, dim=-1)
-            
-            similarity_matrix = torch.matmul(seq_final, query_final.T) / self.contrastive_temperature
-            contrastive_targets = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
-            contrastive_loss = F.cross_entropy(similarity_matrix, contrastive_targets)
-            
-            total_loss = total_loss + (self.contrastive_weight * contrastive_loss)
-
-        return total_loss, logits
+        return self.criterion(logits_rearranged, tgt), logits
 
     # =========================================================
-    # SEARCH (FIXED: 100% VECTORIZED GPU SEARCH)
+    # SEARCH (100% Vectorized GPU Beam Search — No Noise)
     # =========================================================
 
     def search(self, batch, n_results):
@@ -399,7 +340,7 @@ class MARIUS(nn.Module):
         scores = topk_log_probs  
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  
 
-        discrete_new = self.depth_emb(topk_indices) * (D ** 0.5)
+        discrete_new = self.depth_emb(topk_indices)
 
         q = self.cosette.model.rq.vq_layers[0]
         num_embeddings = getattr(q, "n_centroids", 32000)
@@ -429,7 +370,7 @@ class MARIUS(nn.Module):
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
             flat_topk = topk_indices.view(-1)
-            flat_discrete = self.depth_emb(flat_topk) * (D ** 0.5)
+            flat_discrete = self.depth_emb(flat_topk)
 
             quantizer = self.cosette.model.rq.vq_layers[i - 1]
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
@@ -445,14 +386,12 @@ class MARIUS(nn.Module):
 
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
-            length_penalty = ((5.0 + i) / 6.0) ** 0.7
-            expanded_scores = scores.unsqueeze(2) + (topk_log_probs / length_penalty)
+            # FIXED: Removed the step-by-step length penalty distortion entirely
+            expanded_scores = scores.unsqueeze(2) + topk_log_probs
             
             expanded_scores = expanded_scores.view(B, -1)
             expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
-
-            # SLOW PYTHON TRACKING LOOP REMOVED completely. Execution stays 100% vectorized on GPU.
             
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
