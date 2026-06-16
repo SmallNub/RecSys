@@ -161,14 +161,18 @@ def main(test_config):
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
     
-    # Dynamic vocab size override for models that specify a vocab_size (e.g. SASRec)
+    # Dynamic vocab size override specifically for SASRec
     from src.models import SpecialTokens
     first_ds = next(iter(datasets.values())) if datasets else None
     if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
         vocab_size = len(first_ds.pp.item_to_id) + len(SpecialTokens)
-        if "model" in cfg and "net" in cfg.model and "vocab_size" in cfg.model.net:
+        if (
+            "model" in cfg 
+            and "net" in cfg.model 
+            and cfg.model.net.get("_target_") == "src.models.sasrec.SASRec"
+        ):
             cfg.model.net.vocab_size = vocab_size
-            print(f"[INFO] Overrode model.net.vocab_size in test to {vocab_size}")
+            print(f"[INFO] Overrode model.net.vocab_size in test to {vocab_size} for SASRec")
 
     # 3. Build diversity context (only if quantization is used i.e. MARIUS, not SASRec++)
     uses_quantization = (
