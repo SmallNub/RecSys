@@ -174,13 +174,19 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.0,
+        label_smoothing=0.1,         # Stabilize distributions slightly at baseline
+        contrastive_weight=0.2,       # Sequence-level metric alignment weight
+        entropy_weight=0.01,         # Overconfidence mitigation penalty weight
+        contrastive_temperature=0.07,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.cosette = cosette
         self.filter_preds = filter_preds
+        self.contrastive_weight = contrastive_weight
+        self.entropy_weight = entropy_weight
+        self.contrastive_temperature = contrastive_temperature
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
@@ -221,8 +227,6 @@ class MARIUS(nn.Module):
 
         self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
-
-        # FIX 1: Enforce variance boundaries on the dual-stream fused embeddings
         self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
@@ -265,11 +269,12 @@ class MARIUS(nn.Module):
         for blk in self.depth_tf:
             x = blk(x, attn_mask=None, is_causal=True)
 
-        x = self.depth_final_norm(x)
+        hidden_states = self.depth_final_norm(x)
         
-        # FIX 2: Apply scale scaling to stop unregularized logit-scale explosion
-        logits = torch.einsum("bld,vd->blv", x, self.depth_emb.weight)
-        return logits / (self.depth_cfg.d_model ** 0.5)
+        logits = torch.einsum("bld,vd->blv", hidden_states, self.depth_emb.weight)
+        logits = logits / (self.depth_cfg.d_model ** 0.5)
+        
+        return logits, hidden_states
 
     def train_forward(self, input, target):
         temporal = self.temporal_forward(input)
@@ -300,23 +305,62 @@ class MARIUS(nn.Module):
             res = torch.stack(res, dim=1)
             cont = self.depth_proj(res)
             
-            # Apply fusion norm over combined representation
             fused_tgt = self.fuse_norm(dec + cont)
             tgt = torch.cat([mid, fused_tgt], dim=1)
         else:
             tgt = mid
 
-        logits = self.depth_forward(tgt)
-        return logits, target
+        logits, hidden_states = self.depth_forward(tgt)
+        return logits, hidden_states, mid, target
 
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
-        logits, tgt = self.train_forward(inp, tgt)
-        logits = rearrange(logits, "b l v -> b v l")
-        return self.criterion(logits, tgt), logits
+        logits, hidden_states, mid_queries, tgt = self.train_forward(inp, tgt)
+        
+        # 1. Core Token-level Cross-Entropy Loss
+        logits_rearranged = rearrange(logits, "b l v -> b v l")
+        ce_loss = self.criterion(logits_rearranged, tgt)
+        
+        total_loss = ce_loss
+
+        # 2. Regularization to Combat Overconfidence (Entropy Maximization Penalty)
+        if self.entropy_weight > 0.0:
+            # Filter padded/ignored tokens out of entropy computation
+            valid_mask = (tgt != -100) # [B_f, K]
+            if valid_mask.any():
+                log_probs = F.log_softmax(logits, dim=-1)
+                probs = torch.exp(log_probs)
+                
+                # Compute token shannon entropy: -sum(p * log_p)
+                token_entropy = -torch.sum(probs * log_probs, dim=-1) # [B_f, K]
+                mean_entropy = token_entropy[valid_mask].mean()
+                
+                # We subtract entropy because we want to maximize it (preventing collapse to 0)
+                total_loss = total_loss - (self.entropy_weight * mean_entropy)
+
+        # 3. Hidden-State Sequence Contrastive Optimization (Align Loss with Listwise Metrics)
+        if self.contrastive_weight > 0.0:
+            # Mean-pool depth sequence representations to form singular item embeddings
+            seq_embeddings = hidden_states.mean(dim=1) # [N, D]
+            query_embeddings = mid_queries.squeeze(1) # [N, D]
+            
+            # Normalize embeddings to calculate cosine similarities cleanly
+            seq_norm = F.normalize(seq_embeddings, p=2, dim=-1)
+            query_norm = F.normalize(query_embeddings, p=2, dim=-1)
+            
+            # Compute similarity matrix [N, N]
+            similarity_matrix = torch.matmul(seq_norm, query_norm.T) / self.contrastive_temperature
+            
+            # Targets are the identity mappings (sequence i matches query i)
+            contrastive_targets = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
+            contrastive_loss = F.cross_entropy(similarity_matrix, contrastive_targets)
+            
+            total_loss = total_loss + (self.contrastive_weight * contrastive_loss)
+
+        return total_loss, logits
 
     # =========================================================
-    # SEARCH 
+    # SEARCH
     # =========================================================
 
     def search(self, batch, n_results):
@@ -335,7 +379,7 @@ class MARIUS(nn.Module):
 
         sequences = mid[:, None, :]  
 
-        logits = self.depth_forward(sequences)  
+        logits, _ = self.depth_forward(sequences)  
         log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  
 
         topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  
@@ -355,14 +399,13 @@ class MARIUS(nn.Module):
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
 
-        # Apply fusion norm here to preserve structural matching consistency
         fused_new = self.fuse_norm(discrete_new + (continuous_new * v_mask))
         sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
+            last_logits, _ = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
             log_probs = F.log_softmax(last_logits, dim=-1)  
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
@@ -387,7 +430,6 @@ class MARIUS(nn.Module):
             flat_projected = self.depth_proj(flat_decoded)
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
 
-            # Apply fusion norm to subsequent generated prefixes
             flat_fused = self.fuse_norm(flat_discrete + (flat_projected * flat_valid))
             next_tokens = flat_fused.view(B, b, b, 1, D)
 
