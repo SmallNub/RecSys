@@ -1,23 +1,24 @@
 # @package _global_
 # MARIUS config for small datasets (~10k items: Video Games, Beauty)
-# Structurally stabilized via Gradient Isolation and Logit Denormalization Protection
+# Enhanced with Deduped Path Search and Bridge Multi-Layer Fusions
 
 task_name: MARIUS_fusion
 
-# Runtime configuration overrides injected into train.yaml
+# Runtime configuration overrides for train.yaml
 trainer:
-  max_steps: 20_000
+  max_steps: 40_000
   val_check_interval: 2_000
 
 model:
   net:
     _target_: src.models.marius_fusion.MARIUS
     
-    # LOSS & REGULARIZATION CALIBRATION
-    contrastive_weight: 0.3        # Safely set high; gradients are isolated from the generator
+    # LOSS & TEMPERATURE SCALE RE-CALIBRATION
+    contrastive_weight: 0.25        
     entropy_weight: 0.0             
     contrastive_temperature: 0.07
-    label_smoothing: 0.0           # RESEARCH FIX: Standardized next-token choice probability distribution
+    softmax_temperature: 0.12       # OPTIMIZED: Marginally widened to complement length penalties
+    label_smoothing: 0.0           
 
     temporal_cfg:
       _target_: src.models.marius_fusion.TransformerConfig
@@ -46,7 +47,7 @@ model:
   # OPTIMIZER SETTINGS
   optimizer: 
     lr: 0.0005
-    weight_decay: 0.01              # Stabilized parameter norms across short-term training spans
+    weight_decay: 0.01              
   scheduler: 
     warmup_steps: 1000              
     

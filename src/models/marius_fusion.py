@@ -175,10 +175,11 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.0,           # RESEARCH FIX: Disabling smoothing maximizes token distribution sharpness
+        label_smoothing=0.0,           
         contrastive_weight=0.2,         
         entropy_weight=0.0,            
         contrastive_temperature=0.07,
+        softmax_temperature=0.10,       
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -188,6 +189,7 @@ class MARIUS(nn.Module):
         self.contrastive_weight = contrastive_weight
         self.entropy_weight = entropy_weight
         self.contrastive_temperature = contrastive_temperature
+        self.softmax_temperature = softmax_temperature
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
@@ -196,7 +198,7 @@ class MARIUS(nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Embeddings & Projections
+        # GENERAL UPGRADE 1: Scaled Embeddings
         self.temp_emb = nn.Embedding(
             temporal_cfg.vocab_size,
             temporal_cfg.d_model,
@@ -230,9 +232,14 @@ class MARIUS(nn.Module):
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
         self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
-        self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
+        # GENERAL UPGRADE 2: Deep Non-Linear Fusion Bridge with LayerNorm
+        self.mid_proj = nn.Sequential(
+            nn.Linear(temporal_cfg.d_model, depth_cfg.d_model),
+            nn.LayerNorm(depth_cfg.d_model),
+            nn.GELU(),
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
+        )
         
-        # RESEARCH FIX: Dedicated normalization layers to isolate the shared representation norms
         self.query_norm_layer = nn.LayerNorm(depth_cfg.d_model)
         self.seq_norm_layer = nn.LayerNorm(depth_cfg.d_model)
 
@@ -259,7 +266,8 @@ class MARIUS(nn.Module):
     def temporal_forward(self, input):
         B, L, K = input.shape
 
-        discrete = self.temp_emb(input).sum(dim=-2)
+        # Scale discrete embeddings to balance attention weights
+        discrete = self.temp_emb(input).sum(dim=-2) * (self.temporal_cfg.d_model ** 0.5)
         if self.training:
             drop = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete.dtype)
             discrete = discrete * drop
@@ -288,8 +296,11 @@ class MARIUS(nn.Module):
 
         hidden_states = self.depth_final_norm(x)
         
-        logits = torch.einsum("bld,vd->blv", hidden_states, self.depth_emb.weight)
-        logits = logits / (self.depth_cfg.d_model ** 0.5)
+        norm_hidden = F.normalize(hidden_states, p=2, dim=-1)
+        norm_weight = F.normalize(self.depth_emb.weight, p=2, dim=-1)
+        
+        logits = torch.einsum("bld,vd->blv", norm_hidden, norm_weight)
+        logits = logits / self.softmax_temperature
         
         return logits, hidden_states
 
@@ -304,7 +315,7 @@ class MARIUS(nn.Module):
         mid = mid[keep]
         target = target[keep]
 
-        dec = self.depth_emb(target[:, :-1])
+        dec = self.depth_emb(target[:, :-1]) * (self.depth_cfg.d_model ** 0.5)
         K = dec.shape[1]
 
         if K > 0:
@@ -343,12 +354,8 @@ class MARIUS(nn.Module):
             seq_embeddings = hidden_states[:, -1, :]
             query_embeddings = mid_queries.squeeze(1)
             
-            # RESEARCH FIX 1: Strict Gradient Isolation via .detach()
-            # The generation block is completely isolated from the contrastive objective gradient.
             seq_embeddings_isolated = seq_embeddings.detach()
             
-            # RESEARCH FIX 2: Bounding Representation Magnitudes via explicit LayerNorms
-            # This completely avoids the overconfident Softmax Bottleneck in the generation head.
             query_normed = self.query_norm_layer(query_embeddings)
             seq_normed = self.seq_norm_layer(seq_embeddings_isolated)
             
@@ -367,13 +374,13 @@ class MARIUS(nn.Module):
         return total_loss, logits
 
     # =========================================================
-    # SEARCH
+    # SEARCH (INFERENCE UPGRADE: DEDUPED BEAM RETRIEVAL)
     # =========================================================
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
         input = batch["input"]
-        L = batch["target"].shape[-1]
+        L = batch["target"].shape[-1]  # Quantizer depth step limit
 
         if self.filter_preds:
             keep_final = n_results
@@ -383,9 +390,10 @@ class MARIUS(nn.Module):
         mid = self.mid_proj(temporal)[:, -1, :]  
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
+        arranged_batch = torch.arange(B, device=input.device).view(-1, 1)
 
+        # Initial root state setup
         sequences = mid[:, None, :]  
-
         logits, _ = self.depth_forward(sequences)  
         log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  
 
@@ -395,7 +403,7 @@ class MARIUS(nn.Module):
         scores = topk_log_probs  
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  
 
-        discrete_new = self.depth_emb(topk_indices)
+        discrete_new = self.depth_emb(topk_indices) * (D ** 0.5)
 
         q = self.cosette.model.rq.vq_layers[0]
         num_embeddings = getattr(q, "n_centroids", 32000)
@@ -409,12 +417,10 @@ class MARIUS(nn.Module):
         fused_new = self.fuse_norm(discrete_new + (continuous_new * v_mask))
         sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
-        arranged = torch.arange(B, device=sequences.device).view(-1, 1)
-
+        # Autoregressive generation loop
         for i in range(2, L + 1):
             logits, _ = self.depth_forward(sequences.view(B * b, i, D))
             last_logits = logits[:, -1, :]
-            
             log_probs = F.log_softmax(last_logits, dim=-1)  
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
@@ -428,7 +434,7 @@ class MARIUS(nn.Module):
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
             flat_topk = topk_indices.view(-1)
-            flat_discrete = self.depth_emb(flat_topk)
+            flat_discrete = self.depth_emb(flat_topk) * (D ** 0.5)
 
             quantizer = self.cosette.model.rq.vq_layers[i - 1]
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
@@ -444,16 +450,29 @@ class MARIUS(nn.Module):
 
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
-            expanded_scores = scores.unsqueeze(2) + topk_log_probs
+            # Length penalty normalizer to prevent top-k truncation starvation
+            length_penalty = ((5.0 + i) / 6.0) ** 0.7
+            expanded_scores = scores.unsqueeze(2) + (topk_log_probs / length_penalty)
+            
             expanded_scores = expanded_scores.view(B, -1)
-
             expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
+            # INFERENCE UPGRADE: Exact Path Deduplication
+            # Strips duplicate structural candidates out of the tracking stack early
+            for batch_idx in range(B):
+                seen_paths = set()
+                for path_idx in range(b * b):
+                    path_tuple = tuple(expanded_indices[batch_idx, path_idx].tolist())
+                    if path_tuple in seen_paths:
+                        expanded_scores[batch_idx, path_idx] = -1e9  # Penalty
+                    else:
+                        seen_paths.add(path_tuple)
+
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
-            sequences = expanded_sequences[arranged, topk_indices]
-            indices = expanded_indices[arranged, topk_indices]
+            sequences = expanded_sequences[arranged_batch, topk_indices]
+            indices = expanded_indices[arranged_batch, topk_indices]
             scores = topk_scores  
 
         if self.filter_preds:
@@ -461,6 +480,6 @@ class MARIUS(nn.Module):
             is_in_query = is_in_query.all(dim=-1).any(dim=-1)
             scores[is_in_query] = -torch.inf
             topk_scores, topk_indices = torch.topk(scores, keep_final, dim=-1)
-            indices = indices[arranged, topk_indices]
+            indices = indices[arranged_batch, topk_indices]
 
         return indices
