@@ -4,6 +4,10 @@ import torch.nn.functional as F
 from torch import nn
 
 
+# ==========================================
+# 1. CORE NETWORK BUILDING BLOCKS
+# ==========================================
+
 class LinearBlock(nn.Module):
     def __init__(self, input_dim, output_dim, dropout=0.0):
         super().__init__()
@@ -43,11 +47,16 @@ class MLPBlock(nn.Module):
         return self.final_ln(x)
 
 
-def kmeans(samples, num_clusters, num_iters=10):
+# ==========================================
+# 2. HYPERSPHERICAL QUANTIZATION UTILITIES
+# ==========================================
+
+def spherical_kmeans(samples, num_clusters, num_iters=10):
     device = samples.device
     orig_dtype = samples.dtype
 
-    x = samples.float()
+    # Project inputs onto the unit hypersphere
+    x = F.normalize(samples.float(), p=2, dim=-1)
     num_samples = x.size(0)
 
     if num_samples < num_clusters:
@@ -59,19 +68,16 @@ def kmeans(samples, num_clusters, num_iters=10):
     centroids = x[permutation[:num_clusters]].clone()
 
     for _ in range(num_iters):
-        dist_matrix = (
-            torch.sum(x**2, dim=1, keepdim=True)
-            + torch.sum(centroids**2, dim=1, keepdim=True).t()
-            - 2 * torch.matmul(x, centroids.t())
-        )
+        # On a unit sphere, squared Euclidean distance simplifies to: 2 - 2 * cos_sim
+        dist_matrix = 2.0 - 2.0 * torch.matmul(x, centroids.t())
 
         labels = torch.argmin(dist_matrix, dim=-1)
-        counts = torch.bincount(labels, minlength=num_clusters).view(-1, 1).float().clamp(min=1)
-
+        
         sum_centroids = torch.zeros_like(centroids)
         sum_centroids.index_add_(0, labels, x)
 
-        centroids = sum_centroids / counts
+        # Map centroid averages back to the surface of the hypersphere
+        centroids = F.normalize(sum_centroids, p=2, dim=-1)
 
     return centroids.to(dtype=orig_dtype)
 
@@ -91,6 +97,10 @@ def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     return Q * B
 
 
+# ==========================================
+# 3. QUANTIZER MODULES
+# ==========================================
+
 class VectorQuantizer(nn.Module):
     def __init__(
         self,
@@ -99,7 +109,7 @@ class VectorQuantizer(nn.Module):
         beta=0.25,
         kmeans_init=False,
         kmeans_iters=10,
-        sk_epsilon=0.01,
+        sk_epsilon=0.03,  # Tuned down for bounded hyperspherical distances
         sk_iters=100,
     ):
         super().__init__()
@@ -114,25 +124,26 @@ class VectorQuantizer(nn.Module):
         self.embedding = nn.Embedding(self.n_centroids, self.centroids_dim)
         if not kmeans_init:
             self.initted = True
-            self.embedding.weight.data.uniform_(
-                -1.0 / self.n_centroids, 1.0 / self.n_centroids
-            )
+            # Initialized uniformly; dynamically normalized during forward pass
+            self.embedding.weight.data.uniform_(-1.0, 1.0)
         else:
             self.initted = False
             self.embedding.weight.data.zero_()
 
     def get_codebook(self):
-        return self.embedding.weight
+        # Always expose dynamically normalized unit vectors
+        return F.normalize(self.embedding.weight, p=2, dim=-1)
 
     def get_codebook_entry(self, indices, shape=None):
-        z_q = self.embedding(indices)
+        weight = self.get_codebook()
+        z_q = F.embedding(indices, weight)
         if shape is not None:
             z_q = z_q.view(shape)
         return z_q
 
     def init_emb(self, data):
-        print("Initializing VQ with GPU-accelerated KMeans...")
-        centers = kmeans(data, self.n_centroids, self.kmeans_iters)
+        print("Initializing Spherical VQ with GPU-accelerated Spherical KMeans...")
+        centers = spherical_kmeans(data, self.n_centroids, self.kmeans_iters)
         self.embedding.weight.data.copy_(centers)
         self.initted = True
 
@@ -145,33 +156,38 @@ class VectorQuantizer(nn.Module):
         return (distances - middle) / amplitude
 
     def forward(self, x, use_sk=True):
-        latent = x.view(-1, self.centroids_dim)
+        # 1. Map input representations to the unit hypersphere
+        latent = F.normalize(x.view(-1, self.centroids_dim), p=2, dim=-1)
 
         if not self.initted and self.training:
             self.init_emb(latent)
 
-        d = (
-            torch.sum(latent**2, dim=1, keepdim=True)
-            + torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
-            - 2 * torch.matmul(latent, self.embedding.weight.t())
-        )
+        # 2. Grab normalized codebook vectors
+        weight = self.get_codebook()
+
+        # 3. Compute spherical distance matrix
+        d = 2.0 - 2.0 * torch.matmul(latent, weight.t())
 
         if not use_sk or self.sk_epsilon <= 0:
             indices = torch.argmin(d, dim=-1)
         else:
-            d = self.center_distance_for_constraint(d)
-            Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
+            d_norm = self.center_distance_for_constraint(d)
+            Q = sinkhorn_algorithm(d_norm, self.sk_epsilon, self.sk_iters)
             if torch.isnan(Q).any() or torch.isinf(Q).any():
                 print("Sinkhorn Algorithm returns nan/inf values.")
             indices = torch.argmax(Q, dim=-1)
 
-        x_q = self.embedding(indices).view(x.shape)
+        # 4. Extract quantized values from normalized weight space
+        x_q = F.embedding(indices, weight).view(x.shape)
+        latent_shaped = latent.view(x.shape)
 
-        commitment_loss = F.mse_loss(x_q.detach(), x)
-        codebook_loss = F.mse_loss(x_q, x.detach())
+        # 5. Quantizer Losses
+        commitment_loss = F.mse_loss(x_q.detach(), latent_shaped)
+        codebook_loss = F.mse_loss(x_q, latent_shaped.detach())
         loss = codebook_loss + self.beta * commitment_loss
 
-        x_q = x + (x_q - x).detach()
+        # 6. Straight-Through Estimator back to normalized latent
+        x_q = latent_shaped + (x_q - latent_shaped).detach()
         indices = indices.view(x.shape[:-1])
 
         return x_q, loss, indices, d
@@ -239,6 +255,10 @@ class ResidualVectorQuantizer(nn.Module):
         return x_q, mean_losses, all_indices, all_distances
 
 
+# ==========================================
+# 4. LOSS FUNCTIONS & COSETTE MAIN WRAPPER
+# ==========================================
+
 class SigLIPLoss(torch.nn.Module):
     def __init__(self, tau, bias, freeze_tau=False, freeze_bias=False):
         super(SigLIPLoss, self).__init__()
@@ -295,7 +315,7 @@ class COSETTE(torch.nn.Module):
         self.dropout = dropout_prob
         self.kmeans_init = kmeans_init
         self.kmeans_iters = kmeans_iters
-        self.sk_epsilons = sk_epsilons
+        self.sk_epsilons = sk_epsilons if sk_epsilons is not None else [0.03] * len(n_centroids_list)
         self.sk_iters = sk_iters
 
         self.encode_layer_dims = [self.in_dim] + self.layers
@@ -303,7 +323,6 @@ class COSETTE(torch.nn.Module):
 
         self.embeddings = torch.nn.Parameter(embs_block, requires_grad=False) if embs_block is not None else None
 
-        # Upgraded to Modern Residual Modules; Encoder gains a normalizing boundary for VQ stability
         self.encoder = MLPBlock(layers=self.encode_layer_dims, dropout=self.dropout, apply_final_ln=True)
         self.decoder = MLPBlock(layers=self.decode_layer_dims, dropout=self.dropout, apply_final_ln=False)
 
@@ -335,7 +354,6 @@ class COSETTE(torch.nn.Module):
             x_q, rq_loss, _, _ = self.rq(x, use_sk=True)
             x_hat = self.decoder(x_q)
 
-            # 1. Base MSE Reconstruction Loss
             recon_loss = F.mse_loss(x_hat, embeddings, reduction="mean")
             loss += recon_loss * self.loss_weights["reconstruction"]
             loss += rq_loss * self.loss_weights.get("quantization", 0)
@@ -343,22 +361,17 @@ class COSETTE(torch.nn.Module):
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
-            # 2. Reconstruction L1 Loss
             if self.loss_weights.get("reconstruction_l1_loss", 0) > 0:
                 recon_l1_loss = F.l1_loss(x_hat, embeddings, reduction="mean")
                 loss += recon_l1_loss * self.loss_weights.get("reconstruction_l1_loss", 0)
                 metrics["reconstruction_l1_loss"] = recon_l1_loss.item()
 
-            # 3. Latent Consistency Losses
             if self.loss_weights.get("latent_consistency", 0) > 0:
                 x_tilde = self.encoder(x_hat)
-
-                # Latent Consistency MSE
                 latent_cons_loss = F.mse_loss(x_tilde, x_q.detach(), reduction="mean")
                 loss += latent_cons_loss * self.loss_weights["latent_consistency"]
                 metrics["latent_consistency_loss"] = latent_cons_loss.item()
 
-                # Latent Consistency L1
                 if self.loss_weights.get("latent_consistency_l1_loss", 0) > 0:
                     latent_cons_l1_loss = F.l1_loss(x_tilde, x_q.detach(), reduction="mean")
                     loss += latent_cons_l1_loss * self.loss_weights.get("latent_consistency_l1_loss", 0)
