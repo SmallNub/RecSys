@@ -175,8 +175,8 @@ class MARIUS(nn.Module):
         tie_embeddings=False,
         filter_preds=False,
         label_smoothing=0.1,
-        contrastive_weight=0.05,       # Calibrated down to prevent sequence-level overfitting
-        entropy_weight=0.001,          # Calibrated down to protect fine-grained distribution shifts
+        contrastive_weight=0.3,         # Can safely scale back up due to projection head shielding
+        entropy_weight=0.001,
         contrastive_temperature=0.07,
     ):
         super().__init__()
@@ -230,6 +230,19 @@ class MARIUS(nn.Module):
         self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
+        
+        # FIX: Non-linear projection heads to decouple sequence alignment from token generation
+        self.seq_contrastive_head = nn.Sequential(
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
+        )
+        self.query_contrastive_head = nn.Sequential(
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
+        )
+
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
 
     def get_param_groups(self):
@@ -332,13 +345,16 @@ class MARIUS(nn.Module):
                 total_loss = total_loss - (self.entropy_weight * mean_entropy)
 
         if self.contrastive_weight > 0.0:
-            # FIX: Pull only the final token's hidden state summary vector instead of mean-pooling
-            # This protects the intermediate sequence positions from structural representation collapse
             seq_embeddings = hidden_states[:, -1, :]
             query_embeddings = mid_queries.squeeze(1)
             
-            seq_norm = F.normalize(seq_embeddings, p=2, dim=-1)
-            query_norm = F.normalize(query_embeddings, p=2, dim=-1)
+            # FIX: Route embeddings through projection heads. 
+            # The heads warp the space for contrastive performance without harming the backbone's generation layout.
+            seq_projected = self.seq_contrastive_head(seq_embeddings)
+            query_projected = self.query_contrastive_head(query_embeddings)
+            
+            seq_norm = F.normalize(seq_projected, p=2, dim=-1)
+            query_norm = F.normalize(query_projected, p=2, dim=-1)
             
             similarity_matrix = torch.matmul(seq_norm, query_norm.T) / self.contrastive_temperature
             contrastive_targets = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
@@ -394,7 +410,6 @@ class MARIUS(nn.Module):
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            # FIXED: Properly unpack returning tuple before multidimensional indexing
             logits, _ = self.depth_forward(sequences.view(B * b, i, D))
             last_logits = logits[:, -1, :]
             
