@@ -1,6 +1,4 @@
 # @package _global_
-# MARIUS clean baseline configuration for stable convergence on small datasets
-
 task_name: MARIUS_fusion
 
 trainer:

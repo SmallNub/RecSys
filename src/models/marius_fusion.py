@@ -9,10 +9,6 @@ from src.models import SpecialTokens
 from src.models.cosette_wrapper import CosetteWrapper
 
 
-# =========================================================
-# CONFIG
-# =========================================================
-
 @dataclass
 class TransformerConfig:
     n_layers: int
@@ -23,10 +19,6 @@ class TransformerConfig:
     emb_dropout: float
     seq_len: int
 
-
-# =========================================================
-# RoPE (Temporal Only)
-# =========================================================
 
 class RoPE:
     def __init__(self, head_dim):
@@ -60,10 +52,6 @@ def apply_rope(x, cos, sin):
     sin = sin[None, None, :, :].to(x.dtype)
     return x * cos + rotate_half(x) * sin
 
-
-# =========================================================
-# GQA + SDPA Attention
-# =========================================================
 
 class Attention(nn.Module):
     def __init__(self, d_model, d_head, use_rope=True):
@@ -115,10 +103,6 @@ class Attention(nn.Module):
         return self.o_proj(y)
 
 
-# =========================================================
-# SwiGLU Gated Feed-Forward Network
-# =========================================================
-
 class SwiGLU(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -130,10 +114,6 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
-
-# =========================================================
-# Transformer Blocks
-# =========================================================
 
 class TemporalBlock(nn.Module):
     def __init__(self, d_model, d_head):
@@ -163,10 +143,6 @@ class DepthBlock(nn.Module):
         return x
 
 
-# =========================================================
-# MARIUS (Clean Baseline Edition)
-# =========================================================
-
 class MARIUS(nn.Module):
     def __init__(
         self,
@@ -189,7 +165,6 @@ class MARIUS(nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Base Embeddings (Restored 1:1 scale ratios)
         self.temp_emb = nn.Embedding(
             temporal_cfg.vocab_size,
             temporal_cfg.d_model,
@@ -210,7 +185,6 @@ class MARIUS(nn.Module):
         self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
         self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
 
-        # Transformer Stacks
         self.temp_tf = nn.ModuleList([
             TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head) for _ in range(temporal_cfg.n_layers)
         ])
@@ -223,7 +197,6 @@ class MARIUS(nn.Module):
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
         self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
-        # Unified bridge layer for direct gradient highway connection
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
@@ -311,10 +284,6 @@ class MARIUS(nn.Module):
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         return self.criterion(logits_rearranged, tgt), logits
 
-    # =========================================================
-    # SEARCH (100% Vectorized GPU Beam Search — No Noise)
-    # =========================================================
-
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
         input = batch["input"]
@@ -386,7 +355,6 @@ class MARIUS(nn.Module):
 
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
-            # FIXED: Removed the step-by-step length penalty distortion entirely
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
             
             expanded_scores = expanded_scores.view(B, -1)
