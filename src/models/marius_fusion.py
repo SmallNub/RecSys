@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -174,9 +175,9 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.1,
-        contrastive_weight=0.3,         # Can safely scale back up due to projection head shielding
-        entropy_weight=0.001,
+        label_smoothing=0.0,           # RESEARCH FIX: Disabling smoothing maximizes token distribution sharpness
+        contrastive_weight=0.2,         
+        entropy_weight=0.0,            
         contrastive_temperature=0.07,
     ):
         super().__init__()
@@ -231,7 +232,10 @@ class MARIUS(nn.Module):
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         
-        # FIX: Non-linear projection heads to decouple sequence alignment from token generation
+        # RESEARCH FIX: Dedicated normalization layers to isolate the shared representation norms
+        self.query_norm_layer = nn.LayerNorm(depth_cfg.d_model)
+        self.seq_norm_layer = nn.LayerNorm(depth_cfg.d_model)
+
         self.seq_contrastive_head = nn.Sequential(
             nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
             nn.GELU(),
@@ -335,28 +339,26 @@ class MARIUS(nn.Module):
         
         total_loss = ce_loss
 
-        if self.entropy_weight > 0.0:
-            valid_mask = (tgt != -100)
-            if valid_mask.any():
-                log_probs = F.log_softmax(logits, dim=-1)
-                probs = torch.exp(log_probs)
-                token_entropy = -torch.sum(probs * log_probs, dim=-1)
-                mean_entropy = token_entropy[valid_mask].mean()
-                total_loss = total_loss - (self.entropy_weight * mean_entropy)
-
         if self.contrastive_weight > 0.0:
             seq_embeddings = hidden_states[:, -1, :]
             query_embeddings = mid_queries.squeeze(1)
             
-            # FIX: Route embeddings through projection heads. 
-            # The heads warp the space for contrastive performance without harming the backbone's generation layout.
-            seq_projected = self.seq_contrastive_head(seq_embeddings)
-            query_projected = self.query_contrastive_head(query_embeddings)
+            # RESEARCH FIX 1: Strict Gradient Isolation via .detach()
+            # The generation block is completely isolated from the contrastive objective gradient.
+            seq_embeddings_isolated = seq_embeddings.detach()
             
-            seq_norm = F.normalize(seq_projected, p=2, dim=-1)
-            query_norm = F.normalize(query_projected, p=2, dim=-1)
+            # RESEARCH FIX 2: Bounding Representation Magnitudes via explicit LayerNorms
+            # This completely avoids the overconfident Softmax Bottleneck in the generation head.
+            query_normed = self.query_norm_layer(query_embeddings)
+            seq_normed = self.seq_norm_layer(seq_embeddings_isolated)
             
-            similarity_matrix = torch.matmul(seq_norm, query_norm.T) / self.contrastive_temperature
+            query_projected = self.query_contrastive_head(query_normed)
+            seq_projected = self.seq_contrastive_head(seq_normed)
+            
+            query_final = F.normalize(query_projected, p=2, dim=-1)
+            seq_final = F.normalize(seq_projected, p=2, dim=-1)
+            
+            similarity_matrix = torch.matmul(seq_final, query_final.T) / self.contrastive_temperature
             contrastive_targets = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
             contrastive_loss = F.cross_entropy(similarity_matrix, contrastive_targets)
             
