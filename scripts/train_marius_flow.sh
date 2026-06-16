@@ -16,6 +16,7 @@ source activate recsys
 
 # export $(cat .env | xargs)
 export PYTHONPATH=$PWD:$PYTHONPATH
+export HYDRA_FULL_ERROR=1
 
 CATEGORY="Beauty"
 EXPERIMENT="marius_flow_small"

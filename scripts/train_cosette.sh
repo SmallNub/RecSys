@@ -16,6 +16,7 @@ source activate recsys
 
 # export $(cat .env | xargs)
 export PYTHONPATH=$PWD:$PYTHONPATH
+export HYDRA_FULL_ERROR=1
 
 python data_scripts/2_train_cosette.py cosette=default \
   data.category=Beauty

@@ -3,6 +3,7 @@ defaults:
 - disable_hydra_dirs
 - paths
 
+seed: 0
 enforce_filtering: True
 
 run_directory: ??? # Folder name, will be concatenated to paths.model_folder_tplt

@@ -1,9 +1,3 @@
-"""
-Standalone test script — loads specific checkpoints and runs metrics.
-Usage:
-    python src/run_test.py run_directory=MARIUS_small_2026-06-08_13-43-08
-    python src/run_test.py run_directory=MARIUS_small_2026-06-08_13-43-08 debug=true
-"""
 import json
 import os
 import pickle
@@ -93,7 +87,7 @@ def load_checkpoint(run_directory, model_folder, fs):
 # ---------------------------------------------------------------------------
 
 def build_code_to_item(fs, cfg):
-    """Build reverse mapping: tuple(code) -> item_id from the quantized parquet."""
+    """Build reverse mapping: tuple(centroid_code) -> item_id from quantized parquet."""
     quant_path = cfg.paths.semantic_ids_tplt.format(
         emb_method=cfg.data.datasets.emb_id,
         category=cfg.data.datasets.category,
@@ -107,6 +101,18 @@ def build_code_to_item(fs, cfg):
         code_to_item[code] = item_id
     print(f"[INFO] code_to_item size: {len(code_to_item)}")
     return code_to_item
+
+
+def get_n_centroids(cfg):
+    """Extract n_centroids per level from the saved config."""
+    try:
+        n = cfg.data.datasets.get("n_centroids", None)
+        if n is not None:
+            return n
+    except Exception:
+        pass
+    print("[INFO] n_centroids not found in config, defaulting to 256.")
+    return 256
 
 
 def load_item_embeddings(fs, cfg):
@@ -158,6 +164,7 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
         model.code_to_item = diversity_context["code_to_item"]
         model.item_embeddings = diversity_context["item_embeddings"]
         model.popularity_counts = diversity_context["popularity_counts"]
+        model.n_centroids = diversity_context["n_centroids"]
 
     trainer = L.Trainer(accelerator="gpu", precision="bf16-mixed")
     fn = trainer.validate if split == "valid" else trainer.test
@@ -165,43 +172,47 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     metrics = fn(
         model,
         datamodule=datamodule,
-        ckpt_path=ckpt_path,
+        ckpt_path=cfg.paths.protocol + "://" + ckpt_path,
     )
     metrics[0]["n_params"] = n_params
 
     return metrics
 
 
-def debug_code_lookup(model, batch, code_to_item, device):
+def debug_code_lookup(model, batch, code_to_item, n_centroids, device):
     """
-    Print debug info about code lookup using filter_preds=False
-    to get clean codebook codes.
+    Print debug info about code lookup using the actual gen output
+    from search() with filter_preds enabled (same as during test_step).
     """
-    original_filter = model.net.filter_preds
-    model.net.filter_preds = False
+    from src.models import SpecialTokens
+    offset = len(SpecialTokens)  # 2
 
     with torch.no_grad():
         gen = model.net.search(batch, n_results=10)
 
-    model.net.filter_preds = original_filter
+    sample_code_raw = tuple(gen[0][0].cpu().tolist())
+    sample_code = tuple(
+        c - offset - (level * n_centroids)
+        for level, c in enumerate(sample_code_raw)
+    )
 
-    sample_code = tuple(gen[0][0].cpu().tolist())
     print(f"[DEBUG] gen shape: {gen.shape}")
     print(f"[DEBUG] gen dtype: {gen.dtype}")
     print(f"[DEBUG] gen min/max: {gen.min().item()}/{gen.max().item()}")
-    print(f"[DEBUG] Sample gen code (user 0, item 0): {sample_code}")
+    print(f"[DEBUG] Sample raw token code: {sample_code_raw}")
+    print(f"[DEBUG] Sample centroid code (after decoding): {sample_code}")
     print(f"[DEBUG] code_to_item size: {len(code_to_item)}")
     sample_keys = list(code_to_item.keys())[:3]
     print(f"[DEBUG] Sample code_to_item keys: {sample_keys}")
-    print(f"[DEBUG] Match found: {sample_code in code_to_item}")
+    print(f"[DEBUG] Match in code_to_item: {sample_code in code_to_item}")
     key_arr = np.array(list(code_to_item.keys()))
     print(f"[DEBUG] code_to_item key min/max per level: {key_arr.min(axis=0)}/{key_arr.max(axis=0)}")
 
-    # Count how many of the 10 recommended codes map to real items
-    hits = 0
-    for code in gen[0].cpu().tolist():
-        if tuple(code) in code_to_item:
-            hits += 1
+    hits = sum(
+        1 for code in gen[0].cpu().tolist()
+        if tuple(c - offset - (level * n_centroids) for level, c in enumerate(code))
+        in code_to_item
+    )
     print(f"[DEBUG] Codes mapping to real items (user 0): {hits}/10")
 
 
@@ -246,7 +257,9 @@ def main(test_config: DictConfig):
             "code_to_item": build_code_to_item(fs, cfg),
             "item_embeddings": load_item_embeddings(fs, cfg),
             "popularity_counts": get_popularity_counts(fs, cfg),
+            "n_centroids": get_n_centroids(cfg),
         }
+        print(f"[INFO] n_centroids: {diversity_context['n_centroids']}")
     else:
         print("[INFO] Skipping diversity context — no quantization (SASRec++ mode).")
         diversity_context = None
@@ -271,7 +284,12 @@ def main(test_config: DictConfig):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            debug_code_lookup(model, batch, diversity_context["code_to_item"], device)
+            debug_code_lookup(
+                model, batch,
+                diversity_context["code_to_item"],
+                diversity_context["n_centroids"],
+                device,
+            )
 
         print("[DEBUG] Exiting after debug pass. Re-run without debug=true for full metrics.")
         return

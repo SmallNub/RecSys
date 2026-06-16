@@ -3,7 +3,6 @@ import os
 import random
 from collections import defaultdict
 from math import ceil
-from uuid import uuid4
 from datetime import datetime
 
 import fsspec
@@ -18,6 +17,25 @@ from torch.optim.lr_scheduler import LRScheduler
 from tqdm import tqdm
 
 from src.utils.tools import patch_fsspec
+
+
+def set_global_seed(seed: int):
+    """Seeds all main process random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def worker_init_fn(worker_id):
+    """Ensures every DataLoader worker gets a unique, deterministic random seed."""
+    # PyTorch automatically gives each worker a unique base seed based on the main seed
+    base_seed = torch.initial_seed() % (2**32)
+    worker_seed = base_seed + worker_id
+
+    # Re-seed the Python and Numpy generators inside the worker process
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 class LinearDecayScheduler(LRScheduler):
@@ -119,6 +137,7 @@ class Trainer(object):
     def _train_epoch(self, train_data, epoch_idx):
         self.model.train()
 
+<<<<<<< HEAD
         # Dynamic Curvature Annealing Calculations
         # anneal_period = max(1, int(self.epochs * 0.10))
         # if epoch_idx < anneal_period:
@@ -126,8 +145,16 @@ class Trainer(object):
         # else:
         #     c = 1.0
         c = 1.0
+=======
+        anneal_period = max(1, int(self.epochs * 0.10))
+        if epoch_idx < anneal_period:
+            c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
+        else:
+            c = 1.0
+
+>>>>>>> 41fb445bfa9e79d7c29a25f7d66112be44d76b96
         total_loss = 0
-        
+
         model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"
         desc_str = f"[{model_name}] Train {epoch_idx}"
         if self.is_hyper:
@@ -148,7 +175,6 @@ class Trainer(object):
 
             self.optimizer.zero_grad()
 
-            # --- HYBRID TOGGLE: Safe parameter routing ---
             if self.is_hyper:
                 loss, b_metrics = self.model.training_loss(**data, c=c)
             else:
@@ -157,10 +183,7 @@ class Trainer(object):
             self._check_nan(loss)
             loss.backward()
 
-            # =================================================================
-            # FIX ADDED HERE: Hyperbolic Gradient Explosion Protection
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            # =================================================================
 
             self.optimizer.step()
 
@@ -177,10 +200,9 @@ class Trainer(object):
         self.model.eval()
 
         indices_list = []
-        
-        # --- HYBRID TOGGLE ---
+
         if self.is_hyper:
-            indices, _ = self.model.get_indices(c=1.0) 
+            indices, _ = self.model.get_indices(c=1.0)
         else:
             indices, _ = self.model.get_indices()
 
@@ -213,10 +235,15 @@ class Trainer(object):
 
     def _save_checkpoint(self, epoch, ckpt_file):
         ckpt_path = os.path.join(self.local_dir, ckpt_file)
+
+        # Safely unwrap compiled models when storing runtime checkpoints
+        raw_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()}
+
         state = {
             "config": self.config,
             "epoch": epoch,
-            "state_dict": self.model.state_dict(),
+            "state_dict": state_dict,
             "optimizer": self.optimizer.state_dict(),
         }
         torch.save(state, ckpt_path, pickle_protocol=4)
@@ -229,10 +256,10 @@ class Trainer(object):
         print(f"{'='*60}\n")
 
         for epoch_idx in range(self.epochs):
+            train_loss, metrics = self._train_epoch(train_data, epoch_idx)
+
             if self.scheduler is not None:
                 self.scheduler.step()
-
-            train_loss, metrics = self._train_epoch(train_data, epoch_idx)
 
             wandb.log(
                 {
@@ -315,9 +342,10 @@ class DataLoader:
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
+            worker_init_fn=worker_init_fn,
         )
 
-    def _collate_fn(self, batch):  
+    def _collate_fn(self, batch):
         assert len(batch) == 1, "Batch size should be 1"
         return batch[0]
 
@@ -344,17 +372,16 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
         category=config.data.category,
     )
 
-    print("Forward.")
-    # --- HYBRID TOGGLE ---
+    print("Forward Pass Evaluation.")
     is_hyper = config.model.get("type", "euclidean") == "hyperbolic"
     if is_hyper:
         indices, _ = model.get_indices(use_sk=False, c=1.0)
     else:
         indices, _ = model.get_indices(use_sk=False)
-        
+
     indices = indices.cpu().numpy().astype(np.int32)
 
-    print("Preparing dataframe.")
+    print("Preparing DataFrame.")
     series = []
     for _ in range(indices.shape[1]):
         series.append(pd.Series(indices[:, _], name=f"L{_}"))
@@ -364,13 +391,18 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
     print("Saving quantized dataframe.")
     quant_df.to_parquet(quantized_path, filesystem=filesystem)
 
-    sd = model.state_dict()
-    del sd["embeddings"]  
+    print("Cleaning and saving model state dict.")
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    sd = raw_model.state_dict()
+
+    clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    clean_sd.pop("embeddings", None)
+
     with fs.open(model_path, "wb") as f:
         torch.save(
             {
                 "config": config,
-                "state_dict": sd,
+                "state_dict": clean_sd,
                 "epoch": config.optim.epochs,  
             },
             f,
@@ -387,10 +419,14 @@ def make_name(config, timestamp):
 
 
 def make_cosette_embs(config):
+    set_global_seed(config.seed)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     config.ckpt_dir = os.path.join(config.ckpt_dir, timestamp)
 
-    # --- HYBRID TOGGLE: Dynamic Model Import ---
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     model_type = config.model.get("type", "euclidean")
     if model_type == "hyperbolic":
         print(">>> INITIALIZING HYPERBOLIC COSETTE <<<")
@@ -457,6 +493,7 @@ def make_cosette_embs(config):
         sk_epsilons=config.centroids.sk_epsilons,
         sk_iters=config.centroids.sk_iters,
     )
+    model = torch.compile(model)
 
     print("Model : ", model)
     quant_method = make_name(config, timestamp)
@@ -474,7 +511,13 @@ def make_cosette_embs(config):
     last_ckpt = trainer.fit(train_loader)
 
     sd = torch.load(last_ckpt, weights_only=False, map_location="cpu")
-    model.load_state_dict(sd["state_dict"])
+
+    # Safely route the loading parameters back depending on compilation wrappers
+    if hasattr(model, "_orig_mod"):
+        model._orig_mod.load_state_dict(sd["state_dict"])
+    else:
+        model.load_state_dict(sd["state_dict"])
+
     model.eval()
     model.cuda()
 

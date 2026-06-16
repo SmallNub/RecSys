@@ -36,11 +36,11 @@ def main(cfg: DictConfig) -> Optional[float]:
         "viewfs",
         "file",
     ], "This code has only been tested for viewfs:// and file://."
-    filesystem = (
-        pyarrow.fs.FileSystem.from_uri("viewfs://root")[0]
-        if cfg.paths.protocol == "viewfs"
-        else None
-    )
+    # filesystem = (
+    #     pyarrow.fs.FileSystem.from_uri("viewfs://root")[0]
+    #     if cfg.paths.protocol == "viewfs"
+    #     else None
+    # )
 
     name = f"{cfg.task_name}_{now_to_str()}"
 
@@ -51,8 +51,25 @@ def main(cfg: DictConfig) -> Optional[float]:
     # Disable MHA Fast path (in this version it can NaN because of left-padding)
     torch.backends.mha.set_fastpath_enabled(False)
 
+    L.seed_everything(cfg.seed, workers=True)
+
     log.info("Instantiating datasets")
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
+
+    # Dynamic vocab size override specifically for SASRec
+    from src.models import SpecialTokens
+    first_ds = next(iter(datasets.values())) if datasets else None
+    if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
+        vocab_size = len(first_ds.pp.item_to_id) + len(SpecialTokens)
+        log.info(f"Detected actual vocab size from dataset: {vocab_size}")
+        if (
+            "model" in cfg 
+            and "net" in cfg.model 
+            and cfg.model.net.get("_target_") == "src.models.sasrec.SASRec"
+        ):
+            cfg.model.net.vocab_size = vocab_size
+            log.info(f"Overrode model.net.vocab_size to {vocab_size} for SASRec")
+
 
     log.info("Instantiating datamodule")
     datamodule: L.LightningDataModule = hydra.utils.instantiate(cfg.data.datamodule, datasets=datasets)

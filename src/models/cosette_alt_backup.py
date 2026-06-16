@@ -4,43 +4,34 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class LinearBlock(nn.Module):
-    def __init__(self, input_dim, output_dim, dropout=0.0):
-        super().__init__()
-        self.ln = nn.LayerNorm(input_dim)
-        self.linear = nn.Linear(input_dim, output_dim)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-
-        if input_dim != output_dim:
-            self.shortcut = nn.Linear(input_dim, output_dim)
-        else:
-            self.shortcut = nn.Identity()
-
-    def forward(self, x):
-        residual = self.shortcut(x)
-        x = self.ln(x)
-        x = self.linear(x)
-        x = self.act(x)
-        x = self.drop(x)
-        return x + residual
-
-
-class MLPBlock(nn.Module):
-    def __init__(self, layers, dropout=0.0, apply_final_ln=False):
-        super().__init__()
+class MLPLayers(nn.Module):
+    def __init__(self, layers, dropout=0.0, activation="relu"):
+        super(MLPLayers, self).__init__()
         self.layers = layers
-        self.blocks = nn.ModuleList()
+        self.dropout = dropout
+        self.activation = activation
 
-        for input_size, output_size in zip(self.layers[:-1], self.layers[1:]):
-            self.blocks.append(LinearBlock(input_size, output_size, dropout))
+        mlp_modules = []
+        for idx, (input_size, output_size) in enumerate(
+            zip(self.layers[:-1], self.layers[1:])
+        ):
+            mlp_modules.append(nn.Dropout(p=self.dropout))
+            mlp_modules.append(nn.Linear(input_size, output_size))
+            activation_func = nn.ReLU()
+            if activation_func is not None and idx != (len(self.layers) - 2):
+                mlp_modules.append(activation_func)
 
-        self.final_ln = nn.LayerNorm(layers[-1]) if apply_final_ln else nn.Identity()
+        self.mlp_layers = nn.Sequential(*mlp_modules)
+        self.apply(self.init_weights)
 
-    def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        return self.final_ln(x)
+    def init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight.data)
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+
+    def forward(self, input_feature):
+        return self.mlp_layers(input_feature)
 
 
 def kmeans(samples, num_clusters, num_iters=10):
@@ -51,21 +42,21 @@ def kmeans(samples, num_clusters, num_iters=10):
     num_samples = x.size(0)
 
     if num_samples < num_clusters:
-        repeats = (num_clusters // num_samples) + 1
-        x = x.repeat(repeats, 1)
-        num_samples = x.size(0)
+        raise ValueError(
+            f"Number of samples ({num_samples}) must be >= num_clusters ({num_clusters})"
+        )
 
     permutation = torch.randperm(num_samples, device=device)
     centroids = x[permutation[:num_clusters]].clone()
 
     for _ in range(num_iters):
-        dist_matrix = (
+        dists = (
             torch.sum(x**2, dim=1, keepdim=True)
             + torch.sum(centroids**2, dim=1, keepdim=True).t()
             - 2 * torch.matmul(x, centroids.t())
         )
 
-        labels = torch.argmin(dist_matrix, dim=-1)
+        labels = torch.argmin(dists, dim=-1)
         counts = torch.bincount(labels, minlength=num_clusters).view(-1, 1).float().clamp(min=1)
 
         sum_centroids = torch.zeros_like(centroids)
@@ -80,6 +71,7 @@ def kmeans(samples, num_clusters, num_iters=10):
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     B, K = distances.shape
 
+    # Shift-Invariance Trick: Prevents exponent overflow without using slow double precision
     shifted_dists = distances - distances.min()
     Q = torch.exp(-shifted_dists / epsilon)
     Q /= (Q.sum() + 1e-12)
@@ -254,9 +246,7 @@ class SigLIPLoss(torch.nn.Module):
             mask[pos] = 1.0
 
         logsig = F.logsigmoid(mask * logits)
-
-        denominator = (mask == 1).sum(dim=1).clamp(min=1)
-        loss = -(logsig.sum(dim=1) / denominator).mean()
+        loss = -(logsig.sum(dim=1) / (mask == 1).sum(dim=1)).mean()
         return loss
 
     def forward(self, xa, xb, items, timelines):
@@ -286,6 +276,7 @@ class COSETTE(torch.nn.Module):
         sk_iters=100,
     ):
         super(COSETTE, self).__init__()
+        # Use safe .get methods to prevent KeyError crashes with empty runtime dictionaries
         self.loss_weights = loss_weights if loss_weights is not None else {}
 
         self.in_dim = in_dim
@@ -303,9 +294,8 @@ class COSETTE(torch.nn.Module):
 
         self.embeddings = torch.nn.Parameter(embs_block, requires_grad=False) if embs_block is not None else None
 
-        # Upgraded to Modern Residual Modules; Encoder gains a normalizing boundary for VQ stability
-        self.encoder = MLPBlock(layers=self.encode_layer_dims, dropout=self.dropout, apply_final_ln=True)
-        self.decoder = MLPBlock(layers=self.decode_layer_dims, dropout=self.dropout, apply_final_ln=False)
+        self.encoder = MLPLayers(layers=self.encode_layer_dims, dropout=self.dropout)
+        self.decoder = MLPLayers(layers=self.decode_layer_dims, dropout=self.dropout)
 
         self.rq = ResidualVectorQuantizer(
             n_centroids_list=self.n_centroids_list,

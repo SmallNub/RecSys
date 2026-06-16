@@ -1,11 +1,17 @@
+import math
 from dataclasses import dataclass
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
 from src.models import SpecialTokens
 from src.models.cosette_wrapper import CosetteWrapper
 
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 @dataclass
 class TransformerConfig:
@@ -18,7 +24,150 @@ class TransformerConfig:
     seq_len: int
 
 
-class MARIUS(torch.nn.Module):
+# =========================================================
+# RoPE (Temporal Only)
+# =========================================================
+
+class RoPE:
+    def __init__(self, head_dim):
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.inv_freq = inv_freq
+        self._cache = {}
+
+    def get(self, seq_len, device):
+        key = (seq_len, device)
+        if key in self._cache:
+            return self._cache[key]
+
+        t = torch.arange(seq_len, device=device)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()
+        sin = emb.sin()
+
+        self._cache[key] = (cos, sin)
+        return cos, sin
+
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(x, cos, sin):
+    cos = cos[None, None, :, :].to(x.dtype)
+    sin = sin[None, None, :, :].to(x.dtype)
+    return x * cos + rotate_half(x) * sin
+
+
+# =========================================================
+# GQA + SDPA Attention
+# =========================================================
+
+class Attention(nn.Module):
+    def __init__(self, d_model, d_head, use_rope=True):
+        super().__init__()
+        self.d_model = d_model
+        self.d_head = d_head
+        self.use_rope = use_rope
+
+        self.n_heads = d_model // d_head
+        self.n_kv_heads = max(1, self.n_heads // 4)
+
+        self.q_proj = nn.Linear(d_model, self.n_heads * d_head, bias=False)
+        self.k_proj = nn.Linear(d_model, self.n_kv_heads * d_head, bias=False)
+        self.v_proj = nn.Linear(d_model, self.n_kv_heads * d_head, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        if self.use_rope:
+            self.rope = RoPE(d_head)
+
+    def forward(self, x, attn_mask=None, is_causal=False):
+        B, L, _ = x.shape
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = rearrange(q, "b l (h d) -> b h l d", d=self.d_head)
+        k = rearrange(k, "b l (h d) -> b h l d", d=self.d_head)
+        v = rearrange(v, "b l (h d) -> b h l d", d=self.d_head)
+
+        if self.n_kv_heads != self.n_heads:
+            repeat = self.n_heads // self.n_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        if self.use_rope:
+            cos, sin = self.rope.get(L, x.device)
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal
+        )
+
+        y = rearrange(y, "b h l d -> b l (h d)")
+        return self.o_proj(y)
+
+
+# =========================================================
+# SwiGLU Gated Feed-Forward Network
+# =========================================================
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        hidden_dim = 4 * d_model * 2 // 3
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
+
+# =========================================================
+# Transformer Blocks
+# =========================================================
+
+class TemporalBlock(nn.Module):
+    def __init__(self, d_model, d_head):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(d_model)
+        self.attn = Attention(d_model, d_head, use_rope=True)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model)
+
+    def forward(self, x, attn_mask=None, is_causal=False):
+        x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class DepthBlock(nn.Module):
+    def __init__(self, d_model, d_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = Attention(d_model, d_head, use_rope=False)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = SwiGLU(d_model)
+
+    def forward(self, x, attn_mask=None, is_causal=False):
+        x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+# =========================================================
+# MARIUS
+# =========================================================
+
+class MARIUS(nn.Module):
     def __init__(
         self,
         temporal_cfg,
@@ -26,96 +175,83 @@ class MARIUS(torch.nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
+        label_smoothing=0.0,           # RESEARCH FIX: Disabling smoothing maximizes token distribution sharpness
+        contrastive_weight=0.2,         
+        entropy_weight=0.0,            
+        contrastive_temperature=0.07,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
-        self.filter_preds = filter_preds
         self.cosette = cosette
+        self.filter_preds = filter_preds
+        self.contrastive_weight = contrastive_weight
+        self.entropy_weight = entropy_weight
+        self.contrastive_temperature = contrastive_temperature
 
-        assert self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size, "Vocab size mismatch"
+        assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
         if self.temporal_cfg.emb_dropout is None:
             self.temporal_cfg.emb_dropout = self.temporal_cfg.dropout
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Discrete Token Embeddings
-        self.temp_emb = torch.nn.Embedding(
-            self.temporal_cfg.vocab_size,
-            self.temporal_cfg.d_model,
+        # Embeddings & Projections
+        self.temp_emb = nn.Embedding(
+            temporal_cfg.vocab_size,
+            temporal_cfg.d_model,
             padding_idx=SpecialTokens.PAD.value,
         )
 
-        self.tie_embeddings = tie_embeddings
-        if tie_embeddings:
-            self.depth_emb = self.temp_emb
-        else:
-            self.depth_emb = torch.nn.Embedding(
-                self.depth_cfg.vocab_size,
-                self.depth_cfg.d_model,
-                padding_idx=SpecialTokens.PAD.value,
-            )
-
-        # Lightweight projections for Continuous Feature Fusion
-        self.temp_proj = torch.nn.Linear(self.cosette.model.in_dim, self.temporal_cfg.d_model)
-        self.depth_proj = torch.nn.Linear(self.cosette.model.centroids_dim, self.depth_cfg.d_model)
-
-        self.temp_pos_emb = torch.nn.Parameter(
-            torch.randn((1, self.temporal_cfg.seq_len, self.temporal_cfg.d_model))
-        )
-        self.depth_pos_emb = torch.nn.Parameter(
-            torch.randn((1, self.depth_cfg.seq_len, self.depth_cfg.d_model))
+        self.depth_emb = self.temp_emb if tie_embeddings else nn.Embedding(
+            depth_cfg.vocab_size,
+            depth_cfg.d_model,
+            padding_idx=SpecialTokens.PAD.value,
         )
 
-        self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
-        self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
+        self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
-        # Standard baseline PyTorch Encoders
-        self.temp_tf = torch.nn.TransformerEncoder(
-            encoder_layer=torch.nn.TransformerEncoderLayer(
-                d_model=self.temporal_cfg.d_model,
-                nhead=self.temporal_cfg.d_model // self.temporal_cfg.d_head,
-                dim_feedforward=self.temporal_cfg.d_model * 4,
-                dropout=self.temporal_cfg.dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            ),
-            num_layers=self.temporal_cfg.n_layers,
-            norm=torch.nn.LayerNorm(self.temporal_cfg.d_model),
+        self.temp_proj = nn.Linear(cosette.model.centroids_dim, temporal_cfg.d_model, bias=False)
+        self.depth_proj = nn.Linear(cosette.model.centroids_dim, depth_cfg.d_model, bias=False)
+
+        self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
+        self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
+
+        # Transformer Stacks
+        self.temp_tf = nn.ModuleList([
+            TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head) for _ in range(temporal_cfg.n_layers)
+        ])
+
+        self.depth_tf = nn.ModuleList([
+            DepthBlock(depth_cfg.d_model, depth_cfg.d_head) for _ in range(depth_cfg.n_layers)
+        ])
+
+        self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
+        self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
+        self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
+
+        self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
+        
+        # RESEARCH FIX: Dedicated normalization layers to isolate the shared representation norms
+        self.query_norm_layer = nn.LayerNorm(depth_cfg.d_model)
+        self.seq_norm_layer = nn.LayerNorm(depth_cfg.d_model)
+
+        self.seq_contrastive_head = nn.Sequential(
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
+        )
+        self.query_contrastive_head = nn.Sequential(
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(depth_cfg.d_model, depth_cfg.d_model, bias=False)
         )
 
-        self.depth_tf = torch.nn.TransformerEncoder(
-            encoder_layer=torch.nn.TransformerEncoderLayer(
-                d_model=self.depth_cfg.d_model,
-                nhead=self.depth_cfg.d_model // self.depth_cfg.d_head,
-                dim_feedforward=self.depth_cfg.d_model * 4,
-                dropout=self.depth_cfg.dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            ),
-            num_layers=self.depth_cfg.n_layers,
-            norm=torch.nn.LayerNorm(self.depth_cfg.d_model),
-        )
-
-        # Native Standard Causal Masks
-        self.register_buffer(
-            "temp_causal_mask",
-            torch.triu(torch.ones((self.temporal_cfg.seq_len, self.temporal_cfg.seq_len), dtype=torch.bool), diagonal=1),
-        )
-        self.register_buffer(
-            "depth_causal_mask",
-            torch.triu(torch.ones((self.depth_cfg.seq_len, self.depth_cfg.seq_len), dtype=torch.bool), diagonal=1),
-        )
-
-        self.mid_proj = torch.nn.Linear(self.temporal_cfg.d_model, self.depth_cfg.d_model)
-        self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n
+            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n or "norm" in n
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -123,82 +259,116 @@ class MARIUS(torch.nn.Module):
     def temporal_forward(self, input):
         B, L, K = input.shape
 
-        discrete_embs = self.temp_emb(input).sum(dim=-2)
+        discrete = self.temp_emb(input).sum(dim=-2)
         if self.training:
-            mask = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete_embs.dtype)
-            discrete_embs = discrete_embs * mask
-        
-        decoded_features = self.cosette.decode(input)
-        continuous_embs = self.temp_proj(decoded_features)
+            drop = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete.dtype)
+            discrete = discrete * drop
 
-        x = discrete_embs + continuous_embs + self.temp_pos_emb[:, :L, :]
-        x = self.temp_dropout(x)
-        
-        padding_mask = input[:, :, 0] == SpecialTokens.PAD.value
-        mask = self.temp_causal_mask[:L, :L]
+        continuous = self.temp_proj(self.cosette.decode(input))
+        x = self.dropout_t(discrete + continuous)
 
-        return self.temp_tf(src=x, mask=mask, src_key_padding_mask=padding_mask)
+        valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)
+        causal_mask = torch.tril(torch.ones(L, L, device=input.device, dtype=torch.bool))
+        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(0).unsqueeze(1)
+
+        for blk in self.temp_tf:
+            x = blk(x, attn_mask=combined_mask, is_causal=False)
+
+        return self.temp_final_norm(x)
 
     def depth_forward(self, tgt):
         seq_len = tgt.shape[1]
-        tgt = tgt + self.depth_pos_emb[:, :seq_len, :]
-        tgt = self.depth_dropout(tgt)
+        positions = torch.arange(seq_len, device=tgt.device)
+        pos_embeddings = self.depth_pos_emb(positions).unsqueeze(0)
+        
+        x = self.dropout_d(tgt + pos_embeddings)
+        
+        for blk in self.depth_tf:
+            x = blk(x, attn_mask=None, is_causal=True)
 
-        mask = self.depth_causal_mask[:seq_len, :seq_len]
-        depth_preds = self.depth_tf(tgt, mask=mask)
-
-        logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
-        return logits
+        hidden_states = self.depth_final_norm(x)
+        
+        logits = torch.einsum("bld,vd->blv", hidden_states, self.depth_emb.weight)
+        logits = logits / (self.depth_cfg.d_model ** 0.5)
+        
+        return logits, hidden_states
 
     def train_forward(self, input, target):
-        temporal_tokens = self.temporal_forward(input)  
-        mid_tokens = self.mid_proj(temporal_tokens)  
-        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")  
+        temporal = self.temporal_forward(input)
+        mid = self.mid_proj(temporal)
+        mid = rearrange(mid, "b l d -> (b l) 1 d")
 
-        target = rearrange(target, "b l k -> (b l) k")  
+        target = rearrange(target, "b l k -> (b l) k")
         keep = target[:, 0] != -100
 
-        mid_tokens = mid_tokens[keep]
+        mid = mid[keep]
         target = target[keep]
 
-        dec_embs_orig = self.depth_emb(target[:, :-1])
-        K_minus_1 = dec_embs_orig.shape[1]
+        dec = self.depth_emb(target[:, :-1])
+        K = dec.shape[1]
 
-        if K_minus_1 > 0:
-            raw_res_list = []
-            for i in range(K_minus_1):
-                quantizer = self.cosette.model.rq.vq_layers[i]
-                layer_indices = target[:, i]
+        if K > 0:
+            res = []
+            for i in range(K):
+                q = self.cosette.model.rq.vq_layers[i]
+                idx = target[:, i]
 
-                num_embeddings = getattr(quantizer, "n_centroids", 32000)
-                valid_mask = (layer_indices >= 0) & (layer_indices < num_embeddings)
-                safe_indices = torch.where(valid_mask, layer_indices, torch.zeros_like(layer_indices))
+                valid = (idx >= 0) & (idx < getattr(q, "n_centroids", 32000))
+                safe = torch.where(valid, idx, torch.zeros_like(idx))
 
-                x_res = quantizer.get_codebook_entry(safe_indices, shape=None)
-                v_mask = valid_mask.unsqueeze(-1).to(x_res.dtype)
-                raw_res_list.append(x_res * v_mask)
+                x = q.get_codebook_entry(safe, shape=None)
+                res.append(x * valid.unsqueeze(-1).to(x.dtype))
 
-            raw_tensor = torch.stack(raw_res_list, dim=1)
-            continuous_depth_embs = self.depth_proj(raw_tensor)
-            depth_embs = dec_embs_orig + continuous_depth_embs
+            res = torch.stack(res, dim=1)
+            cont = self.depth_proj(res)
             
-            tgt = torch.cat([mid_tokens, depth_embs], dim=1)
+            fused_tgt = self.fuse_norm(dec + cont)
+            tgt = torch.cat([mid, fused_tgt], dim=1)
         else:
-            tgt = mid_tokens
+            tgt = mid
 
-        depth_logits = self.depth_forward(tgt)  
-        return depth_logits, target
+        logits, hidden_states = self.depth_forward(tgt)
+        return logits, hidden_states, mid, target
 
     def get_loss(self, batch):
-        input, target = batch["input"], batch["target"]
-        logits, m_target = self.train_forward(input, target)
+        inp, tgt = batch["input"], batch["target"]
+        logits, hidden_states, mid_queries, tgt = self.train_forward(inp, tgt)
         
-        logits = rearrange(logits, "B k v -> B v k")
+        logits_rearranged = rearrange(logits, "b l v -> b v l")
+        ce_loss = self.criterion(logits_rearranged, tgt)
         
-        # CRASH FIX: Removed the [:, :, 1:] slice. 
-        # Both logits and m_target are exactly length K now.
-        loss = self.criterion(logits, m_target)  
-        return loss, logits
+        total_loss = ce_loss
+
+        if self.contrastive_weight > 0.0:
+            seq_embeddings = hidden_states[:, -1, :]
+            query_embeddings = mid_queries.squeeze(1)
+            
+            # RESEARCH FIX 1: Strict Gradient Isolation via .detach()
+            # The generation block is completely isolated from the contrastive objective gradient.
+            seq_embeddings_isolated = seq_embeddings.detach()
+            
+            # RESEARCH FIX 2: Bounding Representation Magnitudes via explicit LayerNorms
+            # This completely avoids the overconfident Softmax Bottleneck in the generation head.
+            query_normed = self.query_norm_layer(query_embeddings)
+            seq_normed = self.seq_norm_layer(seq_embeddings_isolated)
+            
+            query_projected = self.query_contrastive_head(query_normed)
+            seq_projected = self.seq_contrastive_head(seq_normed)
+            
+            query_final = F.normalize(query_projected, p=2, dim=-1)
+            seq_final = F.normalize(seq_projected, p=2, dim=-1)
+            
+            similarity_matrix = torch.matmul(seq_final, query_final.T) / self.contrastive_temperature
+            contrastive_targets = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
+            contrastive_loss = F.cross_entropy(similarity_matrix, contrastive_targets)
+            
+            total_loss = total_loss + (self.contrastive_weight * contrastive_loss)
+
+        return total_loss, logits
+
+    # =========================================================
+    # SEARCH
+    # =========================================================
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
@@ -209,15 +379,15 @@ class MARIUS(torch.nn.Module):
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        temporal_tokens = self.temporal_forward(input)  
-        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]  
+        temporal = self.temporal_forward(input)  
+        mid = self.mid_proj(temporal)[:, -1, :]  
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
-        sequences = mid_tokens[:, None, :]  
-        
-        depth_logits = self.depth_forward(sequences)  
-        log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  
+        sequences = mid[:, None, :]  
+
+        logits, _ = self.depth_forward(sequences)  
+        log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  
 
         topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  
 
@@ -227,22 +397,24 @@ class MARIUS(torch.nn.Module):
 
         discrete_new = self.depth_emb(topk_indices)
 
-        quantizer = self.cosette.model.rq.vq_layers[0]
-        num_embeddings = getattr(quantizer, "n_centroids", 32000)
+        q = self.cosette.model.rq.vq_layers[0]
+        num_embeddings = getattr(q, "n_centroids", 32000)
         valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
         safe_indices = torch.where(valid_mask, topk_indices, torch.zeros_like(topk_indices))
 
-        raw_new_tokens = quantizer.get_codebook_entry(safe_indices, shape=None)
+        raw_new_tokens = q.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
-        
-        fused_new = discrete_new + (continuous_new * v_mask)
-        sequences = torch.concat([sequences, fused_new.unsqueeze(2)], dim=2)  
+
+        fused_new = self.fuse_norm(discrete_new + (continuous_new * v_mask))
+        sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            last_logits = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
+            logits, _ = self.depth_forward(sequences.view(B * b, i, D))
+            last_logits = logits[:, -1, :]
+            
             log_probs = F.log_softmax(last_logits, dim=-1)  
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
@@ -254,7 +426,7 @@ class MARIUS(torch.nn.Module):
             expanded_indices = torch.cat([expanded_indices, topk_indices.unsqueeze(-1)], dim=3)
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
-            
+
             flat_topk = topk_indices.view(-1)
             flat_discrete = self.depth_emb(flat_topk)
 
@@ -266,15 +438,15 @@ class MARIUS(torch.nn.Module):
             flat_decoded = quantizer.get_codebook_entry(safe_indices, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
-            
-            flat_fused = flat_discrete + (flat_projected * flat_valid)
+
+            flat_fused = self.fuse_norm(flat_discrete + (flat_projected * flat_valid))
             next_tokens = flat_fused.view(B, b, b, 1, D)
-            
+
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
             expanded_scores = expanded_scores.view(B, -1)
-            
+
             expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
@@ -286,7 +458,7 @@ class MARIUS(torch.nn.Module):
 
         if self.filter_preds:
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
-            is_in_query = is_in_query.all(dim=-1).any(dim=-1)  
+            is_in_query = is_in_query.all(dim=-1).any(dim=-1)
             scores[is_in_query] = -torch.inf
             topk_scores, topk_indices = torch.topk(scores, keep_final, dim=-1)
             indices = indices[arranged, topk_indices]

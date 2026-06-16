@@ -2,7 +2,7 @@
 #SBATCH --job-name=run_test
 #SBATCH --output=scripts/slurm/run_test_%j.log
 #SBATCH --error=scripts/slurm/run_test_%j.err
-#SBATCH --time=2:00:00
+#SBATCH --time=5:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -15,14 +15,35 @@ module load Anaconda3/2025.06-1
 source activate recsys
 
 export PYTHONPATH=$PWD:$PYTHONPATH
+export HYDRA_FULL_ERROR=1
 export WANDB_MODE=offline
 
-# Set to the run directory you want to test
-RUN_DIRECTORY="MARIUS_small_260611_144729"
+MARIUS_BASE_DIR="outputs/checkpoints/marius"
 
-# Set to true for debug mode (one forward pass, no full metrics)
-DEBUG=false
+# Set to a specific run directory to test just one, or leave empty to loop all
+RUN_DIRECTORY=""
 
-python src/run_test.py \
-    run_directory=${RUN_DIRECTORY} \
-    debug=${DEBUG}
+run_test() {
+    local RUN_DIR=$1
+    echo "========================================"
+    echo ">>> Testing: ${RUN_DIR}"
+    echo "========================================"
+
+    python src/test.py run_directory=${RUN_DIR}
+
+    if [ $? -ne 0 ]; then
+        echo "[WARNING] Failed for ${RUN_DIR}, continuing..."
+    fi
+}
+
+if [ -n "${RUN_DIRECTORY}" ]; then
+    # Single checkpoint mode
+    run_test ${RUN_DIRECTORY}
+else
+    # Loop through all checkpoints
+    for RUN_DIR in ${MARIUS_BASE_DIR}/*/; do
+        run_test $(basename ${RUN_DIR%/})
+    done
+fi
+
+echo "All runs complete."

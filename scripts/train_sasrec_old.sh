@@ -22,9 +22,7 @@ CATEGORIES=("Toys_and_Games" "Movies_and_TV" "Video_Games")
 N_RUNS=5
 EXPERIMENT="sasrec"
 TASKNAME="SASRec"
-SASREC_BASE_DIR="outputs/checkpoints/sasrec"
-
-mkdir -p "${MARIUS_BASE_DIR}/${TASKNAME}"
+MARIUS_BASE_DIR="outputs/checkpoints/marius"
 
 for CATEGORY in "${CATEGORIES[@]}"; do
     echo "========================================"
@@ -41,15 +39,11 @@ for CATEGORY in "${CATEGORIES[@]}"; do
             data.datasets.category=${CATEGORY}
 
         # Step 2: Resolve latest SASRec run directory
-        LATEST_RUN=$(ls -1d "${SASREC_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
-
+        LATEST_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
         if [ -z "$LATEST_RUN" ]; then
-            echo "Warning: No SASRec run found, creating fallback directory"
-
-            mkdir -p "${SASREC_BASE_DIR}/${TASKNAME}_fallback"
-            LATEST_RUN="${SASREC_BASE_DIR}/${TASKNAME}_fallback"
+            echo "Error: No SASRec run found in ${MARIUS_BASE_DIR}"
+            exit 1
         fi
-
         RUN=$(basename "${LATEST_RUN%/}")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Evaluating run_directory=${RUN}"
 
