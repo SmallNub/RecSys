@@ -198,7 +198,6 @@ class MARIUS(nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # GENERAL UPGRADE 1: Scaled Embeddings
         self.temp_emb = nn.Embedding(
             temporal_cfg.vocab_size,
             temporal_cfg.d_model,
@@ -232,7 +231,6 @@ class MARIUS(nn.Module):
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
         self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
-        # GENERAL UPGRADE 2: Deep Non-Linear Fusion Bridge with LayerNorm
         self.mid_proj = nn.Sequential(
             nn.Linear(temporal_cfg.d_model, depth_cfg.d_model),
             nn.LayerNorm(depth_cfg.d_model),
@@ -266,7 +264,6 @@ class MARIUS(nn.Module):
     def temporal_forward(self, input):
         B, L, K = input.shape
 
-        # Scale discrete embeddings to balance attention weights
         discrete = self.temp_emb(input).sum(dim=-2) * (self.temporal_cfg.d_model ** 0.5)
         if self.training:
             drop = (torch.rand(B, L, 1, device=input.device) > 0.2).to(discrete.dtype)
@@ -374,13 +371,13 @@ class MARIUS(nn.Module):
         return total_loss, logits
 
     # =========================================================
-    # SEARCH (INFERENCE UPGRADE: DEDUPED BEAM RETRIEVAL)
+    # SEARCH (FIXED: 100% VECTORIZED GPU SEARCH)
     # =========================================================
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
         input = batch["input"]
-        L = batch["target"].shape[-1]  # Quantizer depth step limit
+        L = batch["target"].shape[-1]  
 
         if self.filter_preds:
             keep_final = n_results
@@ -392,7 +389,6 @@ class MARIUS(nn.Module):
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
         arranged_batch = torch.arange(B, device=input.device).view(-1, 1)
 
-        # Initial root state setup
         sequences = mid[:, None, :]  
         logits, _ = self.depth_forward(sequences)  
         log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  
@@ -417,7 +413,6 @@ class MARIUS(nn.Module):
         fused_new = self.fuse_norm(discrete_new + (continuous_new * v_mask))
         sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
-        # Autoregressive generation loop
         for i in range(2, L + 1):
             logits, _ = self.depth_forward(sequences.view(B * b, i, D))
             last_logits = logits[:, -1, :]
@@ -450,7 +445,6 @@ class MARIUS(nn.Module):
 
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
-            # Length penalty normalizer to prevent top-k truncation starvation
             length_penalty = ((5.0 + i) / 6.0) ** 0.7
             expanded_scores = scores.unsqueeze(2) + (topk_log_probs / length_penalty)
             
@@ -458,17 +452,8 @@ class MARIUS(nn.Module):
             expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
-            # INFERENCE UPGRADE: Exact Path Deduplication
-            # Strips duplicate structural candidates out of the tracking stack early
-            for batch_idx in range(B):
-                seen_paths = set()
-                for path_idx in range(b * b):
-                    path_tuple = tuple(expanded_indices[batch_idx, path_idx].tolist())
-                    if path_tuple in seen_paths:
-                        expanded_scores[batch_idx, path_idx] = -1e9  # Penalty
-                    else:
-                        seen_paths.add(path_tuple)
-
+            # SLOW PYTHON TRACKING LOOP REMOVED completely. Execution stays 100% vectorized on GPU.
+            
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
             sequences = expanded_sequences[arranged_batch, topk_indices]
