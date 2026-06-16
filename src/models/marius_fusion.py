@@ -175,8 +175,8 @@ class MARIUS(nn.Module):
         tie_embeddings=False,
         filter_preds=False,
         label_smoothing=0.1,
-        contrastive_weight=0.2,
-        entropy_weight=0.01,
+        contrastive_weight=0.05,       # Calibrated down to prevent sequence-level overfitting
+        entropy_weight=0.001,          # Calibrated down to protect fine-grained distribution shifts
         contrastive_temperature=0.07,
     ):
         super().__init__()
@@ -332,7 +332,9 @@ class MARIUS(nn.Module):
                 total_loss = total_loss - (self.entropy_weight * mean_entropy)
 
         if self.contrastive_weight > 0.0:
-            seq_embeddings = hidden_states.mean(dim=1)
+            # FIX: Pull only the final token's hidden state summary vector instead of mean-pooling
+            # This protects the intermediate sequence positions from structural representation collapse
+            seq_embeddings = hidden_states[:, -1, :]
             query_embeddings = mid_queries.squeeze(1)
             
             seq_norm = F.normalize(seq_embeddings, p=2, dim=-1)
@@ -392,7 +394,7 @@ class MARIUS(nn.Module):
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            # FIX: Unpack the returned tuple from depth_forward first, then slice the logits tensor
+            # FIXED: Properly unpack returning tuple before multidimensional indexing
             logits, _ = self.depth_forward(sequences.view(B * b, i, D))
             last_logits = logits[:, -1, :]
             
