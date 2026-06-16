@@ -9,8 +9,8 @@ model:
     n_layers: 2
     d_head: 64
     d_model: 512
-    dropout: 0.5
-    emb_dropout: 0.5
+    dropout: 0.4
+    emb_dropout: 0.4
     seq_len: ${data.datasets.prepro_cfg.crop_length}
     filter_preds: true # Better evaluation of "true" validation metrics, but slower
     normalization: l2
@@ -20,8 +20,10 @@ model:
       n_items: 30000
   mode: "dense"
   optimizer: 
-    lr: 0.001
-    weight_decay: 0.0001
+    _target_: torch.optim.Adam
+    _partial_: true
+    lr: 0.0005
+    weight_decay: 0.0
   scheduler: 
     warmup_steps: 2000
 

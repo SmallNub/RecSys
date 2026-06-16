@@ -56,6 +56,17 @@ def main(cfg: DictConfig) -> Optional[float]:
     log.info("Instantiating datasets")
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
+    # Dynamic vocab size override for models that specify a vocab_size (e.g. SASRec)
+    from src.models import SpecialTokens
+    first_ds = next(iter(datasets.values())) if datasets else None
+    if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
+        vocab_size = len(first_ds.pp.item_to_id) + len(SpecialTokens)
+        log.info(f"Detected actual vocab size from dataset: {vocab_size}")
+        if "model" in cfg and "net" in cfg.model and "vocab_size" in cfg.model.net:
+            cfg.model.net.vocab_size = vocab_size
+            log.info(f"Overrode model.net.vocab_size to {vocab_size}")
+
+
     log.info("Instantiating datamodule")
     datamodule: L.LightningDataModule = hydra.utils.instantiate(cfg.data.datamodule, datasets=datasets)
 
