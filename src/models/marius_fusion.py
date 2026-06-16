@@ -174,9 +174,9 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.1,         # Stabilize distributions slightly at baseline
-        contrastive_weight=0.2,       # Sequence-level metric alignment weight
-        entropy_weight=0.01,         # Overconfidence mitigation penalty weight
+        label_smoothing=0.1,
+        contrastive_weight=0.2,
+        entropy_weight=0.01,
         contrastive_temperature=0.07,
     ):
         super().__init__()
@@ -317,41 +317,28 @@ class MARIUS(nn.Module):
         inp, tgt = batch["input"], batch["target"]
         logits, hidden_states, mid_queries, tgt = self.train_forward(inp, tgt)
         
-        # 1. Core Token-level Cross-Entropy Loss
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, tgt)
         
         total_loss = ce_loss
 
-        # 2. Regularization to Combat Overconfidence (Entropy Maximization Penalty)
         if self.entropy_weight > 0.0:
-            # Filter padded/ignored tokens out of entropy computation
-            valid_mask = (tgt != -100) # [B_f, K]
+            valid_mask = (tgt != -100)
             if valid_mask.any():
                 log_probs = F.log_softmax(logits, dim=-1)
                 probs = torch.exp(log_probs)
-                
-                # Compute token shannon entropy: -sum(p * log_p)
-                token_entropy = -torch.sum(probs * log_probs, dim=-1) # [B_f, K]
+                token_entropy = -torch.sum(probs * log_probs, dim=-1)
                 mean_entropy = token_entropy[valid_mask].mean()
-                
-                # We subtract entropy because we want to maximize it (preventing collapse to 0)
                 total_loss = total_loss - (self.entropy_weight * mean_entropy)
 
-        # 3. Hidden-State Sequence Contrastive Optimization (Align Loss with Listwise Metrics)
         if self.contrastive_weight > 0.0:
-            # Mean-pool depth sequence representations to form singular item embeddings
-            seq_embeddings = hidden_states.mean(dim=1) # [N, D]
-            query_embeddings = mid_queries.squeeze(1) # [N, D]
+            seq_embeddings = hidden_states.mean(dim=1)
+            query_embeddings = mid_queries.squeeze(1)
             
-            # Normalize embeddings to calculate cosine similarities cleanly
             seq_norm = F.normalize(seq_embeddings, p=2, dim=-1)
             query_norm = F.normalize(query_embeddings, p=2, dim=-1)
             
-            # Compute similarity matrix [N, N]
             similarity_matrix = torch.matmul(seq_norm, query_norm.T) / self.contrastive_temperature
-            
-            # Targets are the identity mappings (sequence i matches query i)
             contrastive_targets = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
             contrastive_loss = F.cross_entropy(similarity_matrix, contrastive_targets)
             
@@ -405,7 +392,10 @@ class MARIUS(nn.Module):
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
 
         for i in range(2, L + 1):
-            last_logits, _ = self.depth_forward(sequences.view(B * b, i, D))[:, -1, :]
+            # FIX: Unpack the returned tuple from depth_forward first, then slice the logits tensor
+            logits, _ = self.depth_forward(sequences.view(B * b, i, D))
+            last_logits = logits[:, -1, :]
+            
             log_probs = F.log_softmax(last_logits, dim=-1)  
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
