@@ -120,12 +120,12 @@ class Trainer(object):
         self.model.train()
 
         # Dynamic Curvature Annealing Calculations
-        anneal_period = max(1, int(self.epochs * 0.10))
-        if epoch_idx < anneal_period:
-            c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
-        else:
-            c = 1.0
-
+        # anneal_period = max(1, int(self.epochs * 0.10))
+        # if epoch_idx < anneal_period:
+        #     c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
+        # else:
+        #     c = 1.0
+        c = 1.0
         total_loss = 0
         
         model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"

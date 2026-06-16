@@ -1,12 +1,22 @@
+# @package _global_
+
 optim: 
-  lr: 5e-4
-
-model: 
-  type: hyperbolic 
-
-loss: 
-  tau: 1.0 
-  bias: 5.0 
+  lr: 5e-4   
+  epochs: 800 # 192 steps/epochs on Arts -> 3125 epochs = 600k steps, adapt to category.
 
 centroids: 
-  sk_epsilons: [0., 0., 0., 0.01]
+  kmeans_init: false    
+
+model: 
+  type: hyperbolic
+  c: 1.0
+
+loss: 
+  reconstruction_weight: 1.0
+  quantization_weight: 1.0
+  contrastive_weight: 0.001
+  tau: 2 
+  bias: -8
+  freeze_tau: false 
+  freeze_bias: false
+  sequence_length: 20
