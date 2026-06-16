@@ -174,7 +174,7 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.0,  # CRITICAL: Disabled to protect structured RQ hierarchy
+        label_smoothing=0.0,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -219,9 +219,11 @@ class MARIUS(nn.Module):
             DepthBlock(depth_cfg.d_model, depth_cfg.d_head) for _ in range(depth_cfg.n_layers)
         ])
 
-        # CRITICAL FIX: Final Layer Normalizations to stabilize Pre-LN scaling bounds
         self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
+
+        # FIX 1: Enforce variance boundaries on the dual-stream fused embeddings
+        self.fuse_norm = nn.LayerNorm(depth_cfg.d_model)
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
@@ -251,7 +253,7 @@ class MARIUS(nn.Module):
         for blk in self.temp_tf:
             x = blk(x, attn_mask=combined_mask, is_causal=False)
 
-        return self.temp_final_norm(x)  # Normalized output prevents scaling drift
+        return self.temp_final_norm(x)
 
     def depth_forward(self, tgt):
         seq_len = tgt.shape[1]
@@ -263,8 +265,11 @@ class MARIUS(nn.Module):
         for blk in self.depth_tf:
             x = blk(x, attn_mask=None, is_causal=True)
 
-        x = self.depth_final_norm(x)  # Restores bounded variances to the final hidden states
-        return torch.einsum("bld,vd->blv", x, self.depth_emb.weight)
+        x = self.depth_final_norm(x)
+        
+        # FIX 2: Apply scale scaling to stop unregularized logit-scale explosion
+        logits = torch.einsum("bld,vd->blv", x, self.depth_emb.weight)
+        return logits / (self.depth_cfg.d_model ** 0.5)
 
     def train_forward(self, input, target):
         temporal = self.temporal_forward(input)
@@ -294,7 +299,10 @@ class MARIUS(nn.Module):
 
             res = torch.stack(res, dim=1)
             cont = self.depth_proj(res)
-            tgt = torch.cat([mid, dec + cont], dim=1)
+            
+            # Apply fusion norm over combined representation
+            fused_tgt = self.fuse_norm(dec + cont)
+            tgt = torch.cat([mid, fused_tgt], dim=1)
         else:
             tgt = mid
 
@@ -347,7 +355,8 @@ class MARIUS(nn.Module):
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
 
-        fused_new = discrete_new + (continuous_new * v_mask)
+        # Apply fusion norm here to preserve structural matching consistency
+        fused_new = self.fuse_norm(discrete_new + (continuous_new * v_mask))
         sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)  
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)
@@ -378,7 +387,8 @@ class MARIUS(nn.Module):
             flat_projected = self.depth_proj(flat_decoded)
             flat_valid = valid_mask.unsqueeze(-1).to(flat_projected.dtype)
 
-            flat_fused = flat_discrete + (flat_projected * flat_valid)
+            # Apply fusion norm to subsequent generated prefixes
+            flat_fused = self.fuse_norm(flat_discrete + (flat_projected * flat_valid))
             next_tokens = flat_fused.view(B, b, b, 1, D)
 
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
