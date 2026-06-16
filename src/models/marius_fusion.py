@@ -131,11 +131,10 @@ class SwiGLU(nn.Module):
 
 
 # =========================================================
-# Transformer Blocks (Separated Normalization Strategies)
+# Transformer Blocks
 # =========================================================
 
 class TemporalBlock(nn.Module):
-    """Temporal sequence uses RMSNorm + RoPE for smooth semantic progression."""
     def __init__(self, d_model, d_head):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
@@ -150,7 +149,6 @@ class TemporalBlock(nn.Module):
 
 
 class DepthBlock(nn.Module):
-    """Hierarchical Depth uses LayerNorm to retain absolute preference baselines."""
     def __init__(self, d_model, d_head):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -176,7 +174,7 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.1,
+        label_smoothing=0.0,  # CRITICAL: Disabled to protect structured RQ hierarchy
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -204,7 +202,6 @@ class MARIUS(nn.Module):
             padding_idx=SpecialTokens.PAD.value,
         )
 
-        # Learned Absolute Position Embeddings for Depth Hierarchy
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
         self.temp_proj = nn.Linear(cosette.model.centroids_dim, temporal_cfg.d_model, bias=False)
@@ -213,7 +210,7 @@ class MARIUS(nn.Module):
         self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
         self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
 
-        # Specialized Transformer Stacks
+        # Transformer Stacks
         self.temp_tf = nn.ModuleList([
             TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head) for _ in range(temporal_cfg.n_layers)
         ])
@@ -222,12 +219,16 @@ class MARIUS(nn.Module):
             DepthBlock(depth_cfg.d_model, depth_cfg.d_head) for _ in range(depth_cfg.n_layers)
         ])
 
+        # CRITICAL FIX: Final Layer Normalizations to stabilize Pre-LN scaling bounds
+        self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
+        self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
+
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n
+            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n or "norm" in n
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -250,19 +251,19 @@ class MARIUS(nn.Module):
         for blk in self.temp_tf:
             x = blk(x, attn_mask=combined_mask, is_causal=False)
 
-        return x
+        return self.temp_final_norm(x)  # Normalized output prevents scaling drift
 
     def depth_forward(self, tgt):
-        # Inject learned hierarchical absolute positioning injection before block forwards
         seq_len = tgt.shape[1]
         positions = torch.arange(seq_len, device=tgt.device)
-        pos_embeddings = self.depth_pos_emb(positions).unsqueeze(0)  # (1, seq_len, d_model)
+        pos_embeddings = self.depth_pos_emb(positions).unsqueeze(0)
         
         x = self.dropout_d(tgt + pos_embeddings)
         
         for blk in self.depth_tf:
             x = blk(x, attn_mask=None, is_causal=True)
 
+        x = self.depth_final_norm(x)  # Restores bounded variances to the final hidden states
         return torch.einsum("bld,vd->blv", x, self.depth_emb.weight)
 
     def train_forward(self, input, target):
@@ -307,7 +308,7 @@ class MARIUS(nn.Module):
         return self.criterion(logits, tgt), logits
 
     # =========================================================
-    # SEARCH (Kept completely unaltered in logical execution flow)
+    # SEARCH 
     # =========================================================
 
     def search(self, batch, n_results):
