@@ -24,7 +24,7 @@ class TransformerConfig:
 
 
 # =========================================================
-# RoPE (Fixed Shaping & Cached)
+# RoPE (Temporal Only)
 # =========================================================
 
 class RoPE:
@@ -41,9 +41,7 @@ class RoPE:
         t = torch.arange(seq_len, device=device)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
 
-        # Concatenate freqs to match full head_dim for chunk-based rotate_half
         emb = torch.cat((freqs, freqs), dim=-1)
-
         cos = emb.cos()
         sin = emb.sin()
 
@@ -63,7 +61,7 @@ def apply_rope(x, cos, sin):
 
 
 # =========================================================
-# GQA + SDPA Attention (With Conditional RoPE toggle)
+# GQA + SDPA Attention
 # =========================================================
 
 class Attention(nn.Module):
@@ -133,15 +131,31 @@ class SwiGLU(nn.Module):
 
 
 # =========================================================
-# Transformer Block
+# Transformer Blocks (Separated Normalization Strategies)
 # =========================================================
 
-class Block(nn.Module):
-    def __init__(self, d_model, d_head, use_rope=True):
+class TemporalBlock(nn.Module):
+    """Temporal sequence uses RMSNorm + RoPE for smooth semantic progression."""
+    def __init__(self, d_model, d_head):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
-        self.attn = Attention(d_model, d_head, use_rope=use_rope)
+        self.attn = Attention(d_model, d_head, use_rope=True)
         self.norm2 = nn.RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model)
+
+    def forward(self, x, attn_mask=None, is_causal=False):
+        x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class DepthBlock(nn.Module):
+    """Hierarchical Depth uses LayerNorm to retain absolute preference baselines."""
+    def __init__(self, d_model, d_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = Attention(d_model, d_head, use_rope=False)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ffn = SwiGLU(d_model)
 
     def forward(self, x, attn_mask=None, is_causal=False):
@@ -162,7 +176,7 @@ class MARIUS(nn.Module):
         cosette: CosetteWrapper,
         tie_embeddings=False,
         filter_preds=False,
-        label_smoothing=0.1,  # Added label smoothing parameter
+        label_smoothing=0.1,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -190,31 +204,30 @@ class MARIUS(nn.Module):
             padding_idx=SpecialTokens.PAD.value,
         )
 
+        # Learned Absolute Position Embeddings for Depth Hierarchy
+        self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
+
         self.temp_proj = nn.Linear(cosette.model.centroids_dim, temporal_cfg.d_model, bias=False)
         self.depth_proj = nn.Linear(cosette.model.centroids_dim, depth_cfg.d_model, bias=False)
 
         self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
         self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
 
-        # Transformer Stacks (Temporal retains RoPE, Depth disables RoPE)
+        # Specialized Transformer Stacks
         self.temp_tf = nn.ModuleList([
-            Block(temporal_cfg.d_model, temporal_cfg.d_head, use_rope=True) 
-            for _ in range(temporal_cfg.n_layers)
+            TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head) for _ in range(temporal_cfg.n_layers)
         ])
 
         self.depth_tf = nn.ModuleList([
-            Block(depth_cfg.d_model, depth_cfg.d_head, use_rope=False) 
-            for _ in range(depth_cfg.n_layers)
+            DepthBlock(depth_cfg.d_model, depth_cfg.d_head) for _ in range(depth_cfg.n_layers)
         ])
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        
-        # CrossEntropyLoss configured with label smoothing to stabilize ranking metrics
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n
+            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -240,7 +253,12 @@ class MARIUS(nn.Module):
         return x
 
     def depth_forward(self, tgt):
-        x = self.dropout_d(tgt)
+        # Inject learned hierarchical absolute positioning injection before block forwards
+        seq_len = tgt.shape[1]
+        positions = torch.arange(seq_len, device=tgt.device)
+        pos_embeddings = self.depth_pos_emb(positions).unsqueeze(0)  # (1, seq_len, d_model)
+        
+        x = self.dropout_d(tgt + pos_embeddings)
         
         for blk in self.depth_tf:
             x = blk(x, attn_mask=None, is_causal=True)
@@ -289,7 +307,7 @@ class MARIUS(nn.Module):
         return self.criterion(logits, tgt), logits
 
     # =========================================================
-    # SEARCH
+    # SEARCH (Kept completely unaltered in logical execution flow)
     # =========================================================
 
     def search(self, batch, n_results):
