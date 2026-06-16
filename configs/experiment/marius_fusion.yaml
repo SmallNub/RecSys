@@ -34,7 +34,6 @@ model:
   mode: "generative"
   
   optimizer: 
-    tensor_layout: true
     lr: 0.0005
     weight_decay: 0.01              
   scheduler: 
