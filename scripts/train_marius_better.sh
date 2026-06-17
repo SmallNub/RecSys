@@ -36,8 +36,7 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
 python src/train.py experiment=${EXPERIMENT} \
-    data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col \
-    model.net.cosette.model_path=outputs/checkpoints/cosette/${COSETTE_TIMESTAMP}/last_model.pth
+    data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"
 LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
