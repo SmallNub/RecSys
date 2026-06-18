@@ -73,6 +73,10 @@ class Attention(nn.Module):
         self.qkv_proj = nn.Linear(d_model, self.q_dim + 2 * self.kv_dim, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # SOTA Stabilization: Query-Key Normalization (QK-Norm)
+        self.q_norm = nn.RMSNorm(d_head)
+        self.k_norm = nn.RMSNorm(d_head)
+
         if self.use_rope:
             self.rope = RoPE(d_head)
 
@@ -85,6 +89,10 @@ class Attention(nn.Module):
         q = rearrange(q, "b l (h d) -> b h l d", d=self.d_head)
         k = rearrange(k, "b l (h d) -> b h l d", d=self.d_head)
         v = rearrange(v, "b l (h d) -> b h l d", d=self.d_head)
+
+        # Apply QK-Norm across sequence heads
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         if self.use_rope:
             cos, sin = self.rope.get(L, x.device, x.dtype)
@@ -152,11 +160,10 @@ class MARIUS(nn.Module):
         tie_embeddings=False,
         filter_preds=False,
         top_k=10,
-        truncation_weight=0.3,   # Tuned parameters
-        listwise_weight=0.4,     # Tuned parameters
-        repr_weight=0.3,         # Tuned parameters (compensated for uniformity removal)
-        lambda_num_negatives=64,
-        decay_steps=8000         # Ideal exponential horizon for 40k steps budget
+        truncation_weight=0.25,
+        listwise_weight=0.40,
+        repr_weight=0.35,
+        decay_steps=15000 
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -167,7 +174,6 @@ class MARIUS(nn.Module):
         self.truncation_weight = truncation_weight
         self.listwise_weight = listwise_weight
         self.repr_weight = repr_weight
-        self.lambda_num_negatives = lambda_num_negatives
 
         self.decay_steps = float(decay_steps)
         self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
@@ -191,6 +197,10 @@ class MARIUS(nn.Module):
             padding_idx=SpecialTokens.PAD.value,
         )
 
+        # SOTA Stabilization: Embedding Layer Normalization
+        self.temp_emb_ln = nn.LayerNorm(temporal_cfg.d_model)
+        self.depth_emb_ln = nn.LayerNorm(depth_cfg.d_model)
+
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
         self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
@@ -212,6 +222,10 @@ class MARIUS(nn.Module):
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         
+        # SOTA Learned Scaling Parameters for Structural Metrics
+        self.listwise_temp = nn.Parameter(torch.tensor(0.0)) # Log temperature space
+        self.repr_temp = nn.Parameter(torch.tensor(0.0))
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -236,7 +250,7 @@ class MARIUS(nn.Module):
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n or "norm" in n
+            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n or "norm" in n or "temp" in n
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -245,6 +259,7 @@ class MARIUS(nn.Module):
         B, L, K = input.shape
 
         discrete = self.temp_emb(input).sum(dim=-2)
+        discrete = self.temp_emb_ln(discrete)
         x = self.dropout_t(discrete)
 
         valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)
@@ -282,7 +297,9 @@ class MARIUS(nn.Module):
 
         safe_target = target[:, :-1].clone()
         safe_target[safe_target == -100] = SpecialTokens.PAD.value
+        
         dec = self.depth_emb(safe_target)
+        dec = self.depth_emb_ln(dec)
         K = dec.shape[1]
 
         if K > 0:
@@ -294,7 +311,7 @@ class MARIUS(nn.Module):
         return logits, hidden_states, mid, target
 
     # =========================================================================
-    # METRIC-MISMATCH PARADIGMS
+    # SOTA STRUCTURAL LOSS METRICS
     # =========================================================================
 
     def compute_softmax_loss_at_k(self, logits, targets, k=10):
@@ -315,7 +332,11 @@ class MARIUS(nn.Module):
         denom = torch.log(torch.exp(shifted_pos) + torch.exp(shifted_topk).sum(dim=-1) + 1e-8) + max_scores
         return torch.mean(denom - pos_scores)
 
-    def compute_lambda_ndcg_loss(self, logits, targets, num_negatives=64):
+    def compute_plackett_luce_loss(self, logits, targets):
+        """
+        SOTA Listwise Alternative: Plackett-Luce top-k permutation modeling.
+        Replaces noisy continuous rank proxies with real probabilistic ordering constraints.
+        """
         mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
         if not mask.any():
             return torch.tensor(0.0, device=logits.device)
@@ -323,20 +344,29 @@ class MARIUS(nn.Module):
         flat_logits = logits[mask]
         flat_targets = targets[mask]
 
+        # Gather targets alongside dynamic in-batch negatives to establish ranking horizons
         pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1))
-        top_neg_scores, _ = torch.topk(flat_logits, k=num_negatives + 1, dim=-1)
+        topk_neg, _ = torch.topk(flat_logits, k=32, dim=-1)
         
-        slate_scores = torch.cat([pos_scores, top_neg_scores], dim=-1)
-        diffs = slate_scores.unsqueeze(-1) - slate_scores.unsqueeze(-2)
-        soft_ranks = 1.0 + torch.sigmoid(diffs / 0.1).sum(dim=-1)
-        
-        pos_soft_rank = soft_ranks[:, 0]
-        soft_dcg = 1.0 / torch.log2(pos_soft_rank + 1.0)
-        return torch.mean(1.0 - soft_dcg)
+        slate = torch.cat([pos_scores, topk_neg], dim=-1)
+        t = torch.exp(self.listwise_temp).clamp(min=1e-3, max=5.0)
+        scaled_slate = slate / t
 
-    def compute_alignment_loss(self, hidden_states, targets):
+        # Iteratively calculate progressive sequence extraction steps
+        log_prob = 0.0
+        for i in range(min(5, scaled_slate.shape[-1])):
+            remainder = scaled_slate[:, i:]
+            max_val = torch.max(remainder, dim=-1, keepdim=True)[0]
+            norm_rem = remainder - max_val
+            denom = torch.log(torch.exp(norm_rem).sum(dim=-1) + 1e-8) + max_val.squeeze(-1)
+            log_prob += scaled_slate[:, i] - denom
+
+        return torch.mean(-log_prob)
+
+    def compute_infonce_loss(self, hidden_states, targets):
         """
-        Calculates pure representation alignment loss (Uniformity constraints removed).
+        SOTA Unified Representation: Temperature-Scaled InfoNCE.
+        Simultaneously maximizes positive alignment and pushes items uniformly across the hypersphere.
         """
         mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
         if not mask.any():
@@ -346,23 +376,29 @@ class MARIUS(nn.Module):
         flat_targets = targets[mask]
 
         pos_emb = self.depth_emb(flat_targets)
+        
         flat_h_norm = F.normalize(flat_h, p=2, dim=-1)
         pos_emb_norm = F.normalize(pos_emb, p=2, dim=-1)
 
-        alignment_loss = torch.mean((flat_h_norm - pos_emb_norm).pow(2).sum(dim=-1))
-        return alignment_loss
+        # In-batch positive cosine correlations matrix
+        similarity_matrix = torch.matmul(flat_h_norm, pos_emb_norm.T)
+        
+        t = torch.exp(self.repr_temp).clamp(min=1e-2, max=1.0)
+        logits = similarity_matrix / t
+        
+        labels = torch.arange(logits.shape[0], device=hidden_states.device)
+        return F.cross_entropy(logits, labels)
 
     # =========================================================================
 
     def get_loss(self, batch):
-        """
-        Calculates unified loss under an optimized exponential curriculum layout.
-        """
         inp, tgt = batch["input"], batch["target"]
         
         if self.training:
             self.current_step += 1
-            w_ce = math.exp(-self.current_step.item() / self.decay_steps)
+            # Cosine-annealed training curriculum with a 15% floor to maintain vocabulary alignment
+            progress = min(1.0, self.current_step.item() / self.decay_steps)
+            w_ce = 0.15 + 0.85 * (0.5 * (1.0 + math.cos(math.pi * progress)))
             w_structural = 1.0 - w_ce
         else:
             w_ce = 0.0
@@ -371,14 +407,12 @@ class MARIUS(nn.Module):
         temporal = self.temporal_forward(inp)
         logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
         
-        # Pointwise optimization anchor
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
         
-        # Structural structural target losses
         trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
-        listwise_loss = self.compute_lambda_ndcg_loss(logits, target_rearranged, num_negatives=self.lambda_num_negatives)
-        repr_loss = self.compute_alignment_loss(hidden_states, target_rearranged)
+        listwise_loss = self.compute_plackett_luce_loss(logits, target_rearranged)
+        repr_loss = self.compute_infonce_loss(hidden_states, target_rearranged)
         
         rec_loss = (w_ce * ce_loss) + w_structural * (
             self.truncation_weight * trunc_loss + 
@@ -413,6 +447,7 @@ class MARIUS(nn.Module):
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
 
         discrete_new = self.depth_emb(topk_indices)
+        discrete_new = self.depth_emb_ln(discrete_new)
         sequences = torch.cat([sequences, discrete_new.unsqueeze(2)], dim=2)
 
         for i in range(2, L + 1):
@@ -432,6 +467,7 @@ class MARIUS(nn.Module):
 
             flat_topk = topk_indices.view(-1)
             flat_discrete = self.depth_emb(flat_topk)
+            flat_discrete = self.depth_emb_ln(flat_discrete)
             next_tokens = flat_discrete.view(B, b, b, 1, D)
 
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
