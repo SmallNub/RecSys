@@ -31,7 +31,6 @@ class RoPE(nn.Module):
         if key in self._cache:
             return self._cache[key]
 
-        # SMALL IMPROVEMENT: Clear cache if switching devices to prevent GPU memory leaks
         if len(self._cache) > 16:
             self._cache.clear()
 
@@ -71,7 +70,6 @@ class Attention(nn.Module):
         self.q_dim = self.n_heads * d_head
         self.kv_dim = self.n_kv_heads * d_head
         
-        # OPTIMIZATION: Fused QKV layer
         self.qkv_proj = nn.Linear(d_model, self.q_dim + 2 * self.kv_dim, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
@@ -110,7 +108,6 @@ class SwiGLU(nn.Module):
         hidden_dim = 4 * d_model * 2 // 3
         hidden_dim = ((hidden_dim + 7) // 8) * 8
         
-        # OPTIMIZATION: Fused SwiGLU projection
         self.w12 = nn.Linear(d_model, 2 * hidden_dim, bias=False)
         self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
 
@@ -157,6 +154,13 @@ class MARIUS(nn.Module):
         ssl_weight=0.1,
         ssl_mask_prob=0.2,
         ssl_temperature=0.07,
+        top_k=10,
+        truncation_weight=0.4,
+        listwise_weight=0.4,
+        repr_weight=0.2,
+        lambda_num_negatives=64,
+        # Exponential time-scale instead of absolute total steps boundary
+        decay_steps=10000
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -165,6 +169,16 @@ class MARIUS(nn.Module):
         self.ssl_weight = ssl_weight
         self.ssl_mask_prob = ssl_mask_prob
         self.ssl_temperature = ssl_temperature
+        
+        self.top_k = top_k
+        self.truncation_weight = truncation_weight
+        self.listwise_weight = listwise_weight
+        self.repr_weight = repr_weight
+        self.lambda_num_negatives = lambda_num_negatives
+
+        # Internal tracking state setup
+        self.decay_steps = float(decay_steps)
+        self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
@@ -205,24 +219,17 @@ class MARIUS(nn.Module):
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
-        # SMALL IMPROVEMENT: Automatically apply professional transformer weight initialization
+        
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        """
-        SMALL IMPROVEMENT: Fixed scaling initialization for Deep Residual Transformers.
-        Prevents variance explosion in early stages of training.
-        """
         if isinstance(module, nn.Linear):
-            # Standard initialization for input mappings
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             
-        # Scale output projections by number of total layers to stabilize residual stream updates
         for block in self.temp_tf:
             if hasattr(block.attn, 'o_proj'):
                 torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers))
@@ -272,10 +279,6 @@ class MARIUS(nn.Module):
         return logits, hidden_states
 
     def train_forward_fused(self, temporal, target):
-        """
-        OPTIMIZATION: Accepts a precomputed temporal representation 
-        to seamlessly allow single-pass batched computation pipelines.
-        """
         mid = self.mid_proj(temporal)
         mid = rearrange(mid, "b l d -> (b l) 1 d")
 
@@ -317,38 +320,138 @@ class MARIUS(nn.Module):
         loss_view2 = F.cross_entropy(similarity_matrix.T, labels)
         return (loss_view1 + loss_view2) / 2.0
 
+    # =========================================================================
+    # METRIC-MISMATCH PARADIGMS
+    # =========================================================================
+
+    def compute_softmax_loss_at_k(self, logits, targets, k=10):
+        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
+        if not mask.any():
+            return torch.tensor(0.0, device=logits.device)
+
+        flat_logits = logits[mask]
+        flat_targets = targets[mask]
+
+        pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1)).squeeze(-1)
+        topk_scores, _ = torch.topk(flat_logits, k=k, dim=-1)
+        
+        max_scores = torch.max(topk_scores, dim=-1)[0]
+        shifted_topk = topk_scores - max_scores.unsqueeze(-1)
+        shifted_pos = pos_scores - max_scores
+
+        denom = torch.log(torch.exp(shifted_pos) + torch.exp(shifted_topk).sum(dim=-1) + 1e-8) + max_scores
+        return torch.mean(denom - pos_scores)
+
+    def compute_lambda_ndcg_loss(self, logits, targets, num_negatives=64):
+        """
+        Calculates Soft Lambda NDCG loss proxy. (Removed unused k parameter signature match)
+        """
+        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
+        if not mask.any():
+            return torch.tensor(0.0, device=logits.device)
+
+        flat_logits = logits[mask]
+        flat_targets = targets[mask]
+
+        pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1))
+        top_neg_scores, _ = torch.topk(flat_logits, k=num_negatives + 1, dim=-1)
+        
+        slate_scores = torch.cat([pos_scores, top_neg_scores], dim=-1)
+        diffs = slate_scores.unsqueeze(-1) - slate_scores.unsqueeze(-2)
+        soft_ranks = 1.0 + torch.sigmoid(diffs / 0.1).sum(dim=-1)
+        
+        pos_soft_rank = soft_ranks[:, 0]
+        soft_dcg = 1.0 / torch.log2(pos_soft_rank + 1.0)
+        return torch.mean(1.0 - soft_dcg)
+
+    def compute_alignment_uniformity_loss(self, hidden_states, targets):
+        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
+        if not mask.any():
+            return torch.tensor(0.0, device=hidden_states.device)
+
+        flat_h = hidden_states[mask]
+        flat_targets = targets[mask]
+
+        pos_emb = self.depth_emb(flat_targets)
+        flat_h_norm = F.normalize(flat_h, p=2, dim=-1)
+        pos_emb_norm = F.normalize(pos_emb, p=2, dim=-1)
+
+        alignment_loss = torch.mean((flat_h_norm - pos_emb_norm).pow(2).sum(dim=-1))
+
+        num_samples = min(256, pos_emb_norm.shape[0])
+        if num_samples > 1:
+            sampled_emb = pos_emb_norm[:num_samples]
+            sq_dist = 2.0 - 2.0 * torch.matmul(sampled_emb, sampled_emb.T)
+            mask_diag = torch.eye(num_samples, device=hidden_states.device).bool()
+            sq_dist = sq_dist[~mask_diag].view(num_samples, -1)
+            uniformity_loss = torch.log(torch.exp(-2.0 * sq_dist).mean() + 1e-8)
+        else:
+            uniformity_loss = torch.tensor(0.0, device=hidden_states.device)
+
+        return alignment_loss + uniformity_loss
+
+    # =========================================================================
+
     def get_loss(self, batch):
+        """
+        Calculates loss using an exponential step decay calculation schedule.
+        """
         inp, tgt = batch["input"], batch["target"]
         
-        # OPTIMIZATION: Check if SSL step is active and compress 3 passes down into 1 fused pass
+        if self.training:
+            self.current_step += 1
+            # Step-boundless decay configuration
+            w_ce = math.exp(-self.current_step.item() / self.decay_steps)
+            w_structural = 1.0 - w_ce
+        else:
+            # Enforce maximum structural execution during evaluation sequences
+            w_ce = 0.0
+            w_structural = 1.0
+        
         if self.training and self.ssl_weight > 0.0:
             aug_inp1 = self._augment_sequence(inp)
             aug_inp2 = self._augment_sequence(inp)
             
-            # Pack all 3 views into a single batch dimension allocation
             fused_inp = torch.cat([inp, aug_inp1, aug_inp2], dim=0)
             fused_temporal_out = self.temporal_forward(fused_inp)
             
-            # Slice the combined matrix back out effortlessly
             B = inp.shape[0]
             temporal, out1, out2 = torch.split(fused_temporal_out, [B, B, B], dim=0)
             
-            # Compute recommendation cross-entropy
-            logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
+            logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
+            
             logits_rearranged = rearrange(logits, "b l v -> b v l")
-            rec_loss = self.criterion(logits_rearranged, target_rearranged)
+            ce_loss = self.criterion(logits_rearranged, target_rearranged)
             
-            # Compute contrastive profile alignment
+            trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
+            listwise_loss = self.compute_lambda_ndcg_loss(logits, target_rearranged, num_negatives=self.lambda_num_negatives)
+            repr_loss = self.compute_alignment_uniformity_loss(hidden_states, target_rearranged)
+            
+            rec_loss = (w_ce * ce_loss) + w_structural * (
+                self.truncation_weight * trunc_loss + 
+                self.listwise_weight * listwise_loss + 
+                self.repr_weight * repr_loss
+            )
+            
             ssl_loss = self.compute_ssl_loss(out1, out2)
-            
             return rec_loss + (self.ssl_weight * ssl_loss), logits
             
         else:
-            # Fallback for evaluation / validation validation sets
             temporal = self.temporal_forward(inp)
-            logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
+            logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
+            
             logits_rearranged = rearrange(logits, "b l v -> b v l")
-            rec_loss = self.criterion(logits_rearranged, target_rearranged)
+            ce_loss = self.criterion(logits_rearranged, target_rearranged)
+            
+            trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
+            listwise_loss = self.compute_lambda_ndcg_loss(logits, target_rearranged, num_negatives=self.lambda_num_negatives)
+            repr_loss = self.compute_alignment_uniformity_loss(hidden_states, target_rearranged)
+            
+            rec_loss = (w_ce * ce_loss) + w_structural * (
+                self.truncation_weight * trunc_loss + 
+                self.listwise_weight * listwise_loss + 
+                self.repr_weight * repr_loss
+            )
             return rec_loss, logits
 
     def search(self, batch, n_results):
