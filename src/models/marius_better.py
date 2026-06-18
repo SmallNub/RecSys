@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
@@ -19,140 +18,7 @@ class TransformerConfig:
     seq_len: int
 
 
-class RoPE(nn.Module):
-    def __init__(self, head_dim):
-        super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._cache = {}
-
-    def get(self, seq_len, device, dtype):
-        key = (seq_len, device, dtype)
-        if key in self._cache:
-            return self._cache[key]
-
-        if len(self._cache) > 16:
-            self._cache.clear()
-
-        t = torch.arange(seq_len, device=device, dtype=dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device=device, dtype=dtype))
-
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
-
-        self._cache[key] = (cos, sin)
-        return cos, sin
-
-
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rope(x, cos, sin):
-    cos = cos[None, None, :, :].to(x.dtype)
-    sin = sin[None, None, :, :].to(x.dtype)
-    return x * cos + rotate_half(x) * sin
-
-
-class Attention(nn.Module):
-    def __init__(self, d_model, d_head, dropout_p=0.1, use_rope=True):
-        super().__init__()
-        self.d_model = d_model
-        self.d_head = d_head
-        self.use_rope = use_rope
-        self.dropout_p = dropout_p
-
-        self.n_heads = d_model // d_head
-        self.n_kv_heads = max(1, self.n_heads // 4)
-
-        self.q_dim = self.n_heads * d_head
-        self.kv_dim = self.n_kv_heads * d_head
-        
-        self.qkv_proj = nn.Linear(d_model, self.q_dim + 2 * self.kv_dim, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # SOTA Stabilization: Query-Key Normalization (QK-Norm)
-        self.q_norm = nn.RMSNorm(d_head)
-        self.k_norm = nn.RMSNorm(d_head)
-
-        if self.use_rope:
-            self.rope = RoPE(d_head)
-
-    def forward(self, x, attn_mask=None, is_causal=False):
-        B, L, _ = x.shape
-
-        qkv = self.qkv_proj(x)
-        q, k, v = torch.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
-
-        q = rearrange(q, "b l (h d) -> b h l d", d=self.d_head)
-        k = rearrange(k, "b l (h d) -> b h l d", d=self.d_head)
-        v = rearrange(v, "b l (h d) -> b h l d", d=self.d_head)
-
-        # Apply QK-Norm across sequence heads
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        if self.use_rope:
-            cos, sin = self.rope.get(L, x.device, x.dtype)
-            q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
-
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=is_causal
-        )
-
-        y = rearrange(y, "b h l d -> b l (h d)")
-        return self.o_proj(y)
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        hidden_dim = 4 * d_model * 2 // 3
-        hidden_dim = ((hidden_dim + 7) // 8) * 8
-        
-        self.w12 = nn.Linear(d_model, 2 * hidden_dim, bias=False)
-        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
-
-    def forward(self, x):
-        w1_out, w2_out = self.w12(x).chunk(2, dim=-1)
-        return self.w3(F.silu(w1_out) * w2_out)
-
-
-class TemporalBlock(nn.Module):
-    def __init__(self, d_model, d_head, dropout_p=0.1):
-        super().__init__()
-        self.norm1 = nn.RMSNorm(d_model)
-        self.attn = Attention(d_model, d_head, dropout_p=dropout_p, use_rope=True)
-        self.norm2 = nn.RMSNorm(d_model)
-        self.ffn = SwiGLU(d_model)
-
-    def forward(self, x, attn_mask=None, is_causal=False):
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
-class DepthBlock(nn.Module):
-    def __init__(self, d_model, d_head, dropout_p=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attn = Attention(d_model, d_head, dropout_p=dropout_p, use_rope=False)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = SwiGLU(d_model)
-
-    def forward(self, x, attn_mask=None, is_causal=False):
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
-class MARIUS(nn.Module):
+class MARIUS(torch.nn.Module):
     def __init__(
         self,
         temporal_cfg,
@@ -163,165 +29,173 @@ class MARIUS(nn.Module):
         truncation_weight=0.25,
         listwise_weight=0.40,
         repr_weight=0.35,
-        decay_steps=15000 
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
         
+        # Loss Optimization Weights
         self.top_k = top_k
         self.truncation_weight = truncation_weight
         self.listwise_weight = listwise_weight
         self.repr_weight = repr_weight
 
-        self.decay_steps = float(decay_steps)
-        self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
-
-        assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
+        assert (
+            self.depth_cfg.vocab_size == self.temporal_cfg.vocab_size
+        ), "Vocab size mismatch"
 
         if self.temporal_cfg.emb_dropout is None:
             self.temporal_cfg.emb_dropout = self.temporal_cfg.dropout
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        self.temp_emb = nn.Embedding(
-            temporal_cfg.vocab_size,
-            temporal_cfg.d_model,
+        # Embeddings
+        self.temp_emb = torch.nn.Embedding(
+            self.temporal_cfg.vocab_size,
+            self.temporal_cfg.d_model,
             padding_idx=SpecialTokens.PAD.value,
         )
 
-        self.depth_emb = self.temp_emb if tie_embeddings else nn.Embedding(
-            depth_cfg.vocab_size,
-            depth_cfg.d_model,
-            padding_idx=SpecialTokens.PAD.value,
+        self.tie_embeddings = tie_embeddings
+        if tie_embeddings:
+            self.depth_emb = self.temp_emb
+        else:
+            self.depth_emb = torch.nn.Embedding(
+                self.depth_cfg.vocab_size,
+                self.depth_cfg.d_model,
+                padding_idx=SpecialTokens.PAD.value,
+            )
+
+        # Positional Encoding
+        self.temp_pos_emb = torch.nn.Parameter(
+            torch.randn((1, self.temporal_cfg.seq_len, self.temporal_cfg.d_model))
+        )
+        self.depth_pos_emb = torch.nn.Parameter(
+            torch.randn((1, self.depth_cfg.seq_len, self.depth_cfg.d_model))
         )
 
-        # SOTA Stabilization: Embedding Layer Normalization
-        self.temp_emb_ln = nn.LayerNorm(temporal_cfg.d_model)
-        self.depth_emb_ln = nn.LayerNorm(depth_cfg.d_model)
+        # Embedding dropout
+        self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
+        self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
+        # Stable Native Transformers (Fast Path Preserved)
+        self.temp_tf = torch.nn.TransformerEncoder(
+            encoder_layer=torch.nn.TransformerEncoderLayer(
+                d_model=self.temporal_cfg.d_model,
+                nhead=self.temporal_cfg.d_model // self.temporal_cfg.d_head,
+                dim_feedforward=self.temporal_cfg.d_model * 4,
+                dropout=self.temporal_cfg.dropout,
+                batch_first=True,
+                norm_first=True,
+                activation="gelu",
+            ),
+            enable_nested_tensor=False,
+            num_layers=self.temporal_cfg.n_layers,
+            norm=torch.nn.LayerNorm(self.temporal_cfg.d_model),
+        )
 
-        self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
-        self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
+        self.depth_tf = torch.nn.TransformerEncoder(
+            encoder_layer=torch.nn.TransformerEncoderLayer(
+                d_model=self.depth_cfg.d_model,
+                nhead=self.depth_cfg.d_model // self.depth_cfg.d_head,
+                dim_feedforward=self.depth_cfg.d_model * 4,
+                dropout=self.depth_cfg.dropout,
+                batch_first=True,
+                norm_first=True,
+                activation="gelu",
+            ),
+            enable_nested_tensor=False,
+            num_layers=self.depth_cfg.n_layers,
+            norm=torch.nn.LayerNorm(self.depth_cfg.d_model),
+        )
 
-        self.temp_tf = nn.ModuleList([
-            TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head, dropout_p=temporal_cfg.dropout)
-            for _ in range(temporal_cfg.n_layers)
-        ])
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(
+                torch.ones(
+                    (self.temporal_cfg.seq_len, self.temporal_cfg.seq_len),
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            ),
+        )
 
-        self.depth_tf = nn.ModuleList([
-            DepthBlock(depth_cfg.d_model, depth_cfg.d_head, dropout_p=depth_cfg.dropout)
-            for _ in range(depth_cfg.n_layers)
-        ])
+        # Projection
+        self.mid_proj = torch.nn.Linear(
+            self.temporal_cfg.d_model, self.depth_cfg.d_model
+        )
 
-        self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
-        self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
-
-        self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        # Baseline Target Loss
+        self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
         
-        # SOTA Learned Scaling Parameters for Structural Metrics
-        self.listwise_temp = nn.Parameter(torch.tensor(0.0)) # Log temperature space
-        self.repr_temp = nn.Parameter(torch.tensor(0.0))
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            
-        for block in self.temp_tf:
-            if hasattr(block.attn, 'o_proj'):
-                torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers))
-            if hasattr(block.ffn, 'w3'):
-                torch.nn.init.normal_(block.ffn.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers))
-                
-        for block in self.depth_tf:
-            if hasattr(block.attn, 'o_proj'):
-                torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
-            if hasattr(block.ffn, 'w3'):
-                torch.nn.init.normal_(block.ffn.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
+        # Learned Scaling Parameters for Loss Calibration
+        self.listwise_temp = torch.nn.Parameter(torch.tensor(0.0))
+        self.repr_temp = torch.nn.Parameter(torch.tensor(0.0))
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n or "norm" in n or "temp" in n
+            return "temp_emb" in n or "depth_emb" in n or "temp" in n
+
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
+
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
 
     def temporal_forward(self, input):
         B, L, K = input.shape
 
-        discrete = self.temp_emb(input).sum(dim=-2)
-        discrete = self.temp_emb_ln(discrete)
-        x = self.dropout_t(discrete)
+        input_embs = self.temp_emb(input).sum(dim=-2)
+        input_embs += self.temp_pos_emb[:, : input.shape[1], :]
 
-        valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)
-        causal_mask = torch.tril(torch.ones(L, L, device=input.device, dtype=torch.bool))
-        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(0).unsqueeze(1)
+        input_embs = self.temp_dropout(input_embs)
 
-        for blk in self.temp_tf:
-            x = blk(x, attn_mask=combined_mask, is_causal=False)
+        out = self.temp_tf(
+            input_embs,
+            mask=self.causal_mask[:L, :L].to(input.device),
+            src_key_padding_mask=input[:, :, 0] == SpecialTokens.PAD.value,
+        )
 
-        return self.temp_final_norm(x)
+        return out
 
-    def depth_forward(self, tgt):
-        seq_len = tgt.shape[1]
-        positions = torch.arange(seq_len, device=tgt.device)
-        pos_embeddings = self.depth_pos_emb(positions).unsqueeze(0)
+    def depth_forward(self, in_embs):
+        K = in_embs.shape[1]
 
-        x = self.dropout_d(tgt + pos_embeddings)
+        in_embs = in_embs + self.depth_pos_emb[:, :K, :]
+        in_embs = self.depth_dropout(in_embs)
 
-        for blk in self.depth_tf:
-            x = blk(x, attn_mask=None, is_causal=True)
+        depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K].to(in_embs.device))
 
-        hidden_states = self.depth_final_norm(x)
-        logits = torch.matmul(hidden_states, self.depth_emb.weight.T)
-        return logits, hidden_states
+        logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
 
-    def train_forward_fused(self, temporal, target):
-        mid = self.mid_proj(temporal)
-        mid = rearrange(mid, "b l d -> (b l) 1 d")
+        return logits, depth_preds
 
-        target = rearrange(target, "b l k -> (b l) k")
+    def train_forward(self, input, target):
+        temporal_tokens = self.temporal_forward(input)  # B x L x D
+        mid_tokens = self.mid_proj(temporal_tokens)  # B x L x d
+        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")  # BL x 1 x D
+
+        target = rearrange(target, "b l k -> (b l) k")  # BL x K
         keep = target[:, 0] != -100
 
-        mid = mid[keep]
+        # Do not forward padding tokens.
+        mid_tokens = mid_tokens[keep]
         target = target[keep]
 
-        safe_target = target[:, :-1].clone()
-        safe_target[safe_target == -100] = SpecialTokens.PAD.value
-        
-        dec = self.depth_emb(safe_target)
-        dec = self.depth_emb_ln(dec)
-        K = dec.shape[1]
+        # Drop L4, we never predict L5 - BL x K x D
+        dec_embs = self.depth_emb(target[:, :-1])
 
-        if K > 0:
-            tgt = torch.cat([mid, dec], dim=1)
-        else:
-            tgt = mid
+        # mid_tokens : BL x 1 x D - dec_embs : BL x K x D
+        dec_embs = torch.cat([mid_tokens, dec_embs], dim=1)
 
-        logits, hidden_states = self.depth_forward(tgt)
-        return logits, hidden_states, mid, target
+        depth_logits, hidden_states = self.depth_forward(dec_embs)  # BL x K x V & BL x K x D
+        return depth_logits, hidden_states, target
 
     # =========================================================================
-    # SOTA STRUCTURAL LOSS METRICS
+    # ADVANCED STRUCTURAL LOSS CORE FUNCTIONS
     # =========================================================================
 
-    def compute_softmax_loss_at_k(self, logits, targets, k=10):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-
-        flat_logits = logits[mask]
-        flat_targets = targets[mask]
-
+    def compute_softmax_loss_at_k(self, flat_logits, flat_targets, k=10):
         pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1)).squeeze(-1)
         topk_scores, _ = torch.topk(flat_logits, k=k, dim=-1)
         
@@ -332,19 +206,7 @@ class MARIUS(nn.Module):
         denom = torch.log(torch.exp(shifted_pos) + torch.exp(shifted_topk).sum(dim=-1) + 1e-8) + max_scores
         return torch.mean(denom - pos_scores)
 
-    def compute_plackett_luce_loss(self, logits, targets):
-        """
-        SOTA Listwise Alternative: Plackett-Luce top-k permutation modeling.
-        Replaces noisy continuous rank proxies with real probabilistic ordering constraints.
-        """
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-
-        flat_logits = logits[mask]
-        flat_targets = targets[mask]
-
-        # Gather targets alongside dynamic in-batch negatives to establish ranking horizons
+    def compute_plackett_luce_loss(self, flat_logits, flat_targets):
         pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1))
         topk_neg, _ = torch.topk(flat_logits, k=32, dim=-1)
         
@@ -352,7 +214,6 @@ class MARIUS(nn.Module):
         t = torch.exp(self.listwise_temp).clamp(min=1e-3, max=5.0)
         scaled_slate = slate / t
 
-        # Iteratively calculate progressive sequence extraction steps
         log_prob = 0.0
         for i in range(min(5, scaled_slate.shape[-1])):
             remainder = scaled_slate[:, i:]
@@ -363,132 +224,146 @@ class MARIUS(nn.Module):
 
         return torch.mean(-log_prob)
 
-    def compute_infonce_loss(self, hidden_states, targets):
-        """
-        SOTA Unified Representation: Temperature-Scaled InfoNCE.
-        Simultaneously maximizes positive alignment and pushes items uniformly across the hypersphere.
-        """
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=hidden_states.device)
-
-        flat_h = hidden_states[mask]
-        flat_targets = targets[mask]
-
+    def compute_infonce_loss(self, flat_hidden, flat_targets):
         pos_emb = self.depth_emb(flat_targets)
         
-        flat_h_norm = F.normalize(flat_h, p=2, dim=-1)
+        flat_h_norm = F.normalize(flat_hidden, p=2, dim=-1)
         pos_emb_norm = F.normalize(pos_emb, p=2, dim=-1)
 
-        # In-batch positive cosine correlations matrix
         similarity_matrix = torch.matmul(flat_h_norm, pos_emb_norm.T)
         
         t = torch.exp(self.repr_temp).clamp(min=1e-2, max=1.0)
         logits = similarity_matrix / t
         
-        labels = torch.arange(logits.shape[0], device=hidden_states.device)
+        labels = torch.arange(logits.shape[0], device=flat_hidden.device)
         return F.cross_entropy(logits, labels)
 
     # =========================================================================
 
     def get_loss(self, batch):
-        inp, tgt = batch["input"], batch["target"]
+        input, target = batch["input"], batch["target"]
+
+        logits, hidden_states, m_target = self.train_forward(input, target)
+
+        # 1. Native Cross Entropy Formulation (Channel Transposed)
+        logits_ce = rearrange(logits, "B k v -> B v k")
+        base_ce_loss = self.criterion(logits_ce, m_target)
+
+        # 2. Reshape and Mask Elements for Listwise Structural Calculation
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
+        flat_targets = m_target.view(-1)
         
-        if self.training:
-            self.current_step += 1
-            # Cosine-annealed training curriculum with a 15% floor to maintain vocabulary alignment
-            progress = min(1.0, self.current_step.item() / self.decay_steps)
-            w_ce = 0.15 + 0.85 * (0.5 * (1.0 + math.cos(math.pi * progress)))
-            w_structural = 1.0 - w_ce
+        mask = (flat_targets != -100) & (flat_targets != SpecialTokens.PAD.value)
+        
+        if mask.any():
+            masked_logits = flat_logits[mask]
+            masked_hidden = flat_hidden[mask]
+            masked_targets = flat_targets[mask]
+
+            # Compute Structural Alternatives
+            trunc_loss = self.compute_softmax_loss_at_k(masked_logits, masked_targets, k=self.top_k)
+            listwise_loss = self.compute_plackett_luce_loss(masked_logits, masked_targets)
+            repr_loss = self.compute_infonce_loss(masked_hidden, masked_targets)
+
+            # Unified Loss Composition Array
+            total_loss = base_ce_loss + (
+                self.truncation_weight * trunc_loss +
+                self.listwise_weight * listwise_loss +
+                self.repr_weight * repr_loss
+            )
         else:
-            w_ce = 0.0
-            w_structural = 1.0
-        
-        temporal = self.temporal_forward(inp)
-        logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
-        
-        logits_rearranged = rearrange(logits, "b l v -> b v l")
-        ce_loss = self.criterion(logits_rearranged, target_rearranged)
-        
-        trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
-        listwise_loss = self.compute_plackett_luce_loss(logits, target_rearranged)
-        repr_loss = self.compute_infonce_loss(hidden_states, target_rearranged)
-        
-        rec_loss = (w_ce * ce_loss) + w_structural * (
-            self.truncation_weight * trunc_loss + 
-            self.listwise_weight * listwise_loss + 
-            self.repr_weight * repr_loss
-        )
-        return rec_loss, logits
+            total_loss = base_ce_loss
+
+        return total_loss, logits
 
     def search(self, batch, n_results):
-        assert self.training is False, "Not in evaluation mode."
+        assert self.training is False, "Not in evaluation mode (dropout)."
+
         input = batch["input"]
         L = batch["target"].shape[-1]
 
-        if self.filter_preds:
+        if self.filter_preds:  # Generate more, so that we can filter out seen items.
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        temporal = self.temporal_forward(input)
-        mid = self.mid_proj(temporal)[:, -1, :]
+        # Validation only on the last prediction of the sequence
+        temporal_tokens = self.temporal_forward(input)  # B x L x D
+        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]  # B, D
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
-        arranged_batch = torch.arange(B, device=input.device).view(-1, 1)
 
-        sequences = mid[:, None, :]
-        logits, _ = self.depth_forward(sequences)
-        log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+        # Initialize the beam search ==============================================
+        ## Get logits
+        sequences = mid_tokens[:, None, :]  # B x 1 x D
+        depth_logits, _ = self.depth_forward(sequences)  # B x 1 x D
+        log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)  # B x V
 
-        topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
+        ## Get topk indices
+        topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  # B x b
 
-        indices = topk_indices.unsqueeze(2)
-        scores = topk_log_probs
-        sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
+        indices = topk_indices.unsqueeze(2)  # Shape: (B, b, 1)
+        scores = topk_log_probs  # Shape: B x b
 
-        discrete_new = self.depth_emb(topk_indices)
-        discrete_new = self.depth_emb_ln(discrete_new)
-        sequences = torch.cat([sequences, discrete_new.unsqueeze(2)], dim=2)
+        ## Expand sequences
+        sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  # Shape: (B, b, 1, D)
 
+        new_tokens = self.depth_emb(topk_indices).unsqueeze(2)  # Shape : (B, b, 1, D)
+        sequences = torch.concat([sequences, new_tokens], dim=2)
+
+        arranged = torch.arange(B, device=sequences.device).view(-1, 1)
+
+        # Start the beam search ===================================================
         for i in range(2, L + 1):
-            logits, _ = self.depth_forward(sequences.view(B * b, i, D))
-            last_logits = logits[:, -1, :]
-            log_probs = F.log_softmax(last_logits, dim=-1)
+            # Forward the current sequence to get logits of the next token
+            last_logits, _ = self.depth_forward(sequences.view(B * b, i, D))
+            last_logits = last_logits[:, -1, :]
+            log_probs = F.log_softmax(last_logits, dim=-1)  # B * b x V
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
 
+            # Shape: (B * b, b) -> (B, b, b)
             topk_log_probs = topk_log_probs.view(B, b, b)
             topk_indices = topk_indices.view(B, b, b)
 
+            # Expand indices - Update with top values
             expanded_indices = indices.unsqueeze(2).repeat(1, 1, b, 1)
-            expanded_indices = torch.cat([expanded_indices, topk_indices.unsqueeze(-1)], dim=3)
+            expanded_indices = torch.cat(
+                [expanded_indices, topk_indices.unsqueeze(-1)], dim=3
+            )
 
+            # Expand sequences
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
-
-            flat_topk = topk_indices.view(-1)
-            flat_discrete = self.depth_emb(flat_topk)
-            flat_discrete = self.depth_emb_ln(flat_discrete)
-            next_tokens = flat_discrete.view(B, b, b, 1, D)
-
+            # Choose the new tokens - Shape: (B, b, b, 1, D)
+            next_tokens = self.depth_emb(topk_indices).unsqueeze(3)
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
+            # Expand scores
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
 
+            # Start flattening before selection
             expanded_scores = expanded_scores.view(B, -1)
-            expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
+            expanded_sequences = expanded_sequences.view(
+                B, -1, expanded_sequences.size(-2), D
+            )
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
+            # Select topk from flattened scores
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
-            sequences = expanded_sequences[arranged_batch, topk_indices]
-            indices = expanded_indices[arranged_batch, topk_indices]
-            scores = topk_scores
+            # Shape: (B, b, L+1, D)
+            sequences = expanded_sequences[arranged, topk_indices]
+            indices = expanded_indices[arranged, topk_indices]
+
+            scores = topk_scores  # Shape: (B, b)
 
         if self.filter_preds:
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]
-            is_in_query = is_in_query.all(dim=-1).any(dim=-1)
+            is_in_query = is_in_query.all(dim=-1).any(dim=-1)  # Shape B x b
+
             scores[is_in_query] = -torch.inf
+
             topk_scores, topk_indices = torch.topk(scores, keep_final, dim=-1)
-            indices = indices[arranged_batch, topk_indices]
+            indices = indices[arranged, topk_indices]
 
         return indices
