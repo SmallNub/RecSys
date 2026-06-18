@@ -151,24 +151,17 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        ssl_weight=0.1,
-        ssl_mask_prob=0.2,
-        ssl_temperature=0.07,
         top_k=10,
-        truncation_weight=0.4,
-        listwise_weight=0.4,
-        repr_weight=0.2,
+        truncation_weight=0.3,   # Tuned parameters
+        listwise_weight=0.4,     # Tuned parameters
+        repr_weight=0.3,         # Tuned parameters (compensated for uniformity removal)
         lambda_num_negatives=64,
-        # Exponential time-scale instead of absolute total steps boundary
-        decay_steps=10000
+        decay_steps=8000         # Ideal exponential horizon for 40k steps budget
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
-        self.ssl_weight = ssl_weight
-        self.ssl_mask_prob = ssl_mask_prob
-        self.ssl_temperature = ssl_temperature
         
         self.top_k = top_k
         self.truncation_weight = truncation_weight
@@ -176,7 +169,6 @@ class MARIUS(nn.Module):
         self.repr_weight = repr_weight
         self.lambda_num_negatives = lambda_num_negatives
 
-        # Internal tracking state setup
         self.decay_steps = float(decay_steps)
         self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
@@ -301,25 +293,6 @@ class MARIUS(nn.Module):
         logits, hidden_states = self.depth_forward(tgt)
         return logits, hidden_states, mid, target
 
-    def _augment_sequence(self, input):
-        B, L, K = input.shape
-        mask = torch.rand((B, L, 1), device=input.device) > self.ssl_mask_prob
-        augmented = input.clone()
-        augmented = torch.where(mask, augmented, SpecialTokens.PAD.value)
-        return augmented
-
-    def compute_ssl_loss(self, out1, out2):
-        B = out1.shape[0]
-        emb1 = F.normalize(out1.mean(dim=1), dim=-1)
-        emb2 = F.normalize(out2.mean(dim=1), dim=-1)
-        
-        similarity_matrix = torch.matmul(emb1, emb2.T) / self.ssl_temperature
-        labels = torch.arange(B, device=out1.device)
-        
-        loss_view1 = F.cross_entropy(similarity_matrix, labels)
-        loss_view2 = F.cross_entropy(similarity_matrix.T, labels)
-        return (loss_view1 + loss_view2) / 2.0
-
     # =========================================================================
     # METRIC-MISMATCH PARADIGMS
     # =========================================================================
@@ -343,9 +316,6 @@ class MARIUS(nn.Module):
         return torch.mean(denom - pos_scores)
 
     def compute_lambda_ndcg_loss(self, logits, targets, num_negatives=64):
-        """
-        Calculates Soft Lambda NDCG loss proxy. (Removed unused k parameter signature match)
-        """
         mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
         if not mask.any():
             return torch.tensor(0.0, device=logits.device)
@@ -364,7 +334,10 @@ class MARIUS(nn.Module):
         soft_dcg = 1.0 / torch.log2(pos_soft_rank + 1.0)
         return torch.mean(1.0 - soft_dcg)
 
-    def compute_alignment_uniformity_loss(self, hidden_states, targets):
+    def compute_alignment_loss(self, hidden_states, targets):
+        """
+        Calculates pure representation alignment loss (Uniformity constraints removed).
+        """
         mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
         if not mask.any():
             return torch.tensor(0.0, device=hidden_states.device)
@@ -377,82 +350,42 @@ class MARIUS(nn.Module):
         pos_emb_norm = F.normalize(pos_emb, p=2, dim=-1)
 
         alignment_loss = torch.mean((flat_h_norm - pos_emb_norm).pow(2).sum(dim=-1))
-
-        num_samples = min(256, pos_emb_norm.shape[0])
-        if num_samples > 1:
-            sampled_emb = pos_emb_norm[:num_samples]
-            sq_dist = 2.0 - 2.0 * torch.matmul(sampled_emb, sampled_emb.T)
-            mask_diag = torch.eye(num_samples, device=hidden_states.device).bool()
-            sq_dist = sq_dist[~mask_diag].view(num_samples, -1)
-            uniformity_loss = torch.log(torch.exp(-2.0 * sq_dist).mean() + 1e-8)
-        else:
-            uniformity_loss = torch.tensor(0.0, device=hidden_states.device)
-
-        return alignment_loss + uniformity_loss
+        return alignment_loss
 
     # =========================================================================
 
     def get_loss(self, batch):
         """
-        Calculates loss using an exponential step decay calculation schedule.
+        Calculates unified loss under an optimized exponential curriculum layout.
         """
         inp, tgt = batch["input"], batch["target"]
         
         if self.training:
             self.current_step += 1
-            # Step-boundless decay configuration
             w_ce = math.exp(-self.current_step.item() / self.decay_steps)
             w_structural = 1.0 - w_ce
         else:
-            # Enforce maximum structural execution during evaluation sequences
             w_ce = 0.0
             w_structural = 1.0
         
-        if self.training and self.ssl_weight > 0.0:
-            aug_inp1 = self._augment_sequence(inp)
-            aug_inp2 = self._augment_sequence(inp)
-            
-            fused_inp = torch.cat([inp, aug_inp1, aug_inp2], dim=0)
-            fused_temporal_out = self.temporal_forward(fused_inp)
-            
-            B = inp.shape[0]
-            temporal, out1, out2 = torch.split(fused_temporal_out, [B, B, B], dim=0)
-            
-            logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
-            
-            logits_rearranged = rearrange(logits, "b l v -> b v l")
-            ce_loss = self.criterion(logits_rearranged, target_rearranged)
-            
-            trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
-            listwise_loss = self.compute_lambda_ndcg_loss(logits, target_rearranged, num_negatives=self.lambda_num_negatives)
-            repr_loss = self.compute_alignment_uniformity_loss(hidden_states, target_rearranged)
-            
-            rec_loss = (w_ce * ce_loss) + w_structural * (
-                self.truncation_weight * trunc_loss + 
-                self.listwise_weight * listwise_loss + 
-                self.repr_weight * repr_loss
-            )
-            
-            ssl_loss = self.compute_ssl_loss(out1, out2)
-            return rec_loss + (self.ssl_weight * ssl_loss), logits
-            
-        else:
-            temporal = self.temporal_forward(inp)
-            logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
-            
-            logits_rearranged = rearrange(logits, "b l v -> b v l")
-            ce_loss = self.criterion(logits_rearranged, target_rearranged)
-            
-            trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
-            listwise_loss = self.compute_lambda_ndcg_loss(logits, target_rearranged, num_negatives=self.lambda_num_negatives)
-            repr_loss = self.compute_alignment_uniformity_loss(hidden_states, target_rearranged)
-            
-            rec_loss = (w_ce * ce_loss) + w_structural * (
-                self.truncation_weight * trunc_loss + 
-                self.listwise_weight * listwise_loss + 
-                self.repr_weight * repr_loss
-            )
-            return rec_loss, logits
+        temporal = self.temporal_forward(inp)
+        logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
+        
+        # Pointwise optimization anchor
+        logits_rearranged = rearrange(logits, "b l v -> b v l")
+        ce_loss = self.criterion(logits_rearranged, target_rearranged)
+        
+        # Structural structural target losses
+        trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
+        listwise_loss = self.compute_lambda_ndcg_loss(logits, target_rearranged, num_negatives=self.lambda_num_negatives)
+        repr_loss = self.compute_alignment_loss(hidden_states, target_rearranged)
+        
+        rec_loss = (w_ce * ce_loss) + w_structural * (
+            self.truncation_weight * trunc_loss + 
+            self.listwise_weight * listwise_loss + 
+            self.repr_weight * repr_loss
+        )
+        return rec_loss, logits
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
