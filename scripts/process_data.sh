@@ -20,7 +20,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export HYDRA_FULL_ERROR=1
 
 # CATEGORIES=("All_Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
-CATEGORIES=("Arts_Crafts_and_Sewing" "Sports_and_Outdoors" "Health_and_Household")
+CATEGORIES=("Arts_Crafts_and_Sewing" "Cell_Phones_and_Accessories" "Health_and_Household")
 
 # Join array with commas for hydra list format
 JOINED_CATEGORIES=$(IFS=, ; echo "${CATEGORIES[*]}")
