@@ -18,7 +18,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export HYDRA_FULL_ERROR=1
 
 # CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
-CATEGORIES=("Toys_and_Games" "Movies_and_TV" "Video_Games")
+CATEGORIES=("Arts_Crafts_and_Sewing")
 N_RUNS=5
 EXPERIMENT="sasrec"
 TASKNAME="SASRec"
@@ -30,13 +30,15 @@ for CATEGORY in "${CATEGORIES[@]}"; do
     echo "========================================"
 
     for RUN_IDX in $(seq 1 ${N_RUNS}); do
+        SEED=${RUN_IDX}
         echo "----------------------------------------"
-        echo ">>> ${CATEGORY} - Run ${RUN_IDX}/${N_RUNS}"
+        echo ">>> ${CATEGORY} - Run ${RUN_IDX}/${N_RUNS} (Seed: ${SEED})"
         echo "----------------------------------------"
 
         # Step 1: Train SASRec
         python src/train.py experiment=${EXPERIMENT} \
-            data.datasets.category=${CATEGORY}
+            data.datasets.category=${CATEGORY} \
+            seed=${SEED}
 
         # Step 2: Resolve latest SASRec run directory
         LATEST_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)

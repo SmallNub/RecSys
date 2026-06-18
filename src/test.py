@@ -70,10 +70,11 @@ def get_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
 
     # Inject diversity context for test split
     if split == "test" and diversity_context is not None:
-        model.code_to_item = diversity_context["code_to_item"]
-        model.item_embeddings = diversity_context["item_embeddings"]
-        model.popularity_counts = diversity_context["popularity_counts"]
-        model.n_centroids = diversity_context["n_centroids"]
+        model.code_to_item = diversity_context.get("code_to_item")
+        model.id_to_item = diversity_context.get("id_to_item")
+        model.item_embeddings = diversity_context.get("item_embeddings")
+        model.popularity_counts = diversity_context.get("popularity_counts")
+        model.n_centroids = diversity_context.get("n_centroids")
 
     trainer = L.Trainer(accelerator="gpu", precision="bf16-mixed")
 
@@ -118,8 +119,11 @@ def get_n_centroids(cfg):
 
 def load_item_embeddings(fs, cfg):
     """Load raw item embeddings as a dict: item_id -> np.array."""
+    emb_method = cfg.data.datasets.get("emb_id")
+    if emb_method is None:
+        emb_method = "sentence-t5-xl"
     emb_path = cfg.paths.embeddings_tplt.format(
-        emb_method=cfg.data.datasets.emb_id,
+        emb_method=emb_method,
         category=cfg.data.datasets.category,
     )
     emb_df = pd.read_parquet(emb_path, filesystem=fs)
@@ -174,22 +178,41 @@ def main(test_config):
             cfg.model.net.vocab_size = vocab_size
             print(f"[INFO] Overrode model.net.vocab_size in test to {vocab_size} for SASRec")
 
-    # 3. Build diversity context (only if quantization is used i.e. MARIUS, not SASRec++)
+    # 3. Build diversity context
+    diversity_context = {}
+    
+    first_ds = next(iter(datasets.values())) if datasets else None
+    if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "id_to_item"):
+        diversity_context["id_to_item"] = first_ds.pp.id_to_item
+    else:
+        diversity_context["id_to_item"] = None
+
     uses_quantization = (
         cfg.data.datasets.get("quant_id") is not None
         and cfg.data.datasets.get("emb_id") is not None
     )
     if uses_quantization:
-        print("[INFO] Building diversity context...")
-        diversity_context = {
-            "code_to_item": build_code_to_item(fs, cfg),
-            "item_embeddings": load_item_embeddings(fs, cfg),
-            "popularity_counts": get_popularity_counts(fs, cfg),
-            "n_centroids": get_n_centroids(cfg),
-        }
+        print("[INFO] Building diversity context (with quantization)...")
+        diversity_context["code_to_item"] = build_code_to_item(fs, cfg)
+        diversity_context["n_centroids"] = get_n_centroids(cfg)
     else:
-        print("[INFO] Skipping diversity context — no quantization (SASRec++ mode).")
-        diversity_context = None
+        print("[INFO] No quantization (SASRec++ mode).")
+        diversity_context["code_to_item"] = None
+        diversity_context["n_centroids"] = None
+
+    # Load item embeddings if available
+    try:
+        diversity_context["item_embeddings"] = load_item_embeddings(fs, cfg)
+    except Exception as e:
+        print(f"[WARNING] Could not load item embeddings: {e}. ILD metric will be disabled.")
+        diversity_context["item_embeddings"] = None
+
+    # Load popularity counts if available
+    try:
+        diversity_context["popularity_counts"] = get_popularity_counts(fs, cfg)
+    except Exception as e:
+        print(f"[WARNING] Could not load popularity counts: {e}")
+        diversity_context["popularity_counts"] = None
 
     # 4. Standard accuracy metrics (valid has no diversity)
     valid_metrics = get_metrics(cfg, best_checkpoint, "valid", datasets)
