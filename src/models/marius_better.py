@@ -264,9 +264,23 @@ class MARIUS(torch.nn.Module):
         # 1. Forward pass returns native outputs
         logits, hidden_states, m_target = self.train_forward(input, target)
 
-        # 2. Main Objective: Native Cross Entropy over all codebook tokens
+        # 2. Main Objective: Hierarchical Cross-Entropy (RVQ-Aware)
         logits_ce = rearrange(logits, "B k v -> B v k")
-        base_ce_loss = self.criterion(logits_ce, m_target)
+        
+        # Compute raw token loss without reduction to isolate individual codebook steps
+        raw_ce_loss = F.cross_entropy(logits_ce, m_target, reduction="none", ignore_index=-100) # Shape: (BL, K)
+        
+        # Establish a decaying importance scale across the 4 codebooks
+        # Codebook 0 (macro-cluster) gets maximum focus; Codebook 3 (fine-noise) is down-weighted
+        K = m_target.shape[-1]
+        rvq_weights = torch.tensor([1.5, 1.1, 0.8, 0.6], device=input.device, dtype=raw_ce_loss.dtype)
+        
+        # Apply the structural weights across the sequence length axis
+        weighted_ce = raw_ce_loss * rvq_weights[:K]
+        
+        # Cleanly isolate non-padded tokens for the final scalar gradient average
+        loss_mask = m_target != -100
+        base_ce_loss = weighted_ce[loss_mask].mean() if loss_mask.any() else weighted_ce.sum()
 
         # 3. Auxiliary Regularization: Isolate to item-level (No token collisions)
         # We look specifically at the first prediction step (index 0) of the depth sequence
