@@ -261,34 +261,44 @@ class MARIUS(torch.nn.Module):
     def get_loss(self, batch):
         input, target = batch["input"], batch["target"]
 
+        # 1. Forward pass returns native outputs
         logits, hidden_states, m_target = self.train_forward(input, target)
 
-        # 1. Native Cross Entropy Formulation (Channel Transposed)
+        # 2. Main Objective: Native Cross Entropy over all codebook tokens
         logits_ce = rearrange(logits, "B k v -> B v k")
         base_ce_loss = self.criterion(logits_ce, m_target)
 
-        # 2. Reshape and Mask Elements for Listwise Structural Calculation
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
-        flat_targets = m_target.view(-1)
-        
-        mask = (flat_targets != -100) & (flat_targets != SpecialTokens.PAD.value)
-        
-        if mask.any():
-            masked_logits = flat_logits[mask]
-            masked_hidden = flat_hidden[mask]
-            masked_targets = flat_targets[mask]
+        # 3. Auxiliary Regularization: Isolate to item-level (No token collisions)
+        # We look specifically at the first prediction step (index 0) of the depth sequence
+        item_hidden = hidden_states[:, 0, :]   # Shape: (BL_kept, D)
+        item_targets = m_target[:, 0]          # Shape: (BL_kept,)
 
-            # Compute Structural Alternatives
-            trunc_loss = self.compute_softmax_loss_at_k(masked_logits, masked_targets, k=self.top_k)
-            listwise_loss = self.compute_plackett_luce_loss(masked_logits, masked_targets)
+        valid_item_mask = (item_targets != -100) & (item_targets != SpecialTokens.PAD.value)
+
+        if valid_item_mask.any():
+            masked_hidden = item_hidden[valid_item_mask]
+            masked_targets = item_targets[valid_item_mask]
+
+            # Flatten remaining depth tokens only for listwise ranking margins
+            flat_logits = logits.view(-1, logits.size(-1))
+            flat_targets = m_target.view(-1)
+            token_mask = (flat_targets != -100) & (flat_targets != SpecialTokens.PAD.value)
+            
+            masked_logits = flat_logits[token_mask]
+            masked_flat_targets = flat_targets[token_mask]
+
+            # Compute alternative structural losses cleanly
+            trunc_loss = self.compute_softmax_loss_at_k(masked_logits, masked_flat_targets, k=self.top_k)
+            listwise_loss = self.compute_plackett_luce_loss(masked_logits, masked_flat_targets)
+            
+            # InfoNCE now runs safely on item representations without false negatives
             repr_loss = self.compute_infonce_loss(masked_hidden, masked_targets)
 
-            # Unified Loss Composition Array
+            # Combined Loss with highly precise, low-impact auxiliary weighting
             total_loss = base_ce_loss + (
-                self.truncation_weight * trunc_loss +
-                self.listwise_weight * listwise_loss +
-                self.repr_weight * repr_loss
+                0.02 * trunc_loss +
+                0.01 * listwise_loss +
+                0.02 * repr_loss
             )
         else:
             total_loss = base_ce_loss
