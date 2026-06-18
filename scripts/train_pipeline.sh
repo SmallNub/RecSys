@@ -31,8 +31,8 @@ CATEGORIES=("Arts_Crafts_and_Sewing")
 # CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
 
 N_RUNS=5
-EXPERIMENT="marius_small"
-TASKNAME="MARIUS_small"
+EXPERIMENT="marius"
+TASKNAME="MARIUS"
 
 # Separate data and checkpoint dirs per year to avoid overwrites
 DATASET_ROOT="${PWD}/datasets_${DATASET_YEAR}"
