@@ -132,6 +132,24 @@ class MARIUS(torch.nn.Module):
         # Learned Scaling Parameters for Loss Calibration
         self.listwise_temp = torch.nn.Parameter(torch.tensor(0.0))
         self.repr_temp = torch.nn.Parameter(torch.tensor(0.0))
+        
+        self.reset_marius_init()
+
+    # Place this at the very end of your __init__ function:
+    def reset_marius_init(self):
+        # 1. Tame the massive positional encoding variance
+        torch.nn.init.trunc_normal_(self.temp_pos_emb, std=0.02)
+        torch.nn.init.trunc_normal_(self.depth_pos_emb, std=0.02)
+        
+        # 2. Scale down token embeddings to match standard transformer expectations
+        torch.nn.init.trunc_normal_(self.temp_emb.weight, std=0.02)
+        if not self.tie_embeddings:
+            torch.nn.init.trunc_normal_(self.depth_emb.weight, std=0.02)
+            
+        # 3. Tighten the loss temperatures so they aren't completely flat at Step 0
+        # Initializing to log(0.07) is the SOTA standard for stable InfoNCE alignment
+        torch.nn.init.constant_(self.repr_temp, math.log(0.07))
+        torch.nn.init.constant_(self.listwise_temp, math.log(0.1))
 
     def get_param_groups(self):
         def _select_no_decay(n):
