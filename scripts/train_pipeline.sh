@@ -27,7 +27,7 @@ export WANDB_MODE=offline
 DATASET_YEAR=${1:-2014}
 
 # Categories to run
-CATEGORIES=("Arts_Crafts_and_Sewing")
+CATEGORIES=("Arts_Crafts_and_Sewing", "Sports_and_Outdoors", "Health_and_Household")
 # CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
 
 N_RUNS=5
