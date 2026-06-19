@@ -149,33 +149,36 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        # Inverted Anchor Schedule Milestones
-        phase1_duration=15000,
-        phase2_duration=15000,
-        phase3_duration=10000,
-        max_ce_weight=0.40,
-        distill_temp=3.0,          
+        # Robustness Extensions
+        temporal_noise_scale=0.02, 
+        label_smoothing=0.05,      
+        # Curriculum Schedules
+        phase1_duration=20000,
+        phase2_duration=20000,
+        base_ce_weight=0.25,
+        target_ce_weight=0.75,
+        distill_temp=4.0,         
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
+        self.temporal_noise_scale = temporal_noise_scale
 
-        self.max_ce_weight = max_ce_weight
+        self.base_ce = base_ce_weight
+        self.target_ce = target_ce_weight
         self.p1_end = phase1_duration
-        self.p2_end = phase1_duration + phase2_duration
-        self.total_steps = phase1_duration + phase2_duration + phase3_duration
+        self.total_steps = phase1_duration + phase2_duration
         
         self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
-        if self.temporal_cfg.emb_dropout is None:
-            self.temporal_cfg.emb_dropout = self.temporal_cfg.dropout
-        if self.depth_cfg.emb_dropout is None:
-            self.depth_cfg.emb_dropout = self.depth_cfg.dropout
+        # Safe decoupling of custom embedding dropouts
+        t_emb_drop = temporal_cfg.emb_dropout if temporal_cfg.emb_dropout is not None else temporal_cfg.dropout
+        d_emb_drop = depth_cfg.emb_dropout if depth_cfg.emb_dropout is not None else depth_cfg.dropout
 
-        # Load Teacher Model
+        # Setup Teacher Module
         self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
         self.distill_temp = distill_temp
         if self.teacher is not None:
@@ -200,8 +203,9 @@ class MARIUS(nn.Module):
 
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
-        self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
-        self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
+        # Separated embedding regularizers
+        self.dropout_t = nn.Dropout(t_emb_drop)
+        self.dropout_d = nn.Dropout(d_emb_drop)
 
         self.temp_tf = nn.ModuleList([
             TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head, dropout_p=temporal_cfg.dropout)
@@ -217,7 +221,9 @@ class MARIUS(nn.Module):
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.05)
+        
+        # Grounded Criterion incorporating label smoothing
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
 
         self.apply(self._init_weights)
 
@@ -309,43 +315,42 @@ class MARIUS(nn.Module):
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
         
-        # 1. Base Forward Passes
+        # 1. Base Model Forward
         temporal = self.temporal_forward(inp)
+
+        # Inject Proportional Feature Noise (Active only during training)
+        if self.training and self.temporal_noise_scale > 0.0:
+            # Scale noise relative to the standard deviation profile of the layer activations
+            feature_std = temporal.detach().std()
+            noise = torch.randn_like(temporal) * (feature_std * self.temporal_noise_scale)
+            temporal = temporal + noise
+
         logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
         
-        # 2. Compute underlying Cross Entropy
+        # 2. Hard Target Loss (with Label Smoothing internally handled)
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
 
-        # 3. Dynamic Inverted Anchor Schedule Setup
+        # 3. Grounded Mimicry Engine Calculation
         if self.training:
             self.current_step += 1
             step = min(self.current_step.item(), self.total_steps)
             
             if step <= self.p1_end:
-                # PHASE 1: Pure Teacher Bootstrap
                 w_distill = 1.0
-                w_ce = 0.0
-            elif step <= self.p2_end:
-                # PHASE 2: Smooth Introduction of Cross Entropy Regularization
-                w_distill = 1.0
-                p2_progress = (step - self.p1_end) / float(self.p2_end - self.p1_end)
-                # Cosine curve rising from 0.0 to max_ce_weight
-                cos_f = 0.5 * (1.0 - math.cos(math.pi * p2_progress))
-                w_ce = self.max_ce_weight * cos_f
+                w_ce = self.base_ce
             else:
-                # PHASE 3: Fixed Joint Equilibrium
                 w_distill = 1.0
-                w_ce = self.max_ce_weight
+                p2_progress = (step - self.p1_end) / float(self.total_steps - self.p1_end)
+                cos_f = 0.5 * (1.0 - math.cos(math.pi * p2_progress))
+                w_ce = self.base_ce + (self.target_ce - self.base_ce) * cos_f
         else:
-            # Evaluate using the target validation mix (Phase 3 conditions)
             w_distill = 1.0
-            w_ce = self.max_ce_weight
+            w_ce = self.target_ce
 
-        # Accumulate balanced token loss
         final_loss = w_ce * ce_loss
 
-        # 4. Process Teacher Soft Target Distillation (Always active)
+        # 4. Integrate Soft Targets from Teacher Module
         if self.teacher is not None and w_distill > 0.0:
             with torch.no_grad():
                 if hasattr(self.teacher, "train_forward_fused"):
