@@ -35,7 +35,7 @@ EXPERIMENT="marius"
 TASKNAME="MARIUS"
 
 # Separate data and checkpoint dirs per year to avoid overwrites
-DATASET_ROOT="${PWD}/datasets/datasets-${DATASET_YEAR}"
+DATASET_ROOT="${PWD}/datasets"
 COSETTE_BASE_DIR="outputs/checkpoints/cosette_${DATASET_YEAR}"
 MARIUS_BASE_DIR="outputs/checkpoints/marius_${DATASET_YEAR}"
 
