@@ -27,6 +27,7 @@ centroids:
 model: 
   type: euclidean #euclidean
   layers: [1024, 512, 256, 128]
+  c: 1.0
 
 loss: 
   reconstruction_weight: 1.0

@@ -29,11 +29,9 @@ def set_global_seed(seed: int):
 
 def worker_init_fn(worker_id):
     """Ensures every DataLoader worker gets a unique, deterministic random seed."""
-    # PyTorch automatically gives each worker a unique base seed based on the main seed
     base_seed = torch.initial_seed() % (2**32)
     worker_seed = base_seed + worker_id
 
-    # Re-seed the Python and Numpy generators inside the worker process
     random.seed(worker_seed)
     np.random.seed(worker_seed)
 
@@ -137,22 +135,8 @@ class Trainer(object):
     def _train_epoch(self, train_data, epoch_idx):
         self.model.train()
 
-<<<<<<< HEAD
-        # Dynamic Curvature Annealing Calculations
-        # anneal_period = max(1, int(self.epochs * 0.10))
-        # if epoch_idx < anneal_period:
-        #     c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
-        # else:
-        #     c = 1.0
-        c = 1.0
-=======
-        anneal_period = max(1, int(self.epochs * 0.10))
-        if epoch_idx < anneal_period:
-            c = 0.01 + (1.0 - 0.01) * (epoch_idx / anneal_period)
-        else:
-            c = 1.0
-
->>>>>>> 41fb445bfa9e79d7c29a25f7d66112be44d76b96
+        # Grab c from config, default to 1.0
+        c = self.config.model.get("c", 1.0)
         total_loss = 0
 
         model_name = "HYPERBOLIC" if self.is_hyper else "EUCLIDEAN"
@@ -202,7 +186,8 @@ class Trainer(object):
         indices_list = []
 
         if self.is_hyper:
-            indices, _ = self.model.get_indices(c=1.0)
+            c = self.config.model.get("c", 1.0)
+            indices, _ = self.model.get_indices(c=c)
         else:
             indices, _ = self.model.get_indices()
 
@@ -236,7 +221,6 @@ class Trainer(object):
     def _save_checkpoint(self, epoch, ckpt_file):
         ckpt_path = os.path.join(self.local_dir, ckpt_file)
 
-        # Safely unwrap compiled models when storing runtime checkpoints
         raw_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()}
 
@@ -266,6 +250,7 @@ class Trainer(object):
                     "epoch": epoch_idx,
                     "train_loss": train_loss,
                     "lr": self.optimizer.param_groups[0]["lr"],
+                    "curvature_c": self.config.model.get("c", 0.0) if self.is_hyper else 0.0,
                     **metrics,
                 }
             )
@@ -375,7 +360,8 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
     print("Forward Pass Evaluation.")
     is_hyper = config.model.get("type", "euclidean") == "hyperbolic"
     if is_hyper:
-        indices, _ = model.get_indices(use_sk=False, c=1.0)
+        c = config.model.get("c", 1.0)
+        indices, _ = model.get_indices(use_sk=False, c=c)
     else:
         indices, _ = model.get_indices(use_sk=False)
 
@@ -470,12 +456,12 @@ def make_cosette_embs(config):
         cut=config.loss.sequence_length,
     )
 
-    model = COSETTE(
-        embs_block=embs_block,
-        in_dim=embs_block.shape[-1],
-        layers=config.model.layers,
-        dropout_prob=config.optim.dropout_prob,
-        loss_weights={
+    kwargs = {
+        "embs_block": embs_block,
+        "in_dim": embs_block.shape[-1],
+        "layers": config.model.layers,
+        "dropout_prob": config.optim.dropout_prob,
+        "loss_weights": {
             "quantization": 1,
             "reconstruction": config.loss.reconstruction_weight,
             "contrastive": config.loss.contrastive_weight,
@@ -483,16 +469,21 @@ def make_cosette_embs(config):
             "latent_consistency_l1_loss": config.loss.get("latent_consistency_l1_weight", 0.0),
             "reconstruction_l1_loss": config.loss.get("reconstruction_l1_weight", 0.0),
         },
-        tau=config.loss.tau,
-        bias=config.loss.bias,
-        freeze_tau=config.loss.freeze_tau,
-        freeze_bias=config.loss.freeze_bias,
-        n_centroids_list=config.centroids.n_centroids_list,
-        kmeans_init=config.centroids.kmeans_init,
-        kmeans_iters=config.centroids.kmeans_iters,
-        sk_epsilons=config.centroids.sk_epsilons,
-        sk_iters=config.centroids.sk_iters,
-    )
+        "tau": config.loss.tau,
+        "bias": config.loss.bias,
+        "freeze_tau": config.loss.freeze_tau,
+        "freeze_bias": config.loss.freeze_bias,
+        "n_centroids_list": config.centroids.n_centroids_list,
+        "kmeans_init": config.centroids.kmeans_init,
+        "kmeans_iters": config.centroids.kmeans_iters,
+        "sk_epsilons": config.centroids.sk_epsilons,
+        "sk_iters": config.centroids.sk_iters,
+    }
+
+    if model_type == "hyperbolic":
+        kwargs["c"] = config.model.get("c", 1.0)
+
+    model = COSETTE(**kwargs)
     model = torch.compile(model)
 
     print("Model : ", model)
@@ -512,7 +503,6 @@ def make_cosette_embs(config):
 
     sd = torch.load(last_ckpt, weights_only=False, map_location="cpu")
 
-    # Safely route the loading parameters back depending on compilation wrappers
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(sd["state_dict"])
     else:

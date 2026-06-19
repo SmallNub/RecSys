@@ -1,6 +1,7 @@
 import collections
 import copy
 import os
+import csv
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
@@ -123,33 +124,36 @@ def main(config):
 
     with fs.open(model_path, "rb") as f:
         ckpt = torch.load(f, map_location=torch.device("cpu"), weights_only=False)
-
         model_cfg = ckpt.pop("config")
         state_dict = ckpt.pop("state_dict", None)
 
-        model = COSETTE(
-            embs_block=None,  # Provided at inference time
-            # Dimensions
-            in_dim=embs_block.shape[-1],
-            layers=model_cfg.model.layers,
-            # Quantization
-            n_centroids_list=model_cfg.centroids.n_centroids_list,
-            dropout_prob=model_cfg.optim.dropout_prob,
-            loss_weights={
+        # --- THE FIX: DYNAMIC MODEL INITIALIZATION ---
+        kwargs = {
+            "embs_block": None,  # Provided at inference time
+            "in_dim": embs_block.shape[-1],
+            "layers": model_cfg.model.layers,
+            "n_centroids_list": model_cfg.centroids.n_centroids_list,
+            "dropout_prob": model_cfg.optim.dropout_prob,
+            "loss_weights": {
                 "quantization": 1,
                 "reconstruction": model_cfg.loss.reconstruction_weight,
                 "contrastive": model_cfg.loss.contrastive_weight,
             },
-            tau=model_cfg.loss.tau,
-            bias=model_cfg.loss.bias,
-            freeze_tau=model_cfg.loss.freeze_tau,
-            freeze_bias=model_cfg.loss.freeze_bias,
-            # Cluster assignment
-            kmeans_init=model_cfg.centroids.kmeans_init,
-            kmeans_iters=model_cfg.centroids.kmeans_iters,
-            sk_epsilons=model_cfg.centroids.sk_epsilons,
-            sk_iters=model_cfg.centroids.sk_iters,
-        )
+            "tau": model_cfg.loss.tau,
+            "bias": model_cfg.loss.bias,
+            "freeze_tau": model_cfg.loss.freeze_tau,
+            "freeze_bias": model_cfg.loss.freeze_bias,
+            "kmeans_init": model_cfg.centroids.kmeans_init,
+            "kmeans_iters": model_cfg.centroids.kmeans_iters,
+            "sk_epsilons": model_cfg.centroids.sk_epsilons,
+            "sk_iters": model_cfg.centroids.sk_iters,
+        }
+
+        # Inject curvature 'c' if hyperbolic
+        if model_type == "hyperbolic":
+            kwargs["c"] = model_cfg.model.get("c", 1.0)
+
+        model = COSETTE(**kwargs)
 
         # We didn't save the embeddings block
         model.load_state_dict(state_dict)
@@ -162,10 +166,11 @@ def main(config):
     all_distances = []
     all_indices_tup_set = set()
 
-    # --- HYBRID TOGGLE: Curvature execution ---
+    # --- THE FIX: DYNAMIC CURVATURE INFERENCE ---
     if model_type == "hyperbolic":
+        c_val = model_cfg.model.get("c", 1.0)
         indices, all_distances = model.get_indices(
-            embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False, c=1.0
+            embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False, c=c_val
         )
     else:
         indices, all_distances = model.get_indices(
@@ -204,6 +209,11 @@ def main(config):
     level = len(model_cfg.centroids.n_centroids_list) - 1
     max_num = model_cfg.centroids.n_centroids_list[0]
 
+    # Capture initial collision rate before resolving
+    tot_item_init = len(all_indices_tup)
+    tot_indice_init = len(set(all_indices_tup))
+    initial_collision_rate = (tot_item_init - tot_indice_init) / tot_item_init
+
     while True:
         tot_item = len(all_indices_tup)
         tot_indice = len(set(all_indices_tup))
@@ -237,7 +247,6 @@ def main(config):
                     ori_code[level] = sort_distances_index[item][level][num]
                     num += 1
 
-                # FIX: Changed inner loop variable from `i` to `j` to prevent shadowing
                 for j in range(1, max_num):
                     if tuple(ori_code) in all_indices_tup_set:
                         ori_code = copy.deepcopy(all_indices[item])
@@ -259,11 +268,13 @@ def main(config):
 
     print("All indices number: ", len(all_indices))
     print(len(set([str(code) for code in all_indices])))
-    print("Max number of conflicts: ", max(get_indices_count(all_indices_tup).values()))
+    max_conflicts = max(get_indices_count(all_indices_tup).values())
+    print("Max number of conflicts: ", max_conflicts)
 
     tot_item = len(all_indices_tup)
     tot_indice = len(set(all_indices_tup))
-    print("Final Collision Rate", (tot_item - tot_indice) / tot_item)
+    final_collision_rate = (tot_item - tot_indice) / tot_item
+    print("Final Collision Rate", final_collision_rate)
 
     codes_holder = np.zeros((embs_block.shape[0], indices.shape[1]), dtype=np.int32)
     for i, code in enumerate(all_indices):
@@ -284,6 +295,38 @@ def main(config):
     )
     df.to_parquet(quantized_path, filesystem=fs)
     print("Quantized data saved to", quantized_path)
+
+    # --- CSV LOGGING FOR MULTIRUN (ONE ROW PER EXPERIMENT) ---
+    c_val = model_cfg.model.get("c", "N/A") if model_type == "hyperbolic" else "N/A"
+    run_directory = latest_dir_name if isinstance(latest_dir_name, str) else str(latest_dir_name)
+    category = config.data.category
+
+    # Combine ALL metadata and metrics into a single dictionary
+    row_data = {
+        "run_directory": run_directory,
+        "category": category,
+        "model_type": model_type,
+        "curvature_c": c_val,
+        "initial_collision_rate": initial_collision_rate,
+        "final_collision_rate": final_collision_rate,
+        "iterations_to_solve": tt,
+        "total_collision_items": len(all_collision_items),
+        "max_conflicts": max_conflicts
+    }
+
+    os.makedirs(config.paths.ckpt_dir, exist_ok=True)
+    summary_path = os.path.join(config.paths.ckpt_dir, "results_summary.csv")
+    file_exists = os.path.exists(summary_path)
+
+    fieldnames = list(row_data.keys())
+
+    with open(summary_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_data)
+
+    print(f"[INFO] Results appended to {summary_path} (1 row added)")
 
 
 if __name__ == "__main__":
