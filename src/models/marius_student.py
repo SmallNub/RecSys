@@ -149,21 +149,27 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        distill_temp=3.0, # Kept at standard 3.0 configuration         
+        distill_temp=4.0,
+        ce_weight=0.1,
+        distill_weight=1.0,
+        student_mask_prob=0.25,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
+        self.distill_temp = distill_temp
+        self.ce_weight = ce_weight
+        self.distill_weight = distill_weight
+        self.student_mask_prob = student_mask_prob
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
         t_emb_drop = temporal_cfg.emb_dropout if temporal_cfg.emb_dropout is not None else temporal_cfg.dropout
         d_emb_drop = depth_cfg.emb_dropout if depth_cfg.emb_dropout is not None else depth_cfg.dropout
 
-        # Load Teacher Model
+        # Load Pre-trained Fixed Expert Teacher
         self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
-        self.distill_temp = distill_temp
         if self.teacher is not None:
             self.teacher.eval()
             for param in self.teacher.parameters():
@@ -183,7 +189,6 @@ class MARIUS(nn.Module):
 
         self.temp_emb_ln = nn.LayerNorm(temporal_cfg.d_model)
         self.depth_emb_ln = nn.LayerNorm(depth_cfg.d_model)
-
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
         self.dropout_t = nn.Dropout(t_emb_drop)
@@ -201,12 +206,9 @@ class MARIUS(nn.Module):
 
         self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
-
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         
-        # Clean standard CrossEntropy without explicit label smoothing noise
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -231,6 +233,17 @@ class MARIUS(nn.Module):
                 torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
             if hasattr(block.ffn, 'w3'):
                 torch.nn.init.normal_(block.ffn.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
+
+    def _corrupt_student_input(self, input_tensor):
+        """Forces the student to infer missing context by randomly masking token streams."""
+        corrupted = input_tensor.clone()
+        valid_mask = (corrupted[:, :, 0] != SpecialTokens.PAD.value)
+        
+        rand_grid = torch.rand(corrupted.shape[:2], device=input_tensor.device)
+        mask_condition = (rand_grid < self.student_mask_prob) & valid_mask
+        
+        corrupted[mask_condition] = 0 
+        return corrupted
 
     def get_param_groups(self):
         def _select_no_decay(n):
@@ -297,39 +310,36 @@ class MARIUS(nn.Module):
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
         
-        # 1. Forward pass
-        temporal = self.temporal_forward(inp)
-        logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
-        
-        # 2. Hard Target Loss (Full Capacity)
-        logits_rearranged = rearrange(logits, "b l v -> b v l")
-        ce_loss = self.criterion(logits_rearranged, target_rearranged)
-
-        # Constant maximum capacity baseline strategy
-        final_loss = 1.0 * ce_loss
-
-        # 3. Soft Target Distillation Loss (Full Capacity)
+        # 1. Teacher Forward Pass (Pristine Input Track)
         if self.teacher is not None:
             with torch.no_grad():
-                if hasattr(self.teacher, "train_forward_fused"):
-                    t_temporal = self.teacher.temporal_forward(inp)
-                    teacher_logits, _, _, _ = self.teacher.train_forward_fused(t_temporal, tgt)
-                else:
-                    teacher_logits, _ = self.teacher.train_forward(inp, tgt)
+                temporal_teacher = self.teacher.temporal_forward(inp)
+                logits_teacher, _, _, _ = self.teacher.train_forward_fused(temporal_teacher, tgt)
 
+        # 2. Student Forward Pass (Asymmetric Masked Track)
+        student_input = self._corrupt_student_input(inp) if self.training else inp
+        temporal_student = self.temporal_forward(student_input)
+        logits_student, _, _, target_rearranged = self.train_forward_fused(temporal_student, tgt)
+        
+        # 3. Suppressed Hard CE Loss Component
+        logits_rearranged = rearrange(logits_student, "b l v -> b v l")
+        ce_loss = self.criterion(logits_rearranged, target_rearranged)
+        final_loss = self.ce_weight * ce_loss
+
+        # 4. Soft Target Ranking Distribution Alignment
+        if self.teacher is not None:
             mask = target_rearranged != -100
             if mask.any():
-                flat_student = logits[mask]
-                flat_teacher = teacher_logits[mask]
+                flat_student = logits_student[mask]
+                flat_teacher = logits_teacher[mask]
 
                 soft_student = F.log_softmax(flat_student / self.distill_temp, dim=-1)
                 soft_teacher = F.softmax(flat_teacher / self.distill_temp, dim=-1)
                 distill_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (self.distill_temp ** 2)
                 
-                # Dynamic weight addition matching CE baseline
-                final_loss += 1.0 * distill_loss
+                final_loss += self.distill_weight * distill_loss
 
-        return final_loss, logits
+        return final_loss, logits_student
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
