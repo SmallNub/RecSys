@@ -177,7 +177,7 @@ class MARIUS(nn.Module):
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
         # Setup Distillation attributes
-        self.teacher, _ = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
+        self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
         self.distill_temp = distill_temp
         if self.teacher is not None:
             self.teacher.eval()
