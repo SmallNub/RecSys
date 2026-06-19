@@ -153,8 +153,11 @@ class MARIUS(nn.Module):
         truncation_weight=0.25,
         listwise_weight=0.40,
         repr_weight=0.35,
-        decay_steps=15000,
-        distill_temp=3.0,      # Smoothing factor for structural probabilities
+        # Balanced 3-Phase Schedule Configuration
+        phase1_duration=20000,
+        phase2_duration=15000,
+        phase3_duration=5000,
+        distill_temp=3.0,          
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
@@ -166,7 +169,11 @@ class MARIUS(nn.Module):
         self.listwise_weight = listwise_weight
         self.repr_weight = repr_weight
 
-        self.decay_steps = float(decay_steps)
+        # Set up explicit milestones
+        self.p1_end = phase1_duration
+        self.p2_end = phase1_duration + phase2_duration
+        self.total_steps = phase1_duration + phase2_duration + phase3_duration
+        
         self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
@@ -223,7 +230,6 @@ class MARIUS(nn.Module):
         self.listwise_temp = nn.Parameter(torch.tensor(0.0))
         self.repr_temp = nn.Parameter(torch.tensor(0.0))
 
-        # Restores low-variance standard-deviation stability
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -383,7 +389,7 @@ class MARIUS(nn.Module):
         temporal = self.temporal_forward(inp)
         logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
         
-        # 2. Compute Raw Underling Losses
+        # 2. Compute Raw Underlying Losses
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
         
@@ -391,39 +397,55 @@ class MARIUS(nn.Module):
         listwise_loss = self.compute_plackett_luce_loss(logits, target_rearranged)
         repr_loss = self.compute_infonce_loss(hidden_states, target_rearranged)
         
-        # Aggregate the raw custom structural components
         total_structural = (
             self.truncation_weight * trunc_loss + 
             self.listwise_weight * listwise_loss + 
             self.repr_weight * repr_loss
         )
 
-        # 3. Dynamic Schedule Engine
+        # 3. Comprehensive 3-Phase Scheduling Core
+        ce_floor = 0.15
+        p2_distill_floor = 0.40
+
         if self.training:
             self.current_step += 1
-            # Progress factor moves from 0.0 to 1.0
-            progress = min(1.0, self.current_step.item() / self.decay_steps)
-            # Cosine factor moves from 1.0 down to 0.0
-            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            step = min(self.current_step.item(), self.total_steps)
+            
+            if step <= self.p1_end:
+                # --- PHASE 1: Stable Replication Mode ---
+                w_ce = 1.0
+                w_distill = 1.0
+                w_structural = 0.0
+                
+            elif step <= self.p2_end:
+                # --- PHASE 2: Hand-Off Smooth Mixing Window ---
+                p2_progress = (step - self.p1_end) / float(self.p2_end - self.p1_end)
+                # Cosine wave maps from 1.0 smoothly down to 0.0
+                cos_f = 0.5 * (1.0 + math.cos(math.pi * p2_progress))
+                
+                w_ce = ce_floor + (1.0 - ce_floor) * cos_f
+                w_distill = p2_distill_floor + (1.0 - p2_distill_floor) * cos_f
+                w_structural = (1.0 - ce_floor) * (1.0 - cos_f)
+                
+            else:
+                # --- PHASE 3: Autonomous Ranking Refinement ---
+                p3_progress = (step - self.p2_end) / float(self.total_steps - self.p2_end)
+                cos_f3 = 0.5 * (1.0 + math.cos(math.pi * p3_progress))
+                
+                w_ce = ce_floor
+                w_structural = 1.0 - ce_floor
+                # Slowly evaporate the remaining distillation cushion to absolute 0
+                w_distill = p2_distill_floor * cos_f3
         else:
-            cosine_factor = 0.0  # Validation defaults to pure advanced structural mode
+            # Inference evaluation assumes perfect Phase 3 criteria
+            w_ce = ce_floor
+            w_distill = 0.0
+            w_structural = 1.0 - ce_floor
 
-        # Define explicit boundary conditions
-        ce_floor = 0.15
-        
-        # Distillation drops cleanly from 1.0 -> 0.0
-        w_distill = cosine_factor 
-        
-        # Standard CE drops from 1.0 -> ce_floor (0.15)
-        w_ce = ce_floor + (1.0 - ce_floor) * cosine_factor
-        
-        # Custom Structural losses perform the INVERSE: ramp up from 0.0 -> (1.0 - ce_floor)
-        w_structural = (1.0 - ce_floor) * (1.0 - cosine_factor)
-
-        # 4. Apply Weights Linearly
+        # 4. Mix Active Standard Gradients
         final_loss = (w_ce * ce_loss) + (w_structural * total_structural)
 
-        # 5. Inject Teacher Supervision (Only active during early training)
+        # 5. Inject Teacher Logit Matching (Active across Phase 1, Phase 2, and Phase 3 fade)
         if self.teacher is not None and self.training and w_distill > 0.0:
             with torch.no_grad():
                 if hasattr(self.teacher, "train_forward_fused"):
@@ -441,7 +463,6 @@ class MARIUS(nn.Module):
                 soft_teacher = F.softmax(flat_teacher / self.distill_temp, dim=-1)
                 distill_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (self.distill_temp ** 2)
                 
-                # Append the teacher's guidance directly to the gradient profile
                 final_loss += w_distill * distill_loss
 
         return final_loss, logits
