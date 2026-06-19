@@ -52,6 +52,7 @@ for CATEGORY in "${CATEGORIES[@]}"; do
     echo "========================================"
 
     for RUN_IDX in $(seq 1 ${N_RUNS}); do
+        SEED=${RUN_IDX}
         echo "----------------------------------------"
         echo ">>> ${CATEGORY} - Run ${RUN_IDX}/${N_RUNS}"
         echo "----------------------------------------"
@@ -84,7 +85,8 @@ print(max(runs))
             data.datasets.category=${CATEGORY} \
             data.datasets.quant_id=${QUANT}-col \
             paths.root=${DATASET_ROOT} \
-            paths.model_folder_tplt=${PWD}/${MARIUS_BASE_DIR}
+            paths.model_folder_tplt=${PWD}/${MARIUS_BASE_DIR} \
+            seed=${SEED}
 
         # Step 5: Resolve latest MARIUS run directory
         LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
