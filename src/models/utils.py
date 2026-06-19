@@ -6,24 +6,23 @@ import torch
 from omegaconf import OmegaConf
 
 
-def load_model_from_path(run_directory: str, protocol: str = "file"):
+def load_underlying_model(run_directory: str, protocol: str = "file"):
     """
-    Finds the latest checkpoint, instantiates the model architecture via Hydra,
-    and loads the trained weights into memory.
+    Loads the checkpoint, extracts the core neural network model,
+    and discards the PyTorch Lightning wrapper.
 
     Args:
-        run_directory (str): The path to the model's root run folder.
-        protocol (str): The filesystem protocol (e.g., 'file', 's3', 'gcs').
+        run_directory (str): Path to the model's root run folder.
+        protocol (str): Filesystem protocol ('file', 's3', etc.).
 
     Returns:
-        model: The instantiated PyTorch Lightning model with loaded weights.
-        cfg: The OmegaConf configuration associated with the model.
+        underlying_model: The raw PyTorch nn.Module (e.g., SASRec).
     """
     fs = fsspec.filesystem(protocol)
     target_dir = run_directory
     snapshot_path = os.path.join(run_directory, "checkpoint_manager_snapshot.json")
 
-    # 1. Locate the correct sub-directory (Mirrors get_top_cfg logic)
+    # 1. Locate the correct sub-directory
     if fs.exists(snapshot_path):
         with fs.open(snapshot_path, "r") as f:
             snapshot_data = json.load(f)
@@ -50,24 +49,23 @@ def load_model_from_path(run_directory: str, protocol: str = "file"):
             f"Required config or checkpoint missing in {target_dir}"
         )
 
-    # 2. Load the configuration
+    # 2. Load configuration
     with fs.open(cfg_path) as f:
         cfg = OmegaConf.load(f)
 
-    print(f"[INFO] Instantiating model architecture from config...")
-    # 3. Instantiate the model shell via Hydra
-    model = hydra.utils.instantiate(cfg["model"])
-    model.full_hydra_config = cfg
+    # 3. Instantiate the Lightning wrapper shell
+    # We do this because the checkpoint weights are saved with a "net." prefix
+    lit_module = hydra.utils.instantiate(cfg["model"])
 
-    print(f"[INFO] Loading checkpoint weights from {ckpt_path}...")
-    # 4. Extract and load the state dict weights into the shell
+    # 4. Load the weights into the wrapper
     with fs.open(ckpt_path, "rb") as f:
         checkpoint = torch.load(f, map_location="cpu", weights_only=False)
+        state_dict = (
+            checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        )
+        lit_module.load_state_dict(state_dict)
 
-        # PyTorch Lightning saves model weights under the 'state_dict' key
-        if "state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["state_dict"])
-        else:
-            model.load_state_dict(checkpoint)
+    # 5. Extract only the raw underlying network
+    model = lit_module.net
 
-    return model, cfg
+    return model
