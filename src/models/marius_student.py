@@ -149,30 +149,18 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        top_k=10,
-        truncation_weight=0.25,
-        listwise_weight=0.40,
-        repr_weight=0.35,
-        # Balanced 3-Phase Schedule Configuration
-        phase1_duration=20000,
+        # Pure Imitation Schedule Configuration
+        phase1_duration=25000,
         phase2_duration=15000,
-        phase3_duration=5000,
         distill_temp=3.0,          
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
-        
-        self.top_k = top_k
-        self.truncation_weight = truncation_weight
-        self.listwise_weight = listwise_weight
-        self.repr_weight = repr_weight
 
-        # Set up explicit milestones
         self.p1_end = phase1_duration
-        self.p2_end = phase1_duration + phase2_duration
-        self.total_steps = phase1_duration + phase2_duration + phase3_duration
+        self.total_steps = phase1_duration + phase2_duration
         
         self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
@@ -183,7 +171,7 @@ class MARIUS(nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Setup Distillation attributes
+        # Setup Teacher Module
         self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
         self.distill_temp = distill_temp
         if self.teacher is not None:
@@ -226,9 +214,6 @@ class MARIUS(nn.Module):
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
-        
-        self.listwise_temp = nn.Parameter(torch.tensor(0.0))
-        self.repr_temp = nn.Parameter(torch.tensor(0.0))
 
         self.apply(self._init_weights)
 
@@ -257,7 +242,7 @@ class MARIUS(nn.Module):
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return any(k in n for k in ["_emb", "norm"]) or n.endswith("_temp")
+            return any(k in n for k in ["_emb", "norm"])
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -317,135 +302,40 @@ class MARIUS(nn.Module):
         logits, hidden_states = self.depth_forward(tgt)
         return logits, hidden_states, mid, target
 
-    def compute_softmax_loss_at_k(self, logits, targets, k=10):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-
-        flat_logits = logits[mask]
-        flat_targets = targets[mask]
-
-        pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1)).squeeze(-1)
-        topk_scores, _ = torch.topk(flat_logits, k=k, dim=-1)
-        
-        max_scores = torch.max(topk_scores, dim=-1)[0]
-        shifted_topk = topk_scores - max_scores.unsqueeze(-1)
-        shifted_pos = pos_scores - max_scores
-
-        denom = torch.log(torch.exp(shifted_pos) + torch.exp(shifted_topk).sum(dim=-1) + 1e-8) + max_scores
-        return torch.mean(denom - pos_scores)
-
-    def compute_plackett_luce_loss(self, logits, targets):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-
-        flat_logits = logits[mask]
-        flat_targets = targets[mask]
-
-        pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1))
-        topk_neg, _ = torch.topk(flat_logits, k=32, dim=-1)
-        
-        slate = torch.cat([pos_scores, topk_neg], dim=-1)
-        t = torch.exp(self.listwise_temp).clamp(min=1e-3, max=5.0)
-        scaled_slate = slate / t
-
-        max_val = torch.max(scaled_slate, dim=-1, keepdim=True)[0]
-        norm_slate = scaled_slate - max_val
-        denom = torch.log(torch.exp(norm_slate).sum(dim=-1) + 1e-8) + max_val.squeeze(-1)
-        log_prob = scaled_slate[:, 0] - denom
-
-        return torch.mean(-log_prob)
-
-    def compute_infonce_loss(self, hidden_states, targets):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=hidden_states.device)
-
-        flat_h = hidden_states[mask]
-        flat_targets = targets[mask]
-
-        pos_emb = self.depth_emb(flat_targets)
-        
-        flat_h_norm = F.normalize(flat_h, p=2, dim=-1)
-        pos_emb_norm = F.normalize(pos_emb, p=2, dim=-1)
-
-        similarity_matrix = torch.matmul(flat_h_norm, pos_emb_norm.T)
-        
-        t = torch.exp(self.repr_temp).clamp(min=1e-2, max=1.0)
-        logits = similarity_matrix / t
-        
-        collision_mask = flat_targets.unsqueeze(0) == flat_targets.unsqueeze(1)
-        identity_mask = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
-        logits = logits.masked_fill(collision_mask & ~identity_mask, -1e9)
-        
-        labels = torch.arange(logits.shape[0], device=hidden_states.device)
-        return F.cross_entropy(logits, labels)
-
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
         
-        # 1. Base Forward Passes
+        # 1. Standard Forward Passes
         temporal = self.temporal_forward(inp)
-        logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
+        logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
         
-        # 2. Compute Raw Underlying Losses
+        # 2. Base Hard Target Loss
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
-        
-        trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
-        listwise_loss = self.compute_plackett_luce_loss(logits, target_rearranged)
-        repr_loss = self.compute_infonce_loss(hidden_states, target_rearranged)
-        
-        total_structural = (
-            self.truncation_weight * trunc_loss + 
-            self.listwise_weight * listwise_loss + 
-            self.repr_weight * repr_loss
-        )
 
-        # 3. Comprehensive 3-Phase Scheduling Core
-        ce_floor = 0.15
-        p2_distill_floor = 0.40
-
+        # 3. Two-Phase Pure Distillation Schedule Engine
         if self.training:
             self.current_step += 1
             step = min(self.current_step.item(), self.total_steps)
             
             if step <= self.p1_end:
-                # --- PHASE 1: Stable Replication Mode ---
+                # PHASE 1: Complete Mimicry
                 w_ce = 1.0
                 w_distill = 1.0
-                w_structural = 0.0
-                
-            elif step <= self.p2_end:
-                # --- PHASE 2: Hand-Off Smooth Mixing Window ---
-                p2_progress = (step - self.p1_end) / float(self.p2_end - self.p1_end)
-                # Cosine wave maps from 1.0 smoothly down to 0.0
-                cos_f = 0.5 * (1.0 + math.cos(math.pi * p2_progress))
-                
-                w_ce = ce_floor + (1.0 - ce_floor) * cos_f
-                w_distill = p2_distill_floor + (1.0 - p2_distill_floor) * cos_f
-                w_structural = (1.0 - ce_floor) * (1.0 - cos_f)
-                
             else:
-                # --- PHASE 3: Autonomous Ranking Refinement ---
-                p3_progress = (step - self.p2_end) / float(self.total_steps - self.p2_end)
-                cos_f3 = 0.5 * (1.0 + math.cos(math.pi * p3_progress))
-                
-                w_ce = ce_floor
-                w_structural = 1.0 - ce_floor
-                # Slowly evaporate the remaining distillation cushion to absolute 0
-                w_distill = p2_distill_floor * cos_f3
+                # PHASE 2: Linear Autonomy Transition
+                w_ce = 1.0
+                p2_progress = (step - self.p1_end) / float(self.total_steps - self.p1_end)
+                w_distill = 0.5 * (1.0 + math.cos(math.pi * p2_progress))
         else:
-            # Inference evaluation assumes perfect Phase 3 criteria
-            w_ce = ce_floor
+            # During evaluation, track performance purely under autonomous conditions
+            w_ce = 1.0
             w_distill = 0.0
-            w_structural = 1.0 - ce_floor
 
-        # 4. Mix Active Standard Gradients
-        final_loss = (w_ce * ce_loss) + (w_structural * total_structural)
+        # Calculate final training token loss
+        final_loss = w_ce * ce_loss
 
-        # 5. Inject Teacher Logit Matching (Active across Phase 1, Phase 2, and Phase 3 fade)
+        # 4. Integrate soft label matching from Teacher
         if self.teacher is not None and self.training and w_distill > 0.0:
             with torch.no_grad():
                 if hasattr(self.teacher, "train_forward_fused"):
