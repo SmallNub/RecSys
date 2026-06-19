@@ -62,7 +62,7 @@ def load_model_from_path(run_directory: str, protocol: str = "file"):
     print(f"[INFO] Loading checkpoint weights from {ckpt_path}...")
     # 4. Extract and load the state dict weights into the shell
     with fs.open(ckpt_path, "rb") as f:
-        checkpoint = torch.load(f, map_location="cpu")
+        checkpoint = torch.load(f, map_location="cpu", weights_only=False)
 
         # PyTorch Lightning saves model weights under the 'state_dict' key
         if "state_dict" in checkpoint:
