@@ -19,8 +19,8 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export HYDRA_FULL_ERROR=1
 
 CATEGORY="Beauty"
-EXPERIMENT="marius_better"
-TASKNAME="MARIUS_better"
+EXPERIMENT="marius_student"
+TASKNAME="MARIUS_student"
 
 COSETTE_BASE_DIR="outputs/checkpoints/cosette"
 LATEST_COSETTE_DIR=$(ls -1d ${COSETTE_BASE_DIR}/*/ 2>/dev/null | sort | tail -n 1)
