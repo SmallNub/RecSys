@@ -282,7 +282,8 @@ class MARIUS(nn.Module):
         logits = torch.matmul(hidden_states, self.depth_emb.weight.T)
         return logits, hidden_states
 
-    def train_forward_fused(self, temporal, target):
+    def train_forward(self, input, target):
+        temporal = self.temporal_forward(input)
         mid = self.mid_proj(temporal)
         mid = rearrange(mid, "b l d -> (b l) 1 d")
 
@@ -313,13 +314,11 @@ class MARIUS(nn.Module):
         # 1. Teacher Forward Pass (Pristine Input Track)
         if self.teacher is not None:
             with torch.no_grad():
-                temporal_teacher = self.teacher.temporal_forward(inp)
-                logits_teacher, _, _, _ = self.teacher.train_forward_fused(temporal_teacher, tgt)
+                logits_teacher, *_ = self.teacher.train_forward(inp, tgt)
 
         # 2. Student Forward Pass (Asymmetric Masked Track)
         student_input = self._corrupt_student_input(inp) if self.training else inp
-        temporal_student = self.temporal_forward(student_input)
-        logits_student, _, _, target_rearranged = self.train_forward_fused(temporal_student, tgt)
+        logits_student, _, _, target_rearranged = self.train_forward(student_input, tgt)
         
         # 3. Suppressed Hard CE Loss Component
         logits_rearranged = rearrange(logits_student, "b l v -> b v l")
