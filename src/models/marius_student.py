@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from src.models import SpecialTokens
-from src.models.utils import load_model_from_path
+from src.models.utils import load_model
 
 
 @dataclass
@@ -177,7 +177,7 @@ class MARIUS(nn.Module):
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
         # Setup Distillation attributes
-        self.teacher, _ = load_model_from_path("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
+        self.teacher, _ = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
         self.distill_temp = distill_temp
         if self.teacher is not None:
             self.teacher.eval()

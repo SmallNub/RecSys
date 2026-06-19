@@ -6,7 +6,7 @@ import torch
 from omegaconf import OmegaConf
 
 
-def load_underlying_model(run_directory: str, protocol: str = "file"):
+def load_model(run_directory: str, protocol: str = "file"):
     """
     Loads the checkpoint, extracts the core neural network model,
     and discards the PyTorch Lightning wrapper.
@@ -16,7 +16,7 @@ def load_underlying_model(run_directory: str, protocol: str = "file"):
         protocol (str): Filesystem protocol ('file', 's3', etc.).
 
     Returns:
-        underlying_model: The raw PyTorch nn.Module (e.g., SASRec).
+        model: The raw PyTorch nn.Module (e.g., SASRec).
     """
     fs = fsspec.filesystem(protocol)
     target_dir = run_directory
