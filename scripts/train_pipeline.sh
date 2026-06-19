@@ -35,15 +35,15 @@ EXPERIMENT="marius"
 TASKNAME="MARIUS"
 
 # Separate data and checkpoint dirs per year to avoid overwrites
-DATASET_ROOT="${PWD}/datasets_${DATASET_YEAR}"
+DATASET_ROOT="${PWD}/datasets/datasets-${DATASET_YEAR}"
 COSETTE_BASE_DIR="outputs/checkpoints/cosette_${DATASET_YEAR}"
 MARIUS_BASE_DIR="outputs/checkpoints/marius_${DATASET_YEAR}"
 
 echo "========================================"
 echo ">>> DATASET YEAR: ${DATASET_YEAR}"
 echo ">>> DATASET ROOT: ${DATASET_ROOT}"
-echo ">>> COSETTE DIR:  ${COSETTE_BASE_DIR}"
-echo ">>> MARIUS DIR:   ${MARIUS_BASE_DIR}"
+COSETTE_BASE_DIR="outputs/checkpoints/cosette-${DATASET_YEAR}"
+MARIUS_BASE_DIR="outputs/checkpoints/marius-${DATASET_YEAR}"
 echo "========================================"
 
 for CATEGORY in "${CATEGORIES[@]}"; do
