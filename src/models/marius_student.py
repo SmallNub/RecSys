@@ -149,9 +149,11 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        # Pure Imitation Schedule Configuration
-        phase1_duration=25000,
+        # Inverted Anchor Schedule Milestones
+        phase1_duration=15000,
         phase2_duration=15000,
+        phase3_duration=10000,
+        max_ce_weight=0.40,
         distill_temp=3.0,          
     ):
         super().__init__()
@@ -159,8 +161,10 @@ class MARIUS(nn.Module):
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
 
+        self.max_ce_weight = max_ce_weight
         self.p1_end = phase1_duration
-        self.total_steps = phase1_duration + phase2_duration
+        self.p2_end = phase1_duration + phase2_duration
+        self.total_steps = phase1_duration + phase2_duration + phase3_duration
         
         self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
@@ -171,7 +175,7 @@ class MARIUS(nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Setup Teacher Module
+        # Load Teacher Model
         self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
         self.distill_temp = distill_temp
         if self.teacher is not None:
@@ -213,7 +217,7 @@ class MARIUS(nn.Module):
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.05)
 
         self.apply(self._init_weights)
 
@@ -305,38 +309,44 @@ class MARIUS(nn.Module):
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
         
-        # 1. Standard Forward Passes
+        # 1. Base Forward Passes
         temporal = self.temporal_forward(inp)
         logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
         
-        # 2. Base Hard Target Loss
+        # 2. Compute underlying Cross Entropy
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
 
-        # 3. Two-Phase Pure Distillation Schedule Engine
+        # 3. Dynamic Inverted Anchor Schedule Setup
         if self.training:
             self.current_step += 1
             step = min(self.current_step.item(), self.total_steps)
             
             if step <= self.p1_end:
-                # PHASE 1: Complete Mimicry
-                w_ce = 1.0
+                # PHASE 1: Pure Teacher Bootstrap
                 w_distill = 1.0
+                w_ce = 0.0
+            elif step <= self.p2_end:
+                # PHASE 2: Smooth Introduction of Cross Entropy Regularization
+                w_distill = 1.0
+                p2_progress = (step - self.p1_end) / float(self.p2_end - self.p1_end)
+                # Cosine curve rising from 0.0 to max_ce_weight
+                cos_f = 0.5 * (1.0 - math.cos(math.pi * p2_progress))
+                w_ce = self.max_ce_weight * cos_f
             else:
-                # PHASE 2: Linear Autonomy Transition
-                w_ce = 1.0
-                p2_progress = (step - self.p1_end) / float(self.total_steps - self.p1_end)
-                w_distill = 0.5 * (1.0 + math.cos(math.pi * p2_progress))
+                # PHASE 3: Fixed Joint Equilibrium
+                w_distill = 1.0
+                w_ce = self.max_ce_weight
         else:
-            # During evaluation, track performance purely under autonomous conditions
-            w_ce = 1.0
-            w_distill = 0.0
+            # Evaluate using the target validation mix (Phase 3 conditions)
+            w_distill = 1.0
+            w_ce = self.max_ce_weight
 
-        # Calculate final training token loss
+        # Accumulate balanced token loss
         final_loss = w_ce * ce_loss
 
-        # 4. Integrate soft label matching from Teacher
-        if self.teacher is not None and self.training and w_distill > 0.0:
+        # 4. Process Teacher Soft Target Distillation (Always active)
+        if self.teacher is not None and w_distill > 0.0:
             with torch.no_grad():
                 if hasattr(self.teacher, "train_forward_fused"):
                     t_temporal = self.teacher.temporal_forward(inp)
