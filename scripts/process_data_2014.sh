@@ -17,18 +17,13 @@ module load Anaconda3/2025.06-1
 source activate recsys
 
 export PYTHONPATH=$PWD:$PYTHONPATH
-export HYDRA_FULL_ERROR=1
 
-# CATEGORIES=("All_Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
-CATEGORIES=("Arts_Crafts_and_Sewing" "Cell_Phones_and_Accessories" "Health_and_Household")
+CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
 
-# Join array with commas for hydra list format
-JOINED_CATEGORIES=$(IFS=, ; echo "${CATEGORIES[*]}")
+python scripts/download_data.py --year 2014 --categories "${CATEGORIES[@]}"
 
-python scripts/download_data.py --year 2023 --categories "${CATEGORIES[@]}"
-
-python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet \
-    categories="[$JOINED_CATEGORIES]" \
+python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 \
+    categories="[Beauty,Sports_and_Outdoors,Toys_and_Games,Movies_and_TV,Video_Games]" \
     paths.skip_download=true
 
 for CATEGORY in "${CATEGORIES[@]}"; do

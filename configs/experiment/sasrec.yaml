@@ -6,14 +6,14 @@ model:
   net: 
     _target_: src.models.sasrec.SASRec
     vocab_size: 3_000_000 # Should be overriden at instantiation
-    n_layers: 2
-    d_head: 4
-    d_model: 32
+    n_layers: 4
+    d_head: 16
+    d_model: 128
     dropout: 0.4
     emb_dropout: 0.4
     seq_len: ${data.datasets.prepro_cfg.crop_length}
     filter_preds: true # Better evaluation of "true" validation metrics, but slower
-    normalization: null
+    normalization: l2
     criterion:
       _target_: src.models.sasrec.SampledSoftmax
       temperature: 0.05

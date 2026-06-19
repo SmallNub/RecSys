@@ -25,6 +25,7 @@ class LitModule(LightningModule):
 
         # Diversity/popularity context — injected from test.py before trainer.test
         self.code_to_item = None       # dict: tuple(centroid_code) -> item_id
+        self.id_to_item = None         # dict: vocab_id -> item_id
         self.item_embeddings = None    # dict: item_id -> np.array
         self.popularity_counts = None  # dict: item_id -> int
         self.n_centroids = None        # int: number of centroids per level
@@ -126,9 +127,8 @@ class LitModule(LightningModule):
             )
 
         # Accumulate gen directly for diversity metrics (test only).
-        # gen already has filter_preds applied and contains valid token IDs
-        # in range [2, 1025] which decode correctly to centroid indices.
-        if split == "test" and self.code_to_item is not None:
+        # gen already has filter_preds applied and contains valid token IDs.
+        if split == "test" and (self.code_to_item is not None or self.id_to_item is not None):
             self._accumulate_diversity(gen)
 
     def _decode_token_to_centroid(self, code):
@@ -147,17 +147,29 @@ class LitModule(LightningModule):
     def _accumulate_diversity(self, gen):
         """
         Accumulate per-batch recommendations for end-of-epoch diversity computation.
-        gen: B x K x L — token IDs from search() with filter_preds applied.
+        gen: B x K x L — token IDs from search() with filter_preds applied (generative)
+             or B x K — item vocab indices (dense)
         """
         B = gen.shape[0]
         for b in range(B):
-            rec_codes = gen[b].cpu().tolist()  # K x L
             rec_items = []
-            for code in rec_codes:
-                centroid_code = self._decode_token_to_centroid(code)
-                item_id = self.code_to_item.get(centroid_code)
-                if item_id is not None:
-                    rec_items.append(item_id)
+            if self.mode == "generative":
+                rec_codes = gen[b].cpu().tolist()  # K x L
+                for code in rec_codes:
+                    centroid_code = self._decode_token_to_centroid(code)
+                    if self.code_to_item is not None:
+                        item_id = self.code_to_item.get(centroid_code)
+                        if item_id is not None:
+                            rec_items.append(item_id)
+            elif self.mode == "dense":
+                rec_ids = gen[b].cpu().tolist()  # K
+                for idx in rec_ids:
+                    if self.id_to_item is not None:
+                        item_id = self.id_to_item.get(idx)
+                        if item_id is not None:
+                            rec_items.append(item_id)
+                    else:
+                        rec_items.append(idx)
 
             self._test_rec_items.extend(rec_items)
 
@@ -182,7 +194,7 @@ class LitModule(LightningModule):
         self._test_ild_scores = []
 
     def on_test_epoch_end(self):
-        if self.code_to_item is None:
+        if self.code_to_item is None and self.id_to_item is None:
             return
 
         # ILD

@@ -27,12 +27,12 @@ export WANDB_MODE=offline
 DATASET_YEAR=${1:-2014}
 
 # Categories to run
-CATEGORIES=("Beauty")
+CATEGORIES=("Arts_Crafts_and_Sewing" "Cell_Phones_and_Accessories" "Health_and_Household")
 # CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
 
 N_RUNS=5
-EXPERIMENT="marius_small"
-TASKNAME="MARIUS_small"
+EXPERIMENT="marius"
+TASKNAME="MARIUS"
 
 # Separate data and checkpoint dirs per year to avoid overwrites
 DATASET_ROOT="${PWD}/datasets_${DATASET_YEAR}"
@@ -52,6 +52,7 @@ for CATEGORY in "${CATEGORIES[@]}"; do
     echo "========================================"
 
     for RUN_IDX in $(seq 1 ${N_RUNS}); do
+        SEED=${RUN_IDX}
         echo "----------------------------------------"
         echo ">>> ${CATEGORY} - Run ${RUN_IDX}/${N_RUNS}"
         echo "----------------------------------------"
@@ -84,7 +85,8 @@ print(max(runs))
             data.datasets.category=${CATEGORY} \
             data.datasets.quant_id=${QUANT}-col \
             paths.root=${DATASET_ROOT} \
-            paths.model_folder_tplt=${PWD}/${MARIUS_BASE_DIR}
+            paths.model_folder_tplt=${PWD}/${MARIUS_BASE_DIR} \
+            seed=${SEED}
 
         # Step 5: Resolve latest MARIUS run directory
         LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)

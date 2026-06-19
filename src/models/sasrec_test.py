@@ -17,40 +17,49 @@ class FullSoftmax(torch.nn.Module):
 
 
 class SampledSoftmax(torch.nn.Module):
-    def __init__(self, n_items, temperature=1.0):
+    def __init__(self, n_items, temperature=1.0, pad_idx=-100): # Note: Paper recommends low temp like 0.05
         super().__init__()
-        self.cross_entropy = torch.nn.CrossEntropyLoss()
+        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction='none')
         self.n_items = n_items
-        self.emb_table = None  # Reference set by the model
         self.temperature = temperature
+        self.pad_idx = pad_idx
 
     def __call__(self, embs, target, model):
         B, L, D = embs.shape
-        # Flatten everything
-        embs = embs.view(B * L, D)
-        target = target.view(B * L)
+        
+        # 1. Identify valid (non-padded) positions
+        valid_mask = (target != self.pad_idx).view(-1) 
+        
+        embs_flat = embs.view(B * L, D)
+        target_flat = target.view(B * L)
+        target_clean = torch.where(target_flat == self.pad_idx, 0, target_flat)
 
-        # Get target scores
-        target_scores = (embs * model.get_embs(target)).sum(dim=-1)  # B*L
-        # Sample shared noise & get scores
-        samples = torch.randint(
-            low=0,
-            high=model.embedding.weight.shape[0],
-            size=(self.n_items,),
-            device=embs.device,
-        )
-        noise_scores = embs @ model.get_embs(samples).T
+        # 2. Positive scores (B*L x 1)
+        pos_embs = model.get_embs(target_clean)
+        target_scores = (embs_flat * pos_embs).sum(dim=-1, keepdim=True)
 
-        # Reject samples matching target
-        reject_samples = target[:, None] == samples[None, :]
-        noise_scores -= 1e6 * reject_samples.float()
+        # 3. FIX: Independent negative sampling per sequence step (B*L x n_items)
+        vocab_size = model.embedding.weight.shape[0]
+        samples = torch.randint(0, vocab_size, size=(B * L, self.n_items), device=embs.device)
+        
+        # Gather negative embeddings and compute scores via batched matrix multiplication
+        noise_embs = model.get_embs(samples.view(-1)).view(B * L, self.n_items, D)
+        noise_scores = torch.bmm(embs_flat.unsqueeze(1), noise_embs.transpose(1, 2)).squeeze(1)
 
-        logits = (
-            torch.cat([target_scores[:, None], noise_scores], dim=1) / self.temperature
-        )
-        loss = self.cross_entropy(logits, torch.zeros_like(target))
+        # 4. Remove accidentally sampled targets
+        reject_samples = target_clean[:, None] == samples
+        noise_scores = noise_scores.masked_fill(reject_samples, -1e9)
 
-        return loss, logits
+        # 5. Combine, scale by temperature, and apply masked loss
+        logits = torch.cat([target_scores, noise_scores], dim=1) / self.temperature
+        labels = torch.zeros(B * L, dtype=torch.long, device=embs.device)
+        
+        raw_loss = self.cross_entropy(logits, labels)
+        
+        # FIX: Zero out padding loss and average only over valid elements
+        masked_loss = (raw_loss * valid_mask.float()).sum() / torch.clamp(valid_mask.sum(), min=1)
+
+        return masked_loss, logits
 
 
 class L2Norm(torch.nn.Module):

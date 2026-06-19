@@ -1,0 +1,44 @@
+# @package _global_
+task_name: MARIUS_teacher
+
+trainer:
+  max_steps: 40_000
+  val_check_interval: 2_000
+
+model:
+  net:
+    _target_: src.models.marius_teacher.MARIUS
+    filter_preds: true
+
+    temporal_cfg:
+      _target_: src.models.marius_teacher.TransformerConfig
+      seq_len: ${data.datasets.prepro_cfg.crop_length}
+      vocab_size: 1026
+      n_layers: 2
+      d_head: 64
+      d_model: 256
+      dropout: 0.4
+      emb_dropout: null
+    depth_cfg:
+      _target_: src.models.marius_teacher.TransformerConfig
+      vocab_size: ${model.net.temporal_cfg.vocab_size}
+      seq_len: 4
+      n_layers: 2
+      d_head: 64
+      d_model: ${model.net.temporal_cfg.d_model}
+      dropout: 0.1
+      emb_dropout: null
+  mode: "generative"
+
+  optimizer:
+    lr: 0.0005
+    weight_decay: 0.0001
+  scheduler:
+    warmup_steps: 2000
+
+data:
+  datasets:
+    emb_id: sentence-t5-xl
+    quant_id: COSETTE_128d_256x4_71e4col
+    prepro_cfg:
+      _cls_: src.data.marius.MARIUSPrePro
