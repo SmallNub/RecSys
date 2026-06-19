@@ -149,36 +149,19 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        # Robustness Extensions
-        temporal_noise_scale=0.02, 
-        label_smoothing=0.05,      
-        # Curriculum Schedules
-        phase1_duration=20000,
-        phase2_duration=20000,
-        base_ce_weight=0.25,
-        target_ce_weight=0.75,
-        distill_temp=4.0,         
+        distill_temp=3.0, # Kept at standard 3.0 configuration         
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
-        self.temporal_noise_scale = temporal_noise_scale
-
-        self.base_ce = base_ce_weight
-        self.target_ce = target_ce_weight
-        self.p1_end = phase1_duration
-        self.total_steps = phase1_duration + phase2_duration
-        
-        self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
-        # Safe decoupling of custom embedding dropouts
         t_emb_drop = temporal_cfg.emb_dropout if temporal_cfg.emb_dropout is not None else temporal_cfg.dropout
         d_emb_drop = depth_cfg.emb_dropout if depth_cfg.emb_dropout is not None else depth_cfg.dropout
 
-        # Setup Teacher Module
+        # Load Teacher Model
         self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
         self.distill_temp = distill_temp
         if self.teacher is not None:
@@ -203,7 +186,6 @@ class MARIUS(nn.Module):
 
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
-        # Separated embedding regularizers
         self.dropout_t = nn.Dropout(t_emb_drop)
         self.dropout_d = nn.Dropout(d_emb_drop)
 
@@ -222,8 +204,8 @@ class MARIUS(nn.Module):
 
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
         
-        # Grounded Criterion incorporating label smoothing
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
+        # Clean standard CrossEntropy without explicit label smoothing noise
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
         self.apply(self._init_weights)
 
@@ -315,43 +297,19 @@ class MARIUS(nn.Module):
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
         
-        # 1. Base Model Forward
+        # 1. Forward pass
         temporal = self.temporal_forward(inp)
-
-        # Inject Proportional Feature Noise (Active only during training)
-        if self.training and self.temporal_noise_scale > 0.0:
-            # Scale noise relative to the standard deviation profile of the layer activations
-            feature_std = temporal.detach().std()
-            noise = torch.randn_like(temporal) * (feature_std * self.temporal_noise_scale)
-            temporal = temporal + noise
-
         logits, _, _, target_rearranged = self.train_forward_fused(temporal, tgt)
         
-        # 2. Hard Target Loss (with Label Smoothing internally handled)
+        # 2. Hard Target Loss (Full Capacity)
         logits_rearranged = rearrange(logits, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
 
-        # 3. Grounded Mimicry Engine Calculation
-        if self.training:
-            self.current_step += 1
-            step = min(self.current_step.item(), self.total_steps)
-            
-            if step <= self.p1_end:
-                w_distill = 1.0
-                w_ce = self.base_ce
-            else:
-                w_distill = 1.0
-                p2_progress = (step - self.p1_end) / float(self.total_steps - self.p1_end)
-                cos_f = 0.5 * (1.0 - math.cos(math.pi * p2_progress))
-                w_ce = self.base_ce + (self.target_ce - self.base_ce) * cos_f
-        else:
-            w_distill = 1.0
-            w_ce = self.target_ce
+        # Constant maximum capacity baseline strategy
+        final_loss = 1.0 * ce_loss
 
-        final_loss = w_ce * ce_loss
-
-        # 4. Integrate Soft Targets from Teacher Module
-        if self.teacher is not None and w_distill > 0.0:
+        # 3. Soft Target Distillation Loss (Full Capacity)
+        if self.teacher is not None:
             with torch.no_grad():
                 if hasattr(self.teacher, "train_forward_fused"):
                     t_temporal = self.teacher.temporal_forward(inp)
@@ -368,7 +326,8 @@ class MARIUS(nn.Module):
                 soft_teacher = F.softmax(flat_teacher / self.distill_temp, dim=-1)
                 distill_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (self.distill_temp ** 2)
                 
-                final_loss += w_distill * distill_loss
+                # Dynamic weight addition matching CE baseline
+                final_loss += 1.0 * distill_loss
 
         return final_loss, logits
 
