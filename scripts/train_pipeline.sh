@@ -17,34 +17,17 @@ module load Anaconda3/2025.06-1
 source activate recsys
 
 export PYTHONPATH=$PWD:$PYTHONPATH
-export HYDRA_FULL_ERROR=1
 export WANDB_MODE=offline
+export HYDRA_FULL_ERROR=1
 
-# ============================================================
-# CONFIGURATION — edit these before submitting
-# ============================================================
-# Dataset year: 2014 or 2023
-DATASET_YEAR=${1:-2014}
-
-# Categories to run
-CATEGORIES=("Arts_Crafts_and_Sewing" "Cell_Phones_and_Accessories" "Health_and_Household")
 # CATEGORIES=("Beauty" "Sports_and_Outdoors" "Toys_and_Games" "Movies_and_TV" "Video_Games")
+CATEGORIES=("Arts_Crafts_and_Sewing" "Cell_Phones_and_Accessories" "Health_and_Household")
 
 N_RUNS=5
 EXPERIMENT="marius"
 TASKNAME="MARIUS"
-
-# Separate data and checkpoint dirs per year to avoid overwrites
-DATASET_ROOT="${PWD}/datasets"
-COSETTE_BASE_DIR="outputs/checkpoints/cosette_${DATASET_YEAR}"
-MARIUS_BASE_DIR="outputs/checkpoints/marius_${DATASET_YEAR}"
-
-echo "========================================"
-echo ">>> DATASET YEAR: ${DATASET_YEAR}"
-echo ">>> DATASET ROOT: ${DATASET_ROOT}"
-COSETTE_BASE_DIR="outputs/checkpoints/cosette-${DATASET_YEAR}"
-MARIUS_BASE_DIR="outputs/checkpoints/marius-${DATASET_YEAR}"
-echo "========================================"
+COSETTE_BASE_DIR="outputs/checkpoints/cosette"
+MARIUS_BASE_DIR="outputs/checkpoints/marius"
 
 for CATEGORY in "${CATEGORIES[@]}"; do
     echo "========================================"
@@ -58,23 +41,19 @@ for CATEGORY in "${CATEGORIES[@]}"; do
         echo "----------------------------------------"
 
         # Step 1: Train COSETTE
-        python data_scripts/2_train_cosette.py \
+        python data_scripts/2_train_cosette.py cosette=default \
             data.category=${CATEGORY} \
-            marker=run${RUN_IDX} \
-            paths.root=${DATASET_ROOT} \
-            ckpt_dir=${COSETTE_BASE_DIR}
+            marker=run${RUN_IDX}
 
-        # Step 2: Remove collisions
+        # Step 2: Remove collisions (reconstructs quant name internally via get_latest_timestamp_dir)
         python data_scripts/3_remove_colisions.py \
             data.category=${CATEGORY} \
-            marker=run${RUN_IDX} \
-            paths.root=${DATASET_ROOT} \
-            paths.ckpt_dir=${COSETTE_BASE_DIR}
+            marker=run${RUN_IDX}
 
-        # Step 3: Resolve quant_id from parquet output
+        # Step 3: Resolve quant_id from parquet output — name is COSETTE_SIGLIP_{category}_{timestamp}_run{N}-col
         QUANT=$(python -c "
 from pathlib import Path
-base = Path('${DATASET_ROOT}/data/embeddings/sentence-t5-xl/${CATEGORY}/')
+base = Path('datasets/data/embeddings/sentence-t5-xl/${CATEGORY}/')
 runs = [f.stem for f in base.glob('COSETTE_SIGLIP_${CATEGORY}_*.parquet') if 'col' not in f.stem and '_model' not in f.stem]
 print(max(runs))
 ")
@@ -84,8 +63,6 @@ print(max(runs))
         python src/train.py experiment=${EXPERIMENT} \
             data.datasets.category=${CATEGORY} \
             data.datasets.quant_id=${QUANT}-col \
-            paths.root=${DATASET_ROOT} \
-            paths.model_folder_tplt=${PWD}/${MARIUS_BASE_DIR} \
             seed=${SEED}
 
         # Step 5: Resolve latest MARIUS run directory
@@ -98,10 +75,7 @@ print(max(runs))
         echo "[${CATEGORY}] Run ${RUN_IDX}: Evaluating run_directory=${RUN}"
 
         # Step 6: Test
-        python src/test.py \
-            run_directory="${RUN}" \
-            paths.root=${DATASET_ROOT} \
-            paths.model_folder_tplt=${PWD}/${MARIUS_BASE_DIR}
+        python src/test.py run_directory="${RUN}"
 
     done
 done
