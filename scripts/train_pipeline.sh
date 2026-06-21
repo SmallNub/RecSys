@@ -50,7 +50,7 @@ for CATEGORY in "${CATEGORIES[@]}"; do
             data.category=${CATEGORY} \
             marker=run${RUN_IDX}
 
-        # Step 3: Resolve quant_id from parquet output — name is COSETTE_SIGLIP_{category}_{timestamp}_run{N}-col
+        # Step 3: Resolve quant_id from parquet output — name is COSETTE{category}_{timestamp}_run{N}-col
         QUANT=$(python -c "
 from pathlib import Path
 base = Path('datasets/data/embeddings/sentence-t5-xl/${CATEGORY}/')
@@ -59,19 +59,16 @@ print(max(runs))
 ")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Using quant_id=${QUANT}-col"
 
-        # Step 4: Train MARIUS
-        python src/train.py experiment=${EXPERIMENT} \
+        # Step 4: Train MARIUS and capture run name
+        RUN=$(python src/train.py experiment=${EXPERIMENT} \
             data.datasets.category=${CATEGORY} \
             data.datasets.quant_id=${QUANT}-col \
-            seed=${SEED}
+            seed=${SEED} 2>&1 | tee /dev/stderr | grep "^\[RUN_NAME\]" | awk '{print $2}')
 
-        # Step 5: Resolve latest MARIUS run directory
-        LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
-        if [ -z "$LATEST_MARIUS_RUN" ]; then
-            echo "Error: No MARIUS run found in ${MARIUS_BASE_DIR}"
+        if [ -z "$RUN" ]; then
+            echo "Error: Could not capture run name from train.py"
             exit 1
         fi
-        RUN=$(basename "${LATEST_MARIUS_RUN%/}")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Evaluating run_directory=${RUN}"
 
         # Step 6: Test

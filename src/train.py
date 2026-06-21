@@ -43,6 +43,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     # )
 
     name = f"{cfg.task_name}_{now_to_str()}"
+    print(f"[RUN_NAME] {name}")  # captured by bash
 
     cfg.trainer.logger.name = name
 
