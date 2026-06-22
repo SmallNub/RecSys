@@ -59,16 +59,19 @@ print(max(runs))
 ")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Using quant_id=${QUANT}-col"
 
-        # Step 4: Train MARIUS and capture run name
-        RUN=$(python src/train.py experiment=${EXPERIMENT} \
+        # Step 4: Train MARIUS
+        python src/train.py experiment=${EXPERIMENT} \
             data.datasets.category=${CATEGORY} \
             data.datasets.quant_id=${QUANT}-col \
-            seed=${SEED} 2>&1 | tee /dev/stderr | grep "^\[RUN_NAME\]" | awk '{print $2}')
+            seed=${SEED}
 
-        if [ -z "$RUN" ]; then
-            echo "Error: Could not capture run name from train.py"
+        # Step 5: Resolve latest MARIUS run directory — grab after training so timestamp is correct
+        LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}_"[0-9]*/ 2>/dev/null | sort | tail -n 1)
+        if [ -z "$LATEST_MARIUS_RUN" ]; then
+            echo "Error: No MARIUS run found in ${MARIUS_BASE_DIR}"
             exit 1
         fi
+        RUN=$(basename "${LATEST_MARIUS_RUN%/}")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Evaluating run_directory=${RUN}"
 
         # Step 6: Test
