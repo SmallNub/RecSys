@@ -80,7 +80,7 @@ class Trainer(object):
         self.eval_step = min(config.optim.eval_step, self.epochs)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.ckpt_dir = config.ckpt_dir  
+        self.ckpt_dir = config.ckpt_dir
         self.local_dir = self.ckpt_dir
         os.makedirs(self.local_dir, exist_ok=True)
 
@@ -152,7 +152,9 @@ class Trainer(object):
             if self.config.loss.contrastive_weight == 0:
                 data = {"items": None, "timelines": None}
             else:
-                data = {k: v.to(self.device, non_blocking=True) for k, v in data.items()}
+                data = {
+                    k: v.to(self.device, non_blocking=True) for k, v in data.items()
+                }
 
             self.optimizer.zero_grad()
 
@@ -218,8 +220,12 @@ class Trainer(object):
     def _save_checkpoint(self, epoch, ckpt_file):
         ckpt_path = os.path.join(self.local_dir, ckpt_file)
 
-        raw_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
-        state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()}
+        raw_model = (
+            self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        )
+        state_dict = {
+            k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()
+        }
 
         state = {
             "config": self.config,
@@ -247,7 +253,9 @@ class Trainer(object):
                     "epoch": epoch_idx,
                     "train_loss": train_loss,
                     "lr": self.optimizer.param_groups[0]["lr"],
-                    "curvature_c": self.config.model.get("c", 0.0) if self.is_hyper else 0.0,
+                    "curvature_c": (
+                        self.config.model.get("c", 0.0) if self.is_hyper else 0.0
+                    ),
                     **metrics,
                 }
             )
@@ -294,20 +302,21 @@ class _Dataset(torch.utils.data.IterableDataset):
         T = len(self)
         L = ceil(T / world_size) if T % world_size > worker_id else T // world_size
         self._indices = np.random.permutation(len(self.timelines))
-        for i in range(L):  
+        for i in range(L):
             yield self.__make_batch(i)
 
     def __make_batch(self, i):
         sel_indices = self._indices[i * self.bs : (i + 1) * self.bs]
         sel_timelines = self.timelines[sel_indices]
         sel_timelines = np.array([self._to_size(t) for t in sel_timelines])
-        all_items = np.unique(np.concatenate(sel_timelines))  
-        if all_items[0] == -1:  
+        all_items = np.unique(np.concatenate(sel_timelines))
+        if all_items[0] == -1:
             all_items = all_items[1:]
         return {
             "items": torch.from_numpy(all_items),
             "timelines": torch.from_numpy(sel_timelines),
         }
+
 
 class DataLoader:
     def __init__(self, items, timelines, bs, cut):
@@ -385,7 +394,7 @@ def make_quantized_df(quant_method, config, product_id, model, filesystem):
             {
                 "config": config,
                 "state_dict": clean_sd,
-                "epoch": config.optim.epochs,  
+                "epoch": config.optim.epochs,
             },
             f,
         )
@@ -460,7 +469,9 @@ def make_cosette_embs(config):
             "reconstruction": config.loss.reconstruction_weight,
             "contrastive": config.loss.contrastive_weight,
             "latent_consistency": config.loss.get("latent_consistency_weight", 0.0),
-            "latent_consistency_l1_loss": config.loss.get("latent_consistency_l1_weight", 0.0),
+            "latent_consistency_l1_loss": config.loss.get(
+                "latent_consistency_l1_weight", 0.0
+            ),
             "reconstruction_l1_loss": config.loss.get("reconstruction_l1_weight", 0.0),
         },
         "tau": config.loss.tau,

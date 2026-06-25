@@ -29,14 +29,16 @@ def find_checkpoint_dir(fs, root):
     if fs.exists(snapshot_path):
         with fs.open(snapshot_path, "r") as f:
             snapshot_data = json.load(f)
-        latest_dir_name = snapshot_data["latest_checkpoint_result"]["checkpoint_dir_name"]
+        latest_dir_name = snapshot_data["latest_checkpoint_result"][
+            "checkpoint_dir_name"
+        ]
         print(f"[INFO] Found checkpoint from snapshot: {latest_dir_name}")
         return os.path.join(root, latest_dir_name)
 
     print(f"[WARNING] No snapshot found at {root}, searching for checkpoint_* dirs...")
     try:
         subdirs = [
-            os.path.basename(x.rstrip('/'))
+            os.path.basename(x.rstrip("/"))
             for x in fs.glob(os.path.join(root, "checkpoint_*"))
         ]
         if subdirs:
@@ -114,7 +116,9 @@ def load_item_embeddings(fs, cfg):
         category=cfg.data.datasets.category,
     )
     emb_df = pd.read_parquet(emb_path, filesystem=fs)
-    result = {row["product_id"]: np.array(row["embedding"]) for _, row in emb_df.iterrows()}
+    result = {
+        row["product_id"]: np.array(row["embedding"]) for _, row in emb_df.iterrows()
+    }
     print(f"[INFO] item_embeddings size: {len(result)}")
     return result
 
@@ -172,6 +176,7 @@ def debug_code_lookup(model, batch, code_to_item, n_centroids, device):
     from search() with filter_preds enabled (same as during test_step).
     """
     from src.models import SpecialTokens
+
     offset = len(SpecialTokens)  # 2
 
     with torch.no_grad():
@@ -179,8 +184,7 @@ def debug_code_lookup(model, batch, code_to_item, n_centroids, device):
 
     sample_code_raw = tuple(gen[0][0].cpu().tolist())
     sample_code = tuple(
-        c - offset - (level * n_centroids)
-        for level, c in enumerate(sample_code_raw)
+        c - offset - (level * n_centroids) for level, c in enumerate(sample_code_raw)
     )
 
     print(f"[DEBUG] gen shape: {gen.shape}")
@@ -193,10 +197,13 @@ def debug_code_lookup(model, batch, code_to_item, n_centroids, device):
     print(f"[DEBUG] Sample code_to_item keys: {sample_keys}")
     print(f"[DEBUG] Match in code_to_item: {sample_code in code_to_item}")
     key_arr = np.array(list(code_to_item.keys()))
-    print(f"[DEBUG] code_to_item key min/max per level: {key_arr.min(axis=0)}/{key_arr.max(axis=0)}")
+    print(
+        f"[DEBUG] code_to_item key min/max per level: {key_arr.min(axis=0)}/{key_arr.max(axis=0)}"
+    )
 
     hits = sum(
-        1 for code in gen[0].cpu().tolist()
+        1
+        for code in gen[0].cpu().tolist()
         if tuple(c - offset - (level * n_centroids) for level, c in enumerate(code))
         in code_to_item
     )
@@ -258,24 +265,31 @@ def main(test_config: DictConfig):
             model.to(device)
 
             from torch.utils.data import DataLoader
+
             loader = DataLoader(datasets["test"], batch_size=4, shuffle=False)
             batch = next(iter(loader))
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
+            batch = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
             debug_code_lookup(
-                model, batch,
+                model,
+                batch,
                 diversity_context["code_to_item"],
                 diversity_context["n_centroids"],
                 device,
             )
 
-        print("[DEBUG] Exiting after debug pass. Re-run without debug=true for full metrics.")
+        print(
+            "[DEBUG] Exiting after debug pass. Re-run without debug=true for full metrics."
+        )
         return
 
     valid_metrics = run_metrics(cfg, ckpt_path, "valid", datasets)
-    test_metrics = run_metrics(cfg, ckpt_path, "test", datasets,
-                               diversity_context=diversity_context)
+    test_metrics = run_metrics(
+        cfg, ckpt_path, "test", datasets, diversity_context=diversity_context
+    )
 
     to_pickle(
         fs,
@@ -296,13 +310,15 @@ def main(test_config: DictConfig):
     rows = []
     for split, metrics in [("valid", valid_metrics), ("test", test_metrics)]:
         for k, v in metrics[0].items():
-            rows.append({
-                "run_directory": run_directory,
-                "category": category,
-                "split": split,
-                "metric": k,
-                "value": v,
-            })
+            rows.append(
+                {
+                    "run_directory": run_directory,
+                    "category": category,
+                    "split": split,
+                    "metric": k,
+                    "value": v,
+                }
+            )
 
     file_exists = os.path.exists(summary_path)
     with open(summary_path, "a", newline="") as f:

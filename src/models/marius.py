@@ -150,11 +150,11 @@ class MARIUS(torch.nn.Module):
         return logits
 
     def train_forward(self, input, target):
-        temporal_tokens = self.temporal_forward(input)  
-        mid_tokens = self.mid_proj(temporal_tokens)  
-        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")  
+        temporal_tokens = self.temporal_forward(input)
+        mid_tokens = self.mid_proj(temporal_tokens)
+        mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
 
-        target = rearrange(target, "b l k -> (b l) k")  
+        target = rearrange(target, "b l k -> (b l) k")
         keep = target[:, 0] != -100
 
         mid_tokens = mid_tokens[keep]
@@ -186,8 +186,8 @@ class MARIUS(torch.nn.Module):
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        temporal_tokens = self.temporal_forward(input)  
-        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]  
+        temporal_tokens = self.temporal_forward(input)
+        mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
 
@@ -196,8 +196,8 @@ class MARIUS(torch.nn.Module):
         log_probs = F.log_softmax(depth_logits[:, -1, :], dim=-1)
 
         topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
-        indices = topk_indices.unsqueeze(2) 
-        scores = topk_log_probs 
+        indices = topk_indices.unsqueeze(2)
+        scores = topk_log_probs
 
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
 

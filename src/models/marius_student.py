@@ -8,6 +8,7 @@ from einops import rearrange
 from src.models import SpecialTokens
 from src.models.utils import load_model
 
+
 @dataclass
 class TransformerConfig:
     n_layers: int
@@ -17,6 +18,7 @@ class TransformerConfig:
     dropout: float
     emb_dropout: float
     seq_len: int
+
 
 class RoPE(nn.Module):
     def __init__(self, head_dim):
@@ -34,6 +36,7 @@ class RoPE(nn.Module):
 
         return cos, sin
 
+
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -43,6 +46,7 @@ def apply_rope(x, cos, sin):
     cos = cos[None, None, :, :].to(x.dtype)
     sin = sin[None, None, :, :].to(x.dtype)
     return x * cos + rotate_half(x) * sin
+
 
 class Attention(nn.Module):
     def __init__(self, d_model, d_head, dropout_p=0.1, use_rope=True):
@@ -57,7 +61,7 @@ class Attention(nn.Module):
 
         self.q_dim = self.n_heads * d_head
         self.kv_dim = self.n_kv_heads * d_head
-        
+
         self.qkv_proj = nn.Linear(d_model, self.q_dim + 2 * self.kv_dim, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
@@ -86,27 +90,31 @@ class Attention(nn.Module):
             k = apply_rope(k, cos, sin)
 
         y = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=is_causal
+            is_causal=is_causal,
         )
 
         y = rearrange(y, "b h l d -> b l (h d)")
         return self.o_proj(y)
-    
+
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         hidden_dim = 4 * d_model * 2 // 3
         hidden_dim = ((hidden_dim + 7) // 8) * 8
-        
+
         self.w12 = nn.Linear(d_model, 2 * hidden_dim, bias=False)
         self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x):
         w1_out, w2_out = self.w12(x).chunk(2, dim=-1)
         return self.w3(F.silu(w1_out) * w2_out)
+
 
 class TemporalBlock(nn.Module):
     def __init__(self, d_model, d_head, dropout_p=0.1):
@@ -121,6 +129,7 @@ class TemporalBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
+
 class DepthBlock(nn.Module):
     def __init__(self, d_model, d_head, dropout_p=0.1):
         super().__init__()
@@ -133,6 +142,7 @@ class DepthBlock(nn.Module):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
         x = x + self.ffn(self.norm2(x))
         return x
+
 
 class MARIUS(nn.Module):
     def __init__(
@@ -157,11 +167,21 @@ class MARIUS(nn.Module):
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
-        t_emb_drop = temporal_cfg.emb_dropout if temporal_cfg.emb_dropout is not None else temporal_cfg.dropout
-        d_emb_drop = depth_cfg.emb_dropout if depth_cfg.emb_dropout is not None else depth_cfg.dropout
+        t_emb_drop = (
+            temporal_cfg.emb_dropout
+            if temporal_cfg.emb_dropout is not None
+            else temporal_cfg.dropout
+        )
+        d_emb_drop = (
+            depth_cfg.emb_dropout
+            if depth_cfg.emb_dropout is not None
+            else depth_cfg.dropout
+        )
 
         # Load Pre-trained Fixed Expert Teacher
-        self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
+        self.teacher = load_model(
+            "outputs/checkpoints/marius/MARIUS_teacher_260619_133025"
+        )
         if self.teacher is not None:
             self.teacher.eval()
             for param in self.teacher.parameters():
@@ -173,10 +193,14 @@ class MARIUS(nn.Module):
             padding_idx=SpecialTokens.PAD.value,
         )
 
-        self.depth_emb = self.temp_emb if tie_embeddings else nn.Embedding(
-            depth_cfg.vocab_size,
-            depth_cfg.d_model,
-            padding_idx=SpecialTokens.PAD.value,
+        self.depth_emb = (
+            self.temp_emb
+            if tie_embeddings
+            else nn.Embedding(
+                depth_cfg.vocab_size,
+                depth_cfg.d_model,
+                padding_idx=SpecialTokens.PAD.value,
+            )
         )
 
         self.temp_emb_ln = nn.LayerNorm(temporal_cfg.d_model)
@@ -186,20 +210,30 @@ class MARIUS(nn.Module):
         self.dropout_t = nn.Dropout(t_emb_drop)
         self.dropout_d = nn.Dropout(d_emb_drop)
 
-        self.temp_tf = nn.ModuleList([
-            TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head, dropout_p=temporal_cfg.dropout)
-            for _ in range(temporal_cfg.n_layers)
-        ])
+        self.temp_tf = nn.ModuleList(
+            [
+                TemporalBlock(
+                    temporal_cfg.d_model,
+                    temporal_cfg.d_head,
+                    dropout_p=temporal_cfg.dropout,
+                )
+                for _ in range(temporal_cfg.n_layers)
+            ]
+        )
 
-        self.depth_tf = nn.ModuleList([
-            DepthBlock(depth_cfg.d_model, depth_cfg.d_head, dropout_p=depth_cfg.dropout)
-            for _ in range(depth_cfg.n_layers)
-        ])
+        self.depth_tf = nn.ModuleList(
+            [
+                DepthBlock(
+                    depth_cfg.d_model, depth_cfg.d_head, dropout_p=depth_cfg.dropout
+                )
+                for _ in range(depth_cfg.n_layers)
+            ]
+        )
 
         self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        
+
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.apply(self._init_weights)
 
@@ -213,33 +247,50 @@ class MARIUS(nn.Module):
             if module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0.0)
-            
+
         for block in self.temp_tf:
-            if hasattr(block.attn, 'o_proj'):
-                torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers))
-            if hasattr(block.ffn, 'w3'):
-                torch.nn.init.normal_(block.ffn.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers))
-                
+            if hasattr(block.attn, "o_proj"):
+                torch.nn.init.normal_(
+                    block.attn.o_proj.weight,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers),
+                )
+            if hasattr(block.ffn, "w3"):
+                torch.nn.init.normal_(
+                    block.ffn.w3.weight,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * self.temporal_cfg.n_layers),
+                )
+
         for block in self.depth_tf:
-            if hasattr(block.attn, 'o_proj'):
-                torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
-            if hasattr(block.ffn, 'w3'):
-                torch.nn.init.normal_(block.ffn.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
+            if hasattr(block.attn, "o_proj"):
+                torch.nn.init.normal_(
+                    block.attn.o_proj.weight,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers),
+                )
+            if hasattr(block.ffn, "w3"):
+                torch.nn.init.normal_(
+                    block.ffn.w3.weight,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers),
+                )
 
     def _corrupt_student_input(self, input_tensor):
         """Forces the student to infer missing context by randomly masking token streams."""
         corrupted = input_tensor.clone()
-        valid_mask = (corrupted[:, :, 0] != SpecialTokens.PAD.value)
-        
+        valid_mask = corrupted[:, :, 0] != SpecialTokens.PAD.value
+
         rand_grid = torch.rand(corrupted.shape[:2], device=input_tensor.device)
         mask_condition = (rand_grid < self.student_mask_prob) & valid_mask
-        
-        corrupted[mask_condition] = 0 
+
+        corrupted[mask_condition] = 0
         return corrupted
 
     def get_param_groups(self):
         def _select_no_decay(n):
             return any(k in n for k in ["_emb", "norm"])
+
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -251,9 +302,13 @@ class MARIUS(nn.Module):
         discrete = self.temp_emb_ln(discrete)
         x = self.dropout_t(discrete)
 
-        valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)
-        causal_mask = torch.tril(torch.ones(L, L, device=input.device, dtype=torch.bool))
-        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(0).unsqueeze(1)
+        valid_mask = input[:, :, 0] != SpecialTokens.PAD.value
+        causal_mask = torch.tril(
+            torch.ones(L, L, device=input.device, dtype=torch.bool)
+        )
+        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(
+            0
+        ).unsqueeze(1)
 
         for blk in self.temp_tf:
             x = blk(x, attn_mask=combined_mask, is_causal=False)
@@ -287,7 +342,7 @@ class MARIUS(nn.Module):
 
         safe_target = target[:, :-1].clone()
         safe_target[safe_target == -100] = SpecialTokens.PAD.value
-        
+
         dec = self.depth_emb(safe_target)
         dec = self.depth_emb_ln(dec)
         K = dec.shape[1]
@@ -302,7 +357,7 @@ class MARIUS(nn.Module):
 
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
-        
+
         # 1. Teacher Forward Pass (Pristine Input Track)
         if self.teacher is not None:
             with torch.no_grad():
@@ -311,7 +366,7 @@ class MARIUS(nn.Module):
         # 2. Student Forward Pass (Asymmetric Masked Track)
         student_input = self._corrupt_student_input(inp) if self.training else inp
         logits_student, _, _, target_rearranged = self.train_forward(student_input, tgt)
-        
+
         # 3. Suppressed Hard CE Loss Component
         logits_rearranged = rearrange(logits_student, "b l v -> b v l")
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
@@ -326,8 +381,10 @@ class MARIUS(nn.Module):
 
                 soft_student = F.log_softmax(flat_student / self.distill_temp, dim=-1)
                 soft_teacher = F.softmax(flat_teacher / self.distill_temp, dim=-1)
-                distill_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (self.distill_temp ** 2)
-                
+                distill_loss = F.kl_div(
+                    soft_student, soft_teacher, reduction="batchmean"
+                ) * (self.distill_temp**2)
+
                 final_loss += self.distill_weight * distill_loss
 
         return final_loss, logits_student
@@ -372,7 +429,9 @@ class MARIUS(nn.Module):
             topk_indices = topk_indices.view(B, b, b)
 
             expanded_indices = indices.unsqueeze(2).repeat(1, 1, b, 1)
-            expanded_indices = torch.cat([expanded_indices, topk_indices.unsqueeze(-1)], dim=3)
+            expanded_indices = torch.cat(
+                [expanded_indices, topk_indices.unsqueeze(-1)], dim=3
+            )
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
@@ -386,7 +445,9 @@ class MARIUS(nn.Module):
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
 
             expanded_scores = expanded_scores.view(B, -1)
-            expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
+            expanded_sequences = expanded_sequences.view(
+                B, -1, expanded_sequences.size(-2), D
+            )
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
 
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)

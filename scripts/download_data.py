@@ -37,6 +37,7 @@ args = parser.parse_args()
 # Amazon 2023
 # ---------------------------------------------------------------------------
 
+
 def category_files_2023(category):
     return [
         f"raw/meta_categories/meta_{category}.jsonl",
@@ -65,6 +66,7 @@ def download_2023(categories, local_dir):
 # ---------------------------------------------------------------------------
 # Amazon 2014
 # ---------------------------------------------------------------------------
+
 
 def category_files_2014(category):
     # 5-core ratings and metadata; .gz files are decompressed after download

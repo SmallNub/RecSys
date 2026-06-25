@@ -110,20 +110,26 @@ def embed(config):
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     target_devices = (
-        [f"cuda:{i}" for i in range(len(visible.split(",")))]
-        if visible else ["cpu"]
+        [f"cuda:{i}" for i in range(len(visible.split(",")))] if visible else ["cpu"]
     )
     print(f"Using devices: {target_devices}")
 
     chunk_size = config.batch_size * 256
     pool = model.start_multi_process_pool(target_devices=target_devices)
-    chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
-    embeddings = np.concatenate([
-        model.encode_multi_process(
-            chunk, pool=pool, normalize_embeddings=True, batch_size=config.batch_size
-        )
-        for chunk in tqdm(chunks, desc="Embedding", unit="chunk")
-    ])
+    chunks = [
+        sentences[i : i + chunk_size] for i in range(0, len(sentences), chunk_size)
+    ]
+    embeddings = np.concatenate(
+        [
+            model.encode_multi_process(
+                chunk,
+                pool=pool,
+                normalize_embeddings=True,
+                batch_size=config.batch_size,
+            )
+            for chunk in tqdm(chunks, desc="Embedding", unit="chunk")
+        ]
+    )
     model.stop_multi_process_pool(pool)
 
     out_df = pd.DataFrame(

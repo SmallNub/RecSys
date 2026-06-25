@@ -118,16 +118,16 @@ class MARIUS(torch.nn.Module):
         """Applies stable standard-deviation initialization across discrete spaces."""
         torch.nn.init.trunc_normal_(self.temp_pos_emb, std=0.02)
         torch.nn.init.trunc_normal_(self.depth_pos_emb, std=0.02)
-        
+
         torch.nn.init.trunc_normal_(self.temp_emb.weight, std=0.02)
         if not self.tie_embeddings:
             torch.nn.init.trunc_normal_(self.depth_emb.weight, std=0.02)
-            
+
         with torch.no_grad():
             self.temp_emb.weight[SpecialTokens.PAD.value].zero_()
             if not self.tie_embeddings:
                 self.depth_emb.weight[SpecialTokens.PAD.value].zero_()
-            
+
         torch.nn.init.trunc_normal_(self.mid_proj.weight, std=0.02)
         if self.mid_proj.bias is not None:
             torch.nn.init.constant_(self.mid_proj.bias, 0.0)
@@ -173,7 +173,9 @@ class MARIUS(torch.nn.Module):
         in_embs = in_embs + self.depth_pos_emb[:, :K, :]
         in_embs = self.depth_dropout(in_embs)
 
-        depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K].to(in_embs.device))
+        depth_preds = self.depth_tf(
+            in_embs, mask=self.causal_mask[:K, :K].to(in_embs.device)
+        )
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
 
         return logits

@@ -19,6 +19,7 @@ class TransformerConfig:
     emb_dropout: float
     seq_len: int
 
+
 class RoPE:
     def __init__(self, head_dim):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
@@ -40,6 +41,7 @@ class RoPE:
         self._cache[key] = (cos, sin)
         return cos, sin
 
+
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -49,6 +51,7 @@ def apply_rope(x, cos, sin):
     cos = cos[None, None, :, :].to(x.dtype)
     sin = sin[None, None, :, :].to(x.dtype)
     return x * cos + rotate_half(x) * sin
+
 
 class Attention(nn.Module):
     def __init__(self, d_model, d_head, use_rope=True):
@@ -90,10 +93,7 @@ class Attention(nn.Module):
             k = apply_rope(k, cos, sin)
 
         y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=is_causal
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal
         )
 
         y = rearrange(y, "b h l d -> b l (h d)")
@@ -125,6 +125,7 @@ class TemporalBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
+
 class DepthBlock(nn.Module):
     def __init__(self, d_model, d_head):
         super().__init__()
@@ -137,6 +138,7 @@ class DepthBlock(nn.Module):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
         x = x + self.ffn(self.norm2(x))
         return x
+
 
 class MARIUS(nn.Module):
     def __init__(
@@ -166,27 +168,41 @@ class MARIUS(nn.Module):
             padding_idx=SpecialTokens.PAD.value,
         )
 
-        self.depth_emb = self.temp_emb if tie_embeddings else nn.Embedding(
-            depth_cfg.vocab_size,
-            depth_cfg.d_model,
-            padding_idx=SpecialTokens.PAD.value,
+        self.depth_emb = (
+            self.temp_emb
+            if tie_embeddings
+            else nn.Embedding(
+                depth_cfg.vocab_size,
+                depth_cfg.d_model,
+                padding_idx=SpecialTokens.PAD.value,
+            )
         )
 
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
-        self.temp_proj = nn.Linear(cosette.model.centroids_dim, temporal_cfg.d_model, bias=False)
-        self.depth_proj = nn.Linear(cosette.model.centroids_dim, depth_cfg.d_model, bias=False)
+        self.temp_proj = nn.Linear(
+            cosette.model.centroids_dim, temporal_cfg.d_model, bias=False
+        )
+        self.depth_proj = nn.Linear(
+            cosette.model.centroids_dim, depth_cfg.d_model, bias=False
+        )
 
         self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
         self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
 
-        self.temp_tf = nn.ModuleList([
-            TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head) for _ in range(temporal_cfg.n_layers)
-        ])
+        self.temp_tf = nn.ModuleList(
+            [
+                TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head)
+                for _ in range(temporal_cfg.n_layers)
+            ]
+        )
 
-        self.depth_tf = nn.ModuleList([
-            DepthBlock(depth_cfg.d_model, depth_cfg.d_head) for _ in range(depth_cfg.n_layers)
-        ])
+        self.depth_tf = nn.ModuleList(
+            [
+                DepthBlock(depth_cfg.d_model, depth_cfg.d_head)
+                for _ in range(depth_cfg.n_layers)
+            ]
+        )
 
         self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
@@ -197,7 +213,13 @@ class MARIUS(nn.Module):
 
     def get_param_groups(self):
         def _select_no_decay(n):
-            return "temp_emb" in n or "depth_emb" in n or "depth_pos_emb" in n or "norm" in n
+            return (
+                "temp_emb" in n
+                or "depth_emb" in n
+                or "depth_pos_emb" in n
+                or "norm" in n
+            )
+
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -213,9 +235,13 @@ class MARIUS(nn.Module):
         continuous = self.temp_proj(self.cosette.decode(input))
         x = self.dropout_t(discrete + continuous)
 
-        valid_mask = (input[:, :, 0] != SpecialTokens.PAD.value)
-        causal_mask = torch.tril(torch.ones(L, L, device=input.device, dtype=torch.bool))
-        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(0).unsqueeze(1)
+        valid_mask = input[:, :, 0] != SpecialTokens.PAD.value
+        causal_mask = torch.tril(
+            torch.ones(L, L, device=input.device, dtype=torch.bool)
+        )
+        combined_mask = valid_mask.unsqueeze(1).unsqueeze(2) & causal_mask.unsqueeze(
+            0
+        ).unsqueeze(1)
 
         for blk in self.temp_tf:
             x = blk(x, attn_mask=combined_mask, is_causal=False)
@@ -226,9 +252,9 @@ class MARIUS(nn.Module):
         seq_len = tgt.shape[1]
         positions = torch.arange(seq_len, device=tgt.device)
         pos_embeddings = self.depth_pos_emb(positions).unsqueeze(0)
-        
+
         x = self.dropout_d(tgt + pos_embeddings)
-        
+
         for blk in self.depth_tf:
             x = blk(x, attn_mask=None, is_causal=True)
 
@@ -264,7 +290,7 @@ class MARIUS(nn.Module):
 
             res = torch.stack(res, dim=1)
             cont = self.depth_proj(res)
-            
+
             fused_tgt = self.fuse_norm(dec + cont)
             tgt = torch.cat([mid, fused_tgt], dim=1)
         else:
@@ -282,46 +308,48 @@ class MARIUS(nn.Module):
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
         input = batch["input"]
-        L = batch["target"].shape[-1]  
+        L = batch["target"].shape[-1]
 
         if self.filter_preds:
             keep_final = n_results
             n_results += self.temporal_cfg.seq_len
 
-        temporal = self.temporal_forward(input)  
-        mid = self.mid_proj(temporal)[:, -1, :]  
+        temporal = self.temporal_forward(input)
+        mid = self.mid_proj(temporal)[:, -1, :]
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
         arranged_batch = torch.arange(B, device=input.device).view(-1, 1)
 
-        sequences = mid[:, None, :]  
-        logits, _ = self.depth_forward(sequences)  
-        log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  
+        sequences = mid[:, None, :]
+        logits, _ = self.depth_forward(sequences)
+        log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
 
-        topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)  
+        topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
 
-        indices = topk_indices.unsqueeze(2)  
-        scores = topk_log_probs  
-        sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)  
+        indices = topk_indices.unsqueeze(2)
+        scores = topk_log_probs
+        sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
 
         discrete_new = self.depth_emb(topk_indices)
 
         q = self.cosette.model.rq.vq_layers[0]
         num_embeddings = getattr(q, "n_centroids", 32000)
         valid_mask = (topk_indices >= 0) & (topk_indices < num_embeddings)
-        safe_indices = torch.where(valid_mask, topk_indices, torch.zeros_like(topk_indices))
+        safe_indices = torch.where(
+            valid_mask, topk_indices, torch.zeros_like(topk_indices)
+        )
 
         raw_new_tokens = q.get_codebook_entry(safe_indices, shape=None)
         continuous_new = self.depth_proj(raw_new_tokens)
         v_mask = valid_mask.unsqueeze(-1).to(continuous_new.dtype)
 
         fused_new = self.fuse_norm(discrete_new + (continuous_new * v_mask))
-        sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)  
+        sequences = torch.cat([sequences, fused_new.unsqueeze(2)], dim=2)
 
         for i in range(2, L + 1):
             logits, _ = self.depth_forward(sequences.view(B * b, i, D))
             last_logits = logits[:, -1, :]
-            log_probs = F.log_softmax(last_logits, dim=-1)  
+            log_probs = F.log_softmax(last_logits, dim=-1)
 
             topk_log_probs, topk_indices = torch.topk(log_probs, b, dim=-1)
 
@@ -329,7 +357,9 @@ class MARIUS(nn.Module):
             topk_indices = topk_indices.view(B, b, b)
 
             expanded_indices = indices.unsqueeze(2).repeat(1, 1, b, 1)
-            expanded_indices = torch.cat([expanded_indices, topk_indices.unsqueeze(-1)], dim=3)
+            expanded_indices = torch.cat(
+                [expanded_indices, topk_indices.unsqueeze(-1)], dim=3
+            )
 
             expanded_sequences = sequences.unsqueeze(2).repeat(1, 1, b, 1, 1)
 
@@ -339,7 +369,9 @@ class MARIUS(nn.Module):
             quantizer = self.cosette.model.rq.vq_layers[i - 1]
             num_embeddings = getattr(quantizer, "n_centroids", 32000)
             valid_mask = (flat_topk >= 0) & (flat_topk < num_embeddings)
-            safe_indices = torch.where(valid_mask, flat_topk, torch.zeros_like(flat_topk))
+            safe_indices = torch.where(
+                valid_mask, flat_topk, torch.zeros_like(flat_topk)
+            )
 
             flat_decoded = quantizer.get_codebook_entry(safe_indices, shape=None)
             flat_projected = self.depth_proj(flat_decoded)
@@ -351,16 +383,18 @@ class MARIUS(nn.Module):
             expanded_sequences = torch.cat([expanded_sequences, next_tokens], dim=3)
 
             expanded_scores = scores.unsqueeze(2) + topk_log_probs
-            
+
             expanded_scores = expanded_scores.view(B, -1)
-            expanded_sequences = expanded_sequences.view(B, -1, expanded_sequences.size(-2), D)
+            expanded_sequences = expanded_sequences.view(
+                B, -1, expanded_sequences.size(-2), D
+            )
             expanded_indices = expanded_indices.view(B, -1, expanded_indices.size(-1))
-            
+
             topk_scores, topk_indices = torch.topk(expanded_scores, b, dim=-1)
 
             sequences = expanded_sequences[arranged_batch, topk_indices]
             indices = expanded_indices[arranged_batch, topk_indices]
-            scores = topk_scores  
+            scores = topk_scores
 
         if self.filter_preds:
             is_in_query = indices[:, :, None, :] == input[:, None, :, :]

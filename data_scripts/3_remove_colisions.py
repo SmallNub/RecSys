@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from src.utils.tools import patch_fsspec
 
+
 def partition_list(lst, partition_sizes):
     if sum(partition_sizes) != len(lst):
         return "Error: Sum of partition sizes does not match list length"
@@ -28,7 +29,9 @@ def partition_list(lst, partition_sizes):
     return partitions
 
 
-def get_latest_timestamp_dir(base_dir_path: str, timestamp_format: str = "%Y%m%d_%H%M%S") -> Path:
+def get_latest_timestamp_dir(
+    base_dir_path: str, timestamp_format: str = "%Y%m%d_%H%M%S"
+) -> Path:
     """
     Finds the directory with the latest timestamp name inside base_dir_path.
     """
@@ -86,6 +89,7 @@ def main(config):
     if model_type == "hyperbolic":
         print("\n>>> LOADING HYPERBOLIC COSETTE FOR COLLISION RESOLUTION <<<")
         from src.models.cosette_hyper import COSETTE
+
         prefix = "COSETTE_HYPER"
     else:
         print("\n>>> LOADING EUCLIDEAN COSETTE FOR COLLISION RESOLUTION <<<")
@@ -123,7 +127,7 @@ def main(config):
         state_dict = ckpt.pop("state_dict", None)
 
         kwargs = {
-            "embs_block": None, 
+            "embs_block": None,
             "in_dim": embs_block.shape[-1],
             "layers": model_cfg.model.layers,
             "n_centroids_list": model_cfg.centroids.n_centroids_list,
@@ -167,10 +171,10 @@ def main(config):
             embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False
         )
 
-    indices = indices.cpu().numpy()  
-    all_distances = all_distances.cpu().numpy()  
+    indices = indices.cpu().numpy()
+    all_distances = all_distances.cpu().numpy()
 
-    for index in indices:  
+    for index in indices:
         code = []
         for i, ind in enumerate(index):
             code.append(int(ind))
@@ -284,7 +288,9 @@ def main(config):
     print("Quantized data saved to", quantized_path)
 
     c_val = model_cfg.model.get("c", "N/A") if model_type == "hyperbolic" else "N/A"
-    run_directory = latest_dir_name if isinstance(latest_dir_name, str) else str(latest_dir_name)
+    run_directory = (
+        latest_dir_name if isinstance(latest_dir_name, str) else str(latest_dir_name)
+    )
     category = config.data.category
 
     row_data = {
@@ -296,7 +302,7 @@ def main(config):
         "final_collision_rate": final_collision_rate,
         "iterations_to_solve": tt,
         "total_collision_items": len(all_collision_items),
-        "max_conflicts": max_conflicts
+        "max_conflicts": max_conflicts,
     }
 
     os.makedirs(config.paths.ckpt_dir, exist_ok=True)

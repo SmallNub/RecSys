@@ -19,9 +19,12 @@ def main(config):
             [
                 "python",
                 "scripts/download_data.py",
-                "--year", str(config.get("dataset_year", 2023)),
-                "--base_dir", str(Path(config.paths.hf_data_folder).parent),
-                "--categories", *config.categories,
+                "--year",
+                str(config.get("dataset_year", 2023)),
+                "--base_dir",
+                str(Path(config.paths.hf_data_folder).parent),
+                "--categories",
+                *config.categories,
             ],
             check=True,
         )
@@ -75,6 +78,7 @@ def process_category(category, config, wd):
 # Amazon 2023
 # ---------------------------------------------------------------------------
 
+
 def _process_category_2023(category, config, filesystem):
     print(f"{category} [2023] - Converting and moving files.")
     git_root = Path(config.paths.hf_data_folder)
@@ -82,10 +86,10 @@ def _process_category_2023(category, config, filesystem):
     train_tl = pd.read_csv(git_root / f"benchmark/5core/last_out/{category}.train.csv")
     # Valid and Test only contain 1 interaction per user
     valid_tl = pd.read_csv(git_root / f"benchmark/5core/last_out/{category}.valid.csv")
-    test_tl  = pd.read_csv(git_root / f"benchmark/5core/last_out/{category}.test.csv")
+    test_tl = pd.read_csv(git_root / f"benchmark/5core/last_out/{category}.test.csv")
 
     assert set(valid_tl["user_id"]) == set(train_tl["user_id"])
-    assert set(test_tl["user_id"])  == set(train_tl["user_id"])
+    assert set(test_tl["user_id"]) == set(train_tl["user_id"])
 
     print(f"{category} [2023] - Training")
     train_df = (
@@ -135,7 +139,9 @@ def _process_category_2023(category, config, filesystem):
     df = df[META_SELECTED_COLS]
     df["price"] = df["price"].apply(_sanitize)
     df = df[df.parent_asin.isin(set(all_items))]
-    print(f"{category} [2023] - {df.shape[0]} items for {train_val_test_df.shape[0]} users.")
+    print(
+        f"{category} [2023] - {df.shape[0]} items for {train_val_test_df.shape[0]} users."
+    )
     df.to_parquet(
         config.paths.meta_tplt.format(category=category),
         index=False,
@@ -147,6 +153,7 @@ def _process_category_2023(category, config, filesystem):
 # Amazon 2014
 # ---------------------------------------------------------------------------
 
+
 def _loocv_split(ratings_df):
     """Leave-one-out split: last interaction = test, second-to-last = valid, rest = train."""
     ratings_df = ratings_df.sort_values(["reviewerID", "unixReviewTime"])
@@ -157,7 +164,12 @@ def _loocv_split(ratings_df):
         ratings = group["rating"].tolist()
         n = len(items)
         for i, (item, ts, rating) in enumerate(zip(items, timestamps, ratings)):
-            row = {"user_id": user_id, "parent_asin": item, "timestamp": ts, "rating": rating}
+            row = {
+                "user_id": user_id,
+                "parent_asin": item,
+                "timestamp": ts,
+                "rating": rating,
+            }
             if i == n - 1:
                 test_rows.append(row)
             elif i == n - 2:
@@ -234,6 +246,7 @@ def _process_category_2014(category, config, filesystem):
     meta_path = data_root_2014 / f"meta_{category}.json"
     # Amazon 2014 meta uses Python dict syntax (single quotes), not valid JSON
     import ast
+
     records = []
     with open(meta_path) as f:
         for line in f:
@@ -254,7 +267,9 @@ def _process_category_2014(category, config, filesystem):
     )
     meta = meta[META_SELECTED_COLS]
     meta = meta[meta.parent_asin.isin(set(all_items))]
-    print(f"{category} [2014] - {meta.shape[0]} items for {train_val_test_df.shape[0]} users.")
+    print(
+        f"{category} [2014] - {meta.shape[0]} items for {train_val_test_df.shape[0]} users."
+    )
     meta.to_parquet(
         config.paths.meta_tplt.format(category=category),
         index=False,

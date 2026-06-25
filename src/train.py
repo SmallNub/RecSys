@@ -48,21 +48,27 @@ def main(cfg: DictConfig) -> Optional[float]:
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
     from src.models import SpecialTokens
+
     first_ds = next(iter(datasets.values())) if datasets else None
-    if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
+    if (
+        first_ds is not None
+        and hasattr(first_ds, "pp")
+        and hasattr(first_ds.pp, "item_to_id")
+    ):
         vocab_size = len(first_ds.pp.item_to_id) + len(SpecialTokens)
         log.info(f"Detected actual vocab size from dataset: {vocab_size}")
         if (
-            "model" in cfg 
-            and "net" in cfg.model 
+            "model" in cfg
+            and "net" in cfg.model
             and cfg.model.net.get("_target_") == "src.models.sasrec.SASRec"
         ):
             cfg.model.net.vocab_size = vocab_size
             log.info(f"Overrode model.net.vocab_size to {vocab_size} for SASRec")
 
-
     log.info("Instantiating datamodule")
-    datamodule: L.LightningDataModule = hydra.utils.instantiate(cfg.data.datamodule, datasets=datasets)
+    datamodule: L.LightningDataModule = hydra.utils.instantiate(
+        cfg.data.datamodule, datasets=datasets
+    )
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: L.LightningModule = hydra.utils.instantiate(cfg.model)

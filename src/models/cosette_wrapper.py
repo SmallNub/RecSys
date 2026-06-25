@@ -98,7 +98,9 @@ class CosetteWrapper(nn.Module):
             valid_idx = safe_indices[:, i] < num_embeddings
             valid_mask[:, i] = valid_mask[:, i] & valid_idx
 
-            safe_idx = torch.where(valid_idx, safe_indices[:, i], torch.zeros_like(safe_indices[:, i]))
+            safe_idx = torch.where(
+                valid_idx, safe_indices[:, i], torch.zeros_like(safe_indices[:, i])
+            )
             x_res = quantizer.get_codebook_entry(safe_idx, shape=None)
             embs.append(x_res)
 
@@ -106,13 +108,18 @@ class CosetteWrapper(nn.Module):
         embs = embs * valid_mask.unsqueeze(-1).to(embs.dtype)
 
         if len(orig_shape) > 2:
-            target_shape = orig_shape[:-1] + [num_present_quantizers, self.model.centroids_dim]
+            target_shape = orig_shape[:-1] + [
+                num_present_quantizers,
+                self.model.centroids_dim,
+            ]
             embs = embs.view(target_shape)
 
         return embs
 
     @torch.no_grad()
-    def get_codebook_entry(self, indices: torch.Tensor, quantizer_index: int = 0) -> torch.Tensor:
+    def get_codebook_entry(
+        self, indices: torch.Tensor, quantizer_index: int = 0
+    ) -> torch.Tensor:
         """
         Fetches continuous embeddings specifically for one quantizer level.
         Returns tensor of shape (..., centroids_dim)

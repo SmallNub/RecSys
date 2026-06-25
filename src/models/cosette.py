@@ -56,8 +56,8 @@ def kmeans(
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     Q = torch.exp(-distances / epsilon)
 
-    B = Q.shape[0]  
-    K = Q.shape[1]  
+    B = Q.shape[0]
+    K = Q.shape[1]
 
     sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
     Q /= sum_Q

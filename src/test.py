@@ -30,16 +30,25 @@ def get_top_cfg(fs, config):
     if fs.exists(snapshot_path):
         with fs.open(snapshot_path, "r") as f:
             snapshot_data = json.load(f)
-        latest_dir_name = snapshot_data["latest_checkpoint_result"]["checkpoint_dir_name"]
+        latest_dir_name = snapshot_data["latest_checkpoint_result"][
+            "checkpoint_dir_name"
+        ]
         print(f"[INFO] Found latest sub-checkpoint from snapshot: {latest_dir_name}")
         target_dir = os.path.join(root, latest_dir_name)
     else:
-        print(f"[WARNING] {FILENAMES['snapshot']} not found at {root}. Searching for sub-directories...")
+        print(
+            f"[WARNING] {FILENAMES['snapshot']} not found at {root}. Searching for sub-directories..."
+        )
         try:
-            subdirs = [os.path.basename(x.rstrip('/')) for x in fs.glob(os.path.join(root, "checkpoint_*"))]
+            subdirs = [
+                os.path.basename(x.rstrip("/"))
+                for x in fs.glob(os.path.join(root, "checkpoint_*"))
+            ]
             if subdirs:
                 latest_dir_name = sorted(subdirs)[-1]
-                print(f"[INFO] Fallback selected latest sub-directory: {latest_dir_name}")
+                print(
+                    f"[INFO] Fallback selected latest sub-directory: {latest_dir_name}"
+                )
                 target_dir = os.path.join(root, latest_dir_name)
             else:
                 target_dir = root
@@ -126,7 +135,9 @@ def load_item_embeddings(fs, cfg):
         category=cfg.data.datasets.category,
     )
     emb_df = pd.read_parquet(emb_path, filesystem=fs)
-    return {row["product_id"]: np.array(row["embedding"]) for _, row in emb_df.iterrows()}
+    return {
+        row["product_id"]: np.array(row["embedding"]) for _, row in emb_df.iterrows()
+    }
 
 
 def get_popularity_counts(fs, cfg):
@@ -161,23 +172,34 @@ def main(test_config):
 
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
-    
+
     from src.models import SpecialTokens
+
     first_ds = next(iter(datasets.values())) if datasets else None
-    if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
+    if (
+        first_ds is not None
+        and hasattr(first_ds, "pp")
+        and hasattr(first_ds.pp, "item_to_id")
+    ):
         vocab_size = len(first_ds.pp.item_to_id) + len(SpecialTokens)
         if (
-            "model" in cfg 
-            and "net" in cfg.model 
+            "model" in cfg
+            and "net" in cfg.model
             and cfg.model.net.get("_target_") == "src.models.sasrec.SASRec"
         ):
             cfg.model.net.vocab_size = vocab_size
-            print(f"[INFO] Overrode model.net.vocab_size in test to {vocab_size} for SASRec")
+            print(
+                f"[INFO] Overrode model.net.vocab_size in test to {vocab_size} for SASRec"
+            )
 
     diversity_context = {}
-    
+
     first_ds = next(iter(datasets.values())) if datasets else None
-    if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "id_to_item"):
+    if (
+        first_ds is not None
+        and hasattr(first_ds, "pp")
+        and hasattr(first_ds.pp, "id_to_item")
+    ):
         diversity_context["id_to_item"] = first_ds.pp.id_to_item
     else:
         diversity_context["id_to_item"] = None
@@ -198,7 +220,9 @@ def main(test_config):
     try:
         diversity_context["item_embeddings"] = load_item_embeddings(fs, cfg)
     except Exception as e:
-        print(f"[WARNING] Could not load item embeddings: {e}. ILD metric will be disabled.")
+        print(
+            f"[WARNING] Could not load item embeddings: {e}. ILD metric will be disabled."
+        )
         diversity_context["item_embeddings"] = None
 
     try:
@@ -209,8 +233,9 @@ def main(test_config):
 
     valid_metrics = get_metrics(cfg, best_checkpoint, "valid", datasets)
 
-    test_metrics = get_metrics(cfg, best_checkpoint, "test", datasets,
-                               diversity_context=diversity_context)
+    test_metrics = get_metrics(
+        cfg, best_checkpoint, "test", datasets, diversity_context=diversity_context
+    )
 
     to_pickle(
         fs,
@@ -231,13 +256,15 @@ def main(test_config):
     rows = []
     for split, metrics in [("valid", valid_metrics), ("test", test_metrics)]:
         for k, v in metrics[0].items():
-            rows.append({
-                "run_directory": run_directory,
-                "category": category,
-                "split": split,
-                "metric": k,
-                "value": v,
-            })
+            rows.append(
+                {
+                    "run_directory": run_directory,
+                    "category": category,
+                    "split": split,
+                    "metric": k,
+                    "value": v,
+                }
+            )
 
     file_exists = os.path.exists(summary_path)
     with open(summary_path, "a", newline="") as f:

@@ -113,7 +113,9 @@ class LitModule(LightningModule):
                 add_dataloader_idx=False,
             )
 
-        if split == "test" and (self.code_to_item is not None or self.id_to_item is not None):
+        if split == "test" and (
+            self.code_to_item is not None or self.id_to_item is not None
+        ):
             self._accumulate_diversity(gen)
 
     def _decode_token_to_centroid(self, code):
@@ -123,10 +125,10 @@ class LitModule(LightningModule):
         Decoding: centroid_idx = token_id - special_token_offset - level * n_centroids
         """
         from src.models import SpecialTokens
+
         offset = len(SpecialTokens)  # 2
         return tuple(
-            c - offset - (level * self.n_centroids)
-            for level, c in enumerate(code)
+            c - offset - (level * self.n_centroids) for level, c in enumerate(code)
         )
 
     def _accumulate_diversity(self, gen):
@@ -159,11 +161,13 @@ class LitModule(LightningModule):
             self._test_rec_items.extend(rec_items)
 
             if self.item_embeddings is not None:
-                embs = np.array([
-                    self.item_embeddings[item]
-                    for item in rec_items
-                    if item in self.item_embeddings
-                ])
+                embs = np.array(
+                    [
+                        self.item_embeddings[item]
+                        for item in rec_items
+                        if item in self.item_embeddings
+                    ]
+                )
                 if len(embs) >= 2:
                     norms = np.linalg.norm(embs, axis=1, keepdims=True)
                     embs = embs / (norms + 1e-8)
@@ -181,7 +185,9 @@ class LitModule(LightningModule):
         if self.code_to_item is None and self.id_to_item is None:
             return
 
-        mean_ild = float(np.mean(self._test_ild_scores)) if self._test_ild_scores else 0.0
+        mean_ild = (
+            float(np.mean(self._test_ild_scores)) if self._test_ild_scores else 0.0
+        )
         rec_counts = {}
         for item in self._test_rec_items:
             rec_counts[item] = rec_counts.get(item, 0) + 1
@@ -192,7 +198,8 @@ class LitModule(LightningModule):
 
         if n > 1:
             gini = (
-                2 * np.sum(np.arange(1, n + 1) * counts_sorted)
+                2
+                * np.sum(np.arange(1, n + 1) * counts_sorted)
                 / (n * counts_sorted.sum())
             ) - (n + 1) / n
         else:
@@ -205,7 +212,9 @@ class LitModule(LightningModule):
         self.log(f"test/{self.category}/popularity_bias/Gini", float(gini))
         self.log(f"test/{self.category}/popularity_bias/Entropy", entropy)
 
-        print(f"[Diversity] ILD={mean_ild:.4f} | Gini={gini:.4f} | Entropy={entropy:.4f}")
+        print(
+            f"[Diversity] ILD={mean_ild:.4f} | Gini={gini:.4f} | Entropy={entropy:.4f}"
+        )
 
         self._test_rec_items = []
         self._test_ild_scores = []

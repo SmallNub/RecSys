@@ -8,6 +8,7 @@ from torch import nn
 
 MIN_NORM = 1e-15
 
+
 def project(x, c=1.0):
     """Projects points to ensure they strictly remain inside the Poincare ball."""
     norm = torch.norm(x, dim=-1, keepdim=True)
@@ -16,16 +17,18 @@ def project(x, c=1.0):
     projected = x / norm.clamp_min(MIN_NORM) * maxnorm
     return torch.where(cond, projected, x)
 
+
 def mobius_add(x, y, c=1.0):
     """Performs Mobius addition of x and y in the Poincare ball."""
     x2 = torch.sum(x * x, dim=-1, keepdim=True)
     y2 = torch.sum(y * y, dim=-1, keepdim=True)
     xy = torch.sum(x * y, dim=-1, keepdim=True)
-    
+
     num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
     den = 1 + 2 * c * xy + c**2 * x2 * y2
-    
+
     return project(num / den.clamp_min(MIN_NORM), c)
+
 
 def expmap0(u, c=1.0):
     """Maps a vector u from the Euclidean tangent space at origin to the Poincare ball."""
@@ -33,10 +36,13 @@ def expmap0(u, c=1.0):
     u_norm = torch.norm(u, dim=-1, keepdim=True).clamp_min(MIN_NORM)
     return project(torch.tanh(sqrt_c * u_norm) * u / (sqrt_c * u_norm), c)
 
+
 def logmap0(y, c=1.0):
     """Maps a point y from the Poincare ball to the Euclidean tangent space at origin."""
     sqrt_c = math.sqrt(c)
-    y_norm = torch.norm(y, dim=-1, keepdim=True).clamp(min=MIN_NORM, max=(1.0 - 1e-5) / sqrt_c)
+    y_norm = torch.norm(y, dim=-1, keepdim=True).clamp(
+        min=MIN_NORM, max=(1.0 - 1e-5) / sqrt_c
+    )
     return (torch.atanh(sqrt_c * y_norm) * y) / (sqrt_c * y_norm)
 
 
@@ -69,6 +75,7 @@ class MLPLayers(nn.Module):
     def forward(self, input_feature):
         return self.mlp_layers(input_feature)
 
+
 def kmeans(samples, num_clusters, num_iters=10):
     device = samples.device
     x = samples.cpu().detach().float().numpy()
@@ -76,11 +83,12 @@ def kmeans(samples, num_clusters, num_iters=10):
     centers = cluster.cluster_centers_
     return torch.from_numpy(centers).to(device)
 
+
 @torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     Q = torch.exp(-distances / epsilon)
-    B = Q.shape[0]  
-    K = Q.shape[1]  
+    B = Q.shape[0]
+    K = Q.shape[1]
 
     sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
     Q /= sum_Q
@@ -89,15 +97,16 @@ def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
         Q /= B
         Q /= torch.sum(Q, dim=0, keepdim=True)
         Q /= K
-    Q *= B  
+    Q *= B
     return Q
+
 
 class HyperbolicVectorQuantizer(nn.Module):
     def __init__(
         self,
         n_centroids,
         centroids_dim,
-        c=1.0, 
+        c=1.0,
         beta=0.25,
         kmeans_init=False,
         kmeans_iters=10,
@@ -151,7 +160,7 @@ class HyperbolicVectorQuantizer(nn.Module):
 
         x_expand = latent.unsqueeze(1)
         emb_expand = codebook.unsqueeze(0)
-        
+
         minus_x = -x_expand
         m_add = mobius_add(minus_x, emb_expand, self.c)
         m_add_norm = torch.norm(m_add, dim=-1).clamp(max=1.0 - 1e-5)
@@ -173,6 +182,7 @@ class HyperbolicVectorQuantizer(nn.Module):
         indices = indices.view(x.shape[:-1])
         return x_q, loss, indices, d
 
+
 class HyperbolicResidualVectorQuantizer(nn.Module):
     def __init__(
         self,
@@ -193,7 +203,7 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilons = sk_epsilons
         self.sk_iters = sk_iters
-        
+
         self.vq_layers = nn.ModuleList(
             [
                 HyperbolicVectorQuantizer(
@@ -216,11 +226,11 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
 
         x_q_agg = None
         residual = x
-        
+
         for quantizer in self.vq_layers:
             x_res, loss, indices, distance = quantizer(residual, use_sk=use_sk)
             residual = mobius_add(residual, -x_res, c=self.c)
-            
+
             if x_q_agg is None:
                 x_q_agg = x_res
             else:
@@ -281,6 +291,7 @@ class SigLIPLoss(torch.nn.Module):
         logits = torch.mm(xa, xb.T) * self.tau.exp() + self.bias
         loss = self._siglip_loss(logits, items, timelines)
         return loss
+
 
 class COSETTE(torch.nn.Module):
     def __init__(
@@ -365,7 +376,7 @@ class COSETTE(torch.nn.Module):
             )
 
             embeddings = F.embedding(idxs, self.embeddings)
-            
+
             z_e = self.encoder(embeddings)
             z_h = expmap0(z_e, c=c)
             z_q_h, rq_loss, _, _ = self.rq(z_h, use_sk=True)
@@ -376,13 +387,13 @@ class COSETTE(torch.nn.Module):
 
             loss += recon_loss * self.loss_weights["reconstruction"]
             loss += rq_loss * self.loss_weights["quantization"]
-            
+
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
         if self.loss_weights.get("contrastive", 0.0) > 0:
             embeddings = F.embedding(items, self.embeddings)
-            
+
             z_e = self.encoder(embeddings)
             z_h = expmap0(z_e, c=c)
             z_q_h, sig_rq_loss, _, _ = self.rq(z_h, use_sk=True)
