@@ -22,10 +22,6 @@ FILENAMES = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint loading
-# ---------------------------------------------------------------------------
-
 def find_checkpoint_dir(fs, root):
     """Find the best checkpoint directory inside a run root."""
     snapshot_path = os.path.join(root, FILENAMES["snapshot"])
@@ -82,10 +78,6 @@ def load_checkpoint(run_directory, model_folder, fs):
     return cfg, ckpt_path
 
 
-# ---------------------------------------------------------------------------
-# Diversity context builders
-# ---------------------------------------------------------------------------
-
 def build_code_to_item(fs, cfg):
     """Build reverse mapping: tuple(centroid_code) -> item_id from quantized parquet."""
     quant_path = cfg.paths.semantic_ids_tplt.format(
@@ -141,10 +133,6 @@ def get_popularity_counts(fs, cfg):
     return counts
 
 
-# ---------------------------------------------------------------------------
-# Metric computation
-# ---------------------------------------------------------------------------
-
 def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     """
     Run standard accuracy metrics and optionally diversity metrics.
@@ -159,7 +147,6 @@ def run_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     n_params = sum(p.numel() for p in model.parameters())
     model.full_hydra_config = cfg
 
-    # Inject diversity context for test split
     if split == "test" and diversity_context is not None:
         model.code_to_item = diversity_context["code_to_item"]
         model.item_embeddings = diversity_context["item_embeddings"]
@@ -221,10 +208,6 @@ def to_pickle(fs, path, data):
         pickle.dump(data, f)
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
 @hydra.main(version_base="1.3", config_path="../configs", config_name="test")
 def main(test_config: DictConfig):
     patch_fsspec()
@@ -232,7 +215,6 @@ def main(test_config: DictConfig):
 
     debug = test_config.get("debug", False)
 
-    # 1. Load checkpoint
     cfg, ckpt_path = load_checkpoint(
         run_directory=test_config.run_directory,
         model_folder=test_config.paths.model_folder_tplt,
@@ -242,11 +224,9 @@ def main(test_config: DictConfig):
     if test_config.enforce_filtering:
         cfg.model.net.filter_preds = True
 
-    # 2. Instantiate datasets
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
-    # 3. Build diversity context (only if quantization is used i.e. MARIUS, not SASRec++)
     uses_quantization = (
         cfg.data.datasets.get("quant_id") is not None
         and cfg.data.datasets.get("emb_id") is not None
@@ -264,7 +244,6 @@ def main(test_config: DictConfig):
         print("[INFO] Skipping diversity context — no quantization (SASRec++ mode).")
         diversity_context = None
 
-    # 4. Debug mode — run one forward pass and inspect code lookup, then exit
     if debug:
         if not uses_quantization:
             print("[DEBUG] No quantization — skipping code lookup debug.")
@@ -294,12 +273,10 @@ def main(test_config: DictConfig):
         print("[DEBUG] Exiting after debug pass. Re-run without debug=true for full metrics.")
         return
 
-    # 5. Run metrics
     valid_metrics = run_metrics(cfg, ckpt_path, "valid", datasets)
     test_metrics = run_metrics(cfg, ckpt_path, "test", datasets,
                                diversity_context=diversity_context)
 
-    # 6. Save pickle
     to_pickle(
         fs,
         os.path.join(os.path.dirname(ckpt_path), FILENAMES["metrics"]),
@@ -310,7 +287,6 @@ def main(test_config: DictConfig):
         },
     )
 
-    # 7. Append to shared summary CSV
     summary_path = os.path.join(
         test_config.paths.model_folder_tplt, "results_summary.csv"
     )

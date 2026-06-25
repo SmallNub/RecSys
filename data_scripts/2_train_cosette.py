@@ -20,7 +20,6 @@ from src.utils.tools import patch_fsspec
 
 
 def set_global_seed(seed: int):
-    """Seeds all main process random number generators."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -28,7 +27,6 @@ def set_global_seed(seed: int):
 
 
 def worker_init_fn(worker_id):
-    """Ensures every DataLoader worker gets a unique, deterministic random seed."""
     base_seed = torch.initial_seed() % (2**32)
     worker_seed = base_seed + worker_id
 
@@ -135,7 +133,6 @@ class Trainer(object):
     def _train_epoch(self, train_data, epoch_idx):
         self.model.train()
 
-        # Grab c from config, default to 1.0
         c = self.config.model.get("c", 1.0)
         total_loss = 0
 
@@ -312,7 +309,6 @@ class _Dataset(torch.utils.data.IterableDataset):
             "timelines": torch.from_numpy(sel_timelines),
         }
 
-
 class DataLoader:
     def __init__(self, items, timelines, bs, cut):
         self.timelines = timelines
@@ -422,8 +418,6 @@ def make_cosette_embs(config):
         version_type = config.model.get("version", "default")
         if version_type == "default":
             from src.models.cosette import COSETTE
-        elif version_type == "alt":
-            from src.models.cosette_alt import COSETTE
 
     embeddings_path = config.paths.embeddings_tplt.format(
         emb_method=config.data.emb_method, category=config.data.category

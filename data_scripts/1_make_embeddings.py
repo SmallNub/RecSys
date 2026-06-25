@@ -51,7 +51,6 @@ def get_model(fs, model_folder):
 
         return tmpdir
 
-    # Probably a model_id that will be loaded by SentenceTransformer
     return model_folder
 
 
@@ -59,7 +58,6 @@ def get_model(fs, model_folder):
     config_path="../configs", config_name="1_make_embeddings", version_base="1.2"
 )
 def main(config):
-    # Could loop over multiple categories here ?
     embed(config)
 
 
@@ -67,13 +65,11 @@ def embed(config):
     patch_fsspec()
     fs = fsspec.filesystem(config.paths.protocol)
 
-    # Writing directly to embeddings as it's already filtered
     output_file = config.paths.embeddings_tplt.format(
         emb_method=config.emb_name, category=config.category
     )
     print("Outputs will be written to : ", output_file)
 
-    # Try removing the embeddings, we don't want to have multiple versions in the same folder
     if config.force:
         try:
             fs.rm(output_file, recursive=True)

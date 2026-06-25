@@ -15,8 +15,6 @@ class CosetteWrapper(nn.Module):
         super().__init__()
         print("Loading frozen COSETTE checkpoint...")
         self.model = self._load_model_from_checkpoint(model_path)
-
-        # Buffer tracking device migration dynamically within PyTorch Lightning loops
         self.register_buffer("_device_marker", torch.empty(0))
 
         self.eval()
@@ -38,7 +36,7 @@ class CosetteWrapper(nn.Module):
 
         model_cfg = ckpt.get("config")
         state_dict = ckpt.get("state_dict")
-        state_dict.pop("embeddings", None)  # Pre-emptively remove training block
+        state_dict.pop("embeddings", None)
 
         layers = model_cfg.model.layers
         n_centroids_list = model_cfg.centroids.n_centroids_list
@@ -104,7 +102,7 @@ class CosetteWrapper(nn.Module):
             x_res = quantizer.get_codebook_entry(safe_idx, shape=None)
             embs.append(x_res)
 
-        embs = torch.stack(embs, dim=1)  # B x K x centroids_dim
+        embs = torch.stack(embs, dim=1)
         embs = embs * valid_mask.unsqueeze(-1).to(embs.dtype)
 
         if len(orig_shape) > 2:
@@ -141,10 +139,7 @@ class CosetteWrapper(nn.Module):
         """
         codebook_embs = self.get_codebook_embeddings(indices)
 
-        # Sum vectors directly across all active quantizers (unquantized representation)
         x_q = codebook_embs.sum(dim=-2)
-
-        # Multiplicative masking instead of mutating tensor assignments
         valid_rows = (indices >= 0).all(dim=-1, keepdim=True)
         unquantized_latents = x_q * valid_rows.to(x_q.dtype)
 

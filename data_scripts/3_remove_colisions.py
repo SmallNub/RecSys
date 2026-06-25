@@ -82,7 +82,6 @@ def main(config):
     patch_fsspec()
     fs = fsspec.filesystem(config.paths.protocol)
 
-    # --- HYBRID TOGGLE: Dynamic Import ---
     model_type = config.model.get("type", "euclidean")
     if model_type == "hyperbolic":
         print("\n>>> LOADING HYPERBOLIC COSETTE FOR COLLISION RESOLUTION <<<")
@@ -92,11 +91,8 @@ def main(config):
         print("\n>>> LOADING EUCLIDEAN COSETTE FOR COLLISION RESOLUTION <<<")
         if config.model.get("version", "default") == "default":
             from src.models.cosette import COSETTE
-        else:
-            from src.models.cosette_alt import COSETTE
         prefix = "COSETTE"
 
-    # --- HYBRID TOGGLE: Dynamic Naming ---
     latest_dir_name = get_latest_timestamp_dir(config.paths.ckpt_dir).name
     quant_method = f"{prefix}_{config.data.category}_{latest_dir_name}"
     if config.get("marker") is not None:
@@ -118,7 +114,6 @@ def main(config):
         category=config.data.category,
     )
 
-    # Embeddings_df
     embs_df = pd.read_parquet(embeddings_path, filesystem=fs)
     embs_block = np.stack(embs_df["embedding"].values)
 
@@ -127,9 +122,8 @@ def main(config):
         model_cfg = ckpt.pop("config")
         state_dict = ckpt.pop("state_dict", None)
 
-        # --- THE FIX: DYNAMIC MODEL INITIALIZATION ---
         kwargs = {
-            "embs_block": None,  # Provided at inference time
+            "embs_block": None, 
             "in_dim": embs_block.shape[-1],
             "layers": model_cfg.model.layers,
             "n_centroids_list": model_cfg.centroids.n_centroids_list,
@@ -149,13 +143,10 @@ def main(config):
             "sk_iters": model_cfg.centroids.sk_iters,
         }
 
-        # Inject curvature 'c' if hyperbolic
         if model_type == "hyperbolic":
             kwargs["c"] = model_cfg.model.get("c", 1.0)
 
         model = COSETTE(**kwargs)
-
-        # We didn't save the embeddings block
         model.load_state_dict(state_dict)
 
         model.to("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,7 +157,6 @@ def main(config):
     all_distances = []
     all_indices_tup_set = set()
 
-    # --- THE FIX: DYNAMIC CURVATURE INFERENCE ---
     if model_type == "hyperbolic":
         c_val = model_cfg.model.get("c", 1.0)
         indices, all_distances = model.get_indices(
@@ -177,10 +167,10 @@ def main(config):
             embeddings=torch.from_numpy(embs_block).cuda(), use_sk=False
         )
 
-    indices = indices.cpu().numpy()  # (N, L)
-    all_distances = all_distances.cpu().numpy()  # (N, L, K)
+    indices = indices.cpu().numpy()  
+    all_distances = all_distances.cpu().numpy()  
 
-    for index in indices:  # (N, L) -> (1, L)
+    for index in indices:  
         code = []
         for i, ind in enumerate(index):
             code.append(int(ind))
@@ -190,7 +180,6 @@ def main(config):
         all_indices_tup_set.add(tuple(code))
 
     sort_distances_index = np.argsort(all_distances, axis=2)
-
     item_min_dis = defaultdict(list)
 
     for item, distances in tqdm(enumerate(all_distances), desc="cal distances"):
@@ -209,7 +198,6 @@ def main(config):
     level = len(model_cfg.centroids.n_centroids_list) - 1
     max_num = model_cfg.centroids.n_centroids_list[0]
 
-    # Capture initial collision rate before resolving
     tot_item_init = len(all_indices_tup)
     tot_indice_init = len(set(all_indices_tup))
     initial_collision_rate = (tot_item_init - tot_indice_init) / tot_item_init
@@ -224,7 +212,6 @@ def main(config):
             break
 
         collision_item_groups = get_collision_item(all_indices_tup)
-
         print("len(collision_item_groups)", len(collision_item_groups))
 
         for collision_items in tqdm(collision_item_groups, desc="solve collision"):
@@ -296,12 +283,10 @@ def main(config):
     df.to_parquet(quantized_path, filesystem=fs)
     print("Quantized data saved to", quantized_path)
 
-    # --- CSV LOGGING FOR MULTIRUN (ONE ROW PER EXPERIMENT) ---
     c_val = model_cfg.model.get("c", "N/A") if model_type == "hyperbolic" else "N/A"
     run_directory = latest_dir_name if isinstance(latest_dir_name, str) else str(latest_dir_name)
     category = config.data.category
 
-    # Combine ALL metadata and metrics into a single dictionary
     row_data = {
         "run_directory": run_directory,
         "category": category,

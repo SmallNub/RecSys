@@ -51,7 +51,3 @@ RUN=$(basename "${LATEST_MARIUS_RUN}")
 echo "Running evaluation on latest experiment directory: ${RUN}"
 
 python src/test.py run_directory="${RUN}"
-
-# cat scripts/slurm/train_marius23686210.log base
-# cat scripts/slurm/train_marius23725128.log -cos
-# cat scripts/slurm/train_marius23726400.log -emb

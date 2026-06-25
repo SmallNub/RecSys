@@ -19,7 +19,6 @@ class TransformerConfig:
     emb_dropout: float
     seq_len: int
 
-
 class RoPE:
     def __init__(self, head_dim):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
@@ -41,7 +40,6 @@ class RoPE:
         self._cache[key] = (cos, sin)
         return cos, sin
 
-
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -51,7 +49,6 @@ def apply_rope(x, cos, sin):
     cos = cos[None, None, :, :].to(x.dtype)
     sin = sin[None, None, :, :].to(x.dtype)
     return x * cos + rotate_half(x) * sin
-
 
 class Attention(nn.Module):
     def __init__(self, d_model, d_head, use_rope=True):
@@ -128,7 +125,6 @@ class TemporalBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
-
 class DepthBlock(nn.Module):
     def __init__(self, d_model, d_head):
         super().__init__()
@@ -141,7 +137,6 @@ class DepthBlock(nn.Module):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
         x = x + self.ffn(self.norm2(x))
         return x
-
 
 class MARIUS(nn.Module):
     def __init__(

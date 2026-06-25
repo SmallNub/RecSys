@@ -245,7 +245,6 @@ def _process_category_2014(category, config, filesystem):
                     pass
     meta = pd.DataFrame(records)
 
-    # Map 2014 columns to 2023 schema so downstream scripts work unchanged
     meta = meta.rename(columns={"asin": "parent_asin", "brand": "store"})
     meta["price"] = meta["price"].apply(_sanitize)
     meta["average_rating"] = None

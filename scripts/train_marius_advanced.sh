@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_marius
 #SBATCH --output=scripts/slurm/train_marius%j.log
 #SBATCH --error=scripts/slurm/train_marius%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=1:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -19,8 +19,8 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export HYDRA_FULL_ERROR=1
 
 CATEGORY="Beauty"
-EXPERIMENT="marius_flow_small"
-TASKNAME="MARIUS_flow_small"
+EXPERIMENT="marius_advanced"
+TASKNAME="MARIUS_advanced"
 
 COSETTE_BASE_DIR="outputs/checkpoints/cosette"
 LATEST_COSETTE_DIR=$(ls -1d ${COSETTE_BASE_DIR}/*/ 2>/dev/null | sort | tail -n 1)
@@ -35,7 +35,7 @@ echo "Using latest Cosette timestamp: ${COSETTE_TIMESTAMP}"
 
 QUANT="COSETTE_${CATEGORY}_${COSETTE_TIMESTAMP}"
 
-HYDRA_FULL_ERROR=1 python src/train.py experiment=${EXPERIMENT} \
+python src/train.py experiment=${EXPERIMENT} \
     data.datasets.category=${CATEGORY} data.datasets.quant_id=${QUANT}-col
 
 MARIUS_BASE_DIR="outputs/checkpoints/marius"

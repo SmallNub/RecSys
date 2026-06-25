@@ -10,7 +10,7 @@ class FullSoftmax(torch.nn.Module):
         self.temperature = temperature
 
     def __call__(self, embs, target, model):
-        voc = model.get_embs()  # Normalize everything
+        voc = model.get_embs()
         logits = torch.einsum("b l d, v d -> b v l", embs, voc) / self.temperature
         loss = self.criterion(logits, target)
         return loss, logits
@@ -21,18 +21,15 @@ class SampledSoftmax(torch.nn.Module):
         super().__init__()
         self.cross_entropy = torch.nn.CrossEntropyLoss()
         self.n_items = n_items
-        self.emb_table = None  # Reference set by the model
+        self.emb_table = None
         self.temperature = temperature
 
     def __call__(self, embs, target, model):
         B, L, D = embs.shape
-        # Flatten everything
         embs = embs.view(B * L, D)
         target = target.view(B * L)
 
-        # Get target scores
         target_scores = (embs * model.get_embs(target)).sum(dim=-1)  # B*L
-        # Sample shared noise & get scores
         samples = torch.randint(
             low=0,
             high=model.embedding.weight.shape[0],
@@ -41,7 +38,6 @@ class SampledSoftmax(torch.nn.Module):
         )
         noise_scores = embs @ model.get_embs(samples).T
 
-        # Reject samples matching target
         reject_samples = target[:, None] == samples[None, :]
         noise_scores -= 1e6 * reject_samples.float()
 
@@ -74,7 +70,7 @@ class SASRec(torch.nn.Module):
         vocab_size,
         dropout,
         seq_len,
-        normalization,  # layer | l2 | None
+        normalization,
         criterion=SampledSoftmax(n_items=30_000),
         norm_first=True,
         activation="relu",
@@ -122,7 +118,6 @@ class SASRec(torch.nn.Module):
             ),
             num_layers=n_layers,
             enable_nested_tensor=False,
-            # Final norm at the output of the Transformer
             norm={"l2": L2Norm(), "layer": torch.nn.LayerNorm(d_model), None: None}[
                 normalization
             ],
@@ -151,7 +146,6 @@ class SASRec(torch.nn.Module):
             module.weight.data.fill_(1.0)
 
     def get_param_groups(self):
-        # Ignore weight decay for embedding
         def _select_no_decay(n):
             return "embedding" in n
 
@@ -174,7 +168,6 @@ class SASRec(torch.nn.Module):
             mask=self.causal_mask[:L, :L],
             src_key_padding_mask=(x == SpecialTokens.PAD.value),
         )
-        # Encoder already includes L2Norm or LayerNorm or Nothing at the end
 
         return x_enc
 
@@ -187,7 +180,7 @@ class SASRec(torch.nn.Module):
     def get_loss(self, batch):
         query, target = batch["query"], batch["target"]
 
-        embs = self(query)  # B x L x D; Already normalized
+        embs = self(query)
         loss, logits = self.criterion(embs, target, model=self)
 
         return loss, logits
@@ -198,7 +191,6 @@ class SASRec(torch.nn.Module):
         else:
             e = self.embedding(idx)
 
-        # Get the target embeddings for the given indices
         if self.normalization == "layer" or self.normalization is None:
             return e
         elif self.normalization == "l2":
@@ -208,15 +200,14 @@ class SASRec(torch.nn.Module):
         assert self.training is False, "Not in evaluation mode (dropout)."
 
         query = batch["query"]
-        embs = self(query)[:, -1, :]  # Get last embedding, already normalized
-        voc = self.get_embs()  # Get everything
-        logits = embs @ voc.T  # / temperature doesn't change the order anyway
+        embs = self(query)[:, -1, :]
+        voc = self.get_embs()
+        logits = embs @ voc.T
 
         if self.filter_preds:
             B = query.shape[0]
             logits[torch.arange(B, device=query.device)[:, None], query] = float("-inf")
 
-        # Get the top n_results
         _, top_idx = logits.topk(n_results, dim=-1)
 
         return top_idx

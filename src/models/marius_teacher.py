@@ -16,7 +16,6 @@ class TransformerConfig:
     emb_dropout: float
     seq_len: int
 
-
 class MARIUS(torch.nn.Module):
     def __init__(
         self,
@@ -39,7 +38,6 @@ class MARIUS(torch.nn.Module):
         if self.depth_cfg.emb_dropout is None:
             self.depth_cfg.emb_dropout = self.depth_cfg.dropout
 
-        # Embeddings
         self.temp_emb = torch.nn.Embedding(
             self.temporal_cfg.vocab_size,
             self.temporal_cfg.d_model,
@@ -56,7 +54,6 @@ class MARIUS(torch.nn.Module):
                 padding_idx=SpecialTokens.PAD.value,
             )
 
-        # Positional Encoding Parameters
         self.temp_pos_emb = torch.nn.Parameter(
             torch.empty((1, self.temporal_cfg.seq_len, self.temporal_cfg.d_model))
         )
@@ -64,11 +61,9 @@ class MARIUS(torch.nn.Module):
             torch.empty((1, self.depth_cfg.seq_len, self.depth_cfg.d_model))
         )
 
-        # Embedding dropout
         self.temp_dropout = torch.nn.Dropout(self.temporal_cfg.emb_dropout)
         self.depth_dropout = torch.nn.Dropout(self.depth_cfg.emb_dropout)
 
-        # Native Transformers with Smooth GELU Activations
         self.temp_tf = torch.nn.TransformerEncoder(
             encoder_layer=torch.nn.TransformerEncoderLayer(
                 d_model=self.temporal_cfg.d_model,
@@ -110,43 +105,33 @@ class MARIUS(torch.nn.Module):
             ),
         )
 
-        # Projection
         self.mid_proj = torch.nn.Linear(
             self.temporal_cfg.d_model, self.depth_cfg.d_model
         )
 
-        # Baseline Generative Cross-Entropy
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
-
-        # Execute Stable Initialization Override
         self.reset_marius_parameters()
 
     def reset_marius_parameters(self):
         """Applies stable standard-deviation initialization across discrete spaces."""
-        # Positional encodings
         torch.nn.init.trunc_normal_(self.temp_pos_emb, std=0.02)
         torch.nn.init.trunc_normal_(self.depth_pos_emb, std=0.02)
         
-        # Embeddings
         torch.nn.init.trunc_normal_(self.temp_emb.weight, std=0.02)
         if not self.tie_embeddings:
             torch.nn.init.trunc_normal_(self.depth_emb.weight, std=0.02)
             
-        # Enforce padding_idx to remain zeroed out after truncation normal overwrite
         with torch.no_grad():
             self.temp_emb.weight[SpecialTokens.PAD.value].zero_()
             if not self.tie_embeddings:
                 self.depth_emb.weight[SpecialTokens.PAD.value].zero_()
             
-        # Projections
         torch.nn.init.trunc_normal_(self.mid_proj.weight, std=0.02)
         if self.mid_proj.bias is not None:
             torch.nn.init.constant_(self.mid_proj.bias, 0.0)
 
-        # Deep initialization loop for Transformer blocks (Linear and LayerNorm)
         for m in self.modules():
             if isinstance(m, torch.nn.Linear):
-                # Only touch internal transformer linears (skip mid_proj which is handled above)
                 if m != self.mid_proj:
                     torch.nn.init.trunc_normal_(m.weight, std=0.02)
                     if m.bias is not None:
@@ -187,8 +172,6 @@ class MARIUS(torch.nn.Module):
         in_embs = self.depth_dropout(in_embs)
 
         depth_preds = self.depth_tf(in_embs, mask=self.causal_mask[:K, :K].to(in_embs.device))
-
-        # Project predictions using matrix multiplication with embedding transpose
         logits = torch.einsum("bkd, vd -> bkv", depth_preds, self.depth_emb.weight)
 
         return logits

@@ -1,23 +1,26 @@
 # @package _global_
-# MARIUS config for small datasets (~10k items: Video Games, Beauty)
-# From Table 3 of the paper: d=256, L_T=2, L_D=2
+task_name: MARIUS_advanced
 
-task_name: MARIUS_flow_small
+trainer:
+  max_steps: 40_000
+  val_check_interval: 2_000
 
 model:
   net:
-    _target_: src.models.marius_flow.MARIUS
+    _target_: src.models.marius_advanced.MARIUS
+    filter_preds: true
+
     temporal_cfg:
-      _target_: src.models.marius_flow.TransformerConfig
+      _target_: src.models.marius_advanced.TransformerConfig
       seq_len: ${data.datasets.prepro_cfg.crop_length}
-      vocab_size: 1026 # 4 * 256 + 2
+      vocab_size: 1026
       n_layers: 2
       d_head: 64
       d_model: 256
       dropout: 0.4
       emb_dropout: null
     depth_cfg:
-      _target_: src.models.marius_flow.TransformerConfig
+      _target_: src.models.marius_advanced.TransformerConfig
       vocab_size: ${model.net.temporal_cfg.vocab_size}
       seq_len: 4
       n_layers: 2
@@ -25,18 +28,17 @@ model:
       d_model: ${model.net.temporal_cfg.d_model}
       dropout: 0.1
       emb_dropout: null
-    filter_preds: true # Better evaluation of "true" validation metrics, but slower
   mode: "generative"
-  optimizer: 
+
+  optimizer:
     lr: 0.0005
     weight_decay: 0.0001
-  scheduler: 
+  scheduler:
     warmup_steps: 2000
 
-data: 
+data:
   datasets:
     emb_id: sentence-t5-xl
-    # quant_id: COSETTE_128d_256x4_4ba1-col
     quant_id: COSETTE_128d_256x4_71e4col
-    prepro_cfg: 
+    prepro_cfg:
       _cls_: src.data.marius.MARIUSPrePro

@@ -35,12 +35,10 @@ for CATEGORY in "${CATEGORIES[@]}"; do
         echo ">>> ${CATEGORY} - Run ${RUN_IDX}/${N_RUNS} (Seed: ${SEED})"
         echo "----------------------------------------"
 
-        # Step 1: Train SASRec
         python src/train.py experiment=${EXPERIMENT} \
             data.datasets.category=${CATEGORY} \
             seed=${SEED}
 
-        # Step 2: Resolve latest SASRec run directory
         LATEST_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}"_*/ 2>/dev/null | sort | tail -n 1)
         if [ -z "$LATEST_RUN" ]; then
             echo "Error: No SASRec run found in ${MARIUS_BASE_DIR}"
@@ -49,9 +47,7 @@ for CATEGORY in "${CATEGORIES[@]}"; do
         RUN=$(basename "${LATEST_RUN%/}")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Evaluating run_directory=${RUN}"
 
-        # Step 3: Test and append to results
         python src/test.py run_directory="${RUN}"
     done
 done
 
-echo "All SASRec categories and runs complete."

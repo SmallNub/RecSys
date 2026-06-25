@@ -26,8 +26,6 @@ def main(cfg: DictConfig) -> Optional[float]:
     :param cfg: DictConfig configuration composed by Hydra.
     :return: Optional[float] with optimized metric value.
     """
-    # Avoid "unknown resolver" error - resolve hydra-specific keys.
-    # Plus we don't want each worker to have a different experiment name if they are spawned a second later.
     selective_oc_resolver(cfg, which=["now", "oc.env", "eval"])
 
     pprint(OmegaConf.to_container(cfg))
@@ -36,19 +34,12 @@ def main(cfg: DictConfig) -> Optional[float]:
         "viewfs",
         "file",
     ], "This code has only been tested for viewfs:// and file://."
-    # filesystem = (
-    #     pyarrow.fs.FileSystem.from_uri("viewfs://root")[0]
-    #     if cfg.paths.protocol == "viewfs"
-    #     else None
-    # )
 
     name = f"{cfg.task_name}_{now_to_str()}"
 
     cfg.trainer.logger.name = name
 
-    # Set precision to use tensor cores - highest | high | medium
     torch.set_float32_matmul_precision(cfg.get("fp32_matmul_precision", "high"))
-    # Disable MHA Fast path (in this version it can NaN because of left-padding)
     torch.backends.mha.set_fastpath_enabled(False)
 
     L.seed_everything(cfg.seed, workers=True)
@@ -56,7 +47,6 @@ def main(cfg: DictConfig) -> Optional[float]:
     log.info("Instantiating datasets")
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
 
-    # Dynamic vocab size override specifically for SASRec
     from src.models import SpecialTokens
     first_ds = next(iter(datasets.values())) if datasets else None
     if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
@@ -77,7 +67,6 @@ def main(cfg: DictConfig) -> Optional[float]:
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: L.LightningModule = hydra.utils.instantiate(cfg.model)
     print(model)
-    # Storing it here so that we can access it in the callback
     model.full_hydra_config = cfg
 
     log.info("Instantiating trainer")

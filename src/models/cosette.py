@@ -27,7 +27,6 @@ class MLPLayers(nn.Module):
         self.apply(self.init_weights)
 
     def init_weights(self, module):
-        # We just initialize the module with normal distribution as the paper said
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight.data)
             if module.bias is not None:
@@ -57,23 +56,19 @@ def kmeans(
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     Q = torch.exp(-distances / epsilon)
 
-    B = Q.shape[0]  # number of samples to assign
-    K = Q.shape[1]  # how many centroids per block (usually set to 256)
+    B = Q.shape[0]  
+    K = Q.shape[1]  
 
-    # make the matrix sums to 1
     sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
     Q /= sum_Q
-    # print(Q.sum())
     for it in range(sinkhorn_iterations):
-        # normalize each column: total weight per sample must be 1/B
         Q /= torch.sum(Q, dim=1, keepdim=True)
         Q /= B
 
-        # normalize each row: total weight per prototype must be 1/K
         Q /= torch.sum(Q, dim=0, keepdim=True)
         Q /= K
 
-    Q *= B  # the columns must sum to 1 so that Q is an assignment
+    Q *= B
     return Q
 
 
@@ -131,7 +126,6 @@ class VectorQuantizer(nn.Module):
 
     @staticmethod
     def center_distance_for_constraint(distances):
-        # distances: B, K
         max_distance = distances.max()
         min_distance = distances.min()
 
@@ -142,13 +136,11 @@ class VectorQuantizer(nn.Module):
         return centered_distances
 
     def forward(self, x, use_sk=True):
-        # Flatten input
         latent = x.view(-1, self.centroids_dim)
 
         if not self.initted and self.training:
             self.init_emb(latent)
 
-        # Calculate the L2 Norm between latent and Embedded weights
         d = (
             torch.sum(latent**2, dim=1, keepdim=True)
             + torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
@@ -165,13 +157,10 @@ class VectorQuantizer(nn.Module):
             indices = torch.argmax(Q, dim=-1)
 
         x_q = self.embedding(indices).view(x.shape)
-
-        # compute loss for embedding
         commitment_loss = F.mse_loss(x_q.detach(), x)
         codebook_loss = F.mse_loss(x_q, x.detach())
         loss = codebook_loss + self.beta * commitment_loss
 
-        # preserve gradients
         x_q = x + (x_q - x).detach()
 
         indices = indices.view(x.shape[:-1])
@@ -263,24 +252,19 @@ class SigLIPLoss(torch.nn.Module):
         )
 
     def _siglip_loss(self, logits, items, timelines):
-        # ==== START BY CREATING A {-1, 1} MASK
         with torch.no_grad():
-            # N x N
             mask = torch.full(
                 (len(items), len(items)),
                 -1,
                 dtype=torch.float32,
                 device=self.tau.device,
             )
-            # (N == BxL) -> N x B x L -> N x B
-            # Belonging of each item to each timeline : Broadcast over batch and sequence
             pos = (items[:, None, None] == timelines[None, :, :]).any(axis=2)
-            # Item1 belongs to timeline & Item2 belongs to timeline; for any timeline
             pos = pos.to(
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
             pos = torch.matmul(pos, pos.T) > 0
-            mask[pos] = 1.0  # Positive items
+            mask[pos] = 1.0
 
         logsig = F.logsigmoid(mask * logits)
         loss = -(logsig.sum(dim=1) / (mask == 1).sum(dim=1)).mean()
@@ -370,9 +354,7 @@ class COSETTE(torch.nn.Module):
         loss = 0.0
         metrics = defaultdict(float)
 
-        # Classic reconstruction LOSS
         if self.loss_weights["reconstruction"] > 0:
-            # Randomly sample embeddings - Uniform reconstruction
             idxs = torch.randint(
                 0,
                 self.embeddings.shape[0],
@@ -381,7 +363,6 @@ class COSETTE(torch.nn.Module):
             )
 
             embeddings = F.embedding(idxs, self.embeddings)
-            # Classic RQ-VAE Forward
             x = self.encoder(embeddings)
             x_q, rq_loss, _, _ = self.rq(x, use_sk=True)
             x_hat = self.decoder(x_q)
@@ -393,14 +374,11 @@ class COSETTE(torch.nn.Module):
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
-        # 3. Contrastive training.
-        # Encode the items in the timelines
         if self.loss_weights["contrastive"] > 0:
             embeddings = F.embedding(items, self.embeddings)
             x = self.encoder(embeddings)
             x_q, sig_rq_loss, _, _ = self.rq(x, use_sk=True)
 
-            # Contrastive Loss
             contrastive_loss = self.siglip(x_q, x_q, items, timelines)
 
             loss += sig_rq_loss * self.loss_weights["quantization"]

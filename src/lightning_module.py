@@ -23,14 +23,12 @@ class LitModule(LightningModule):
 
         self.dcg_denom = torch.log2(torch.arange(1, max(self.Ks) + 1) + 1).view(1, -1)
 
-        # Diversity/popularity context — injected from test.py before trainer.test
-        self.code_to_item = None       # dict: tuple(centroid_code) -> item_id
-        self.id_to_item = None         # dict: vocab_id -> item_id
-        self.item_embeddings = None    # dict: item_id -> np.array
-        self.popularity_counts = None  # dict: item_id -> int
-        self.n_centroids = None        # int: number of centroids per level
+        self.code_to_item = None
+        self.id_to_item = None
+        self.item_embeddings = None
+        self.popularity_counts = None
+        self.n_centroids = None
 
-        # Accumulators reset each test epoch
         self._test_rec_items = []
         self._test_ild_scores = []
 
@@ -54,10 +52,7 @@ class LitModule(LightningModule):
         return loss
 
     def _shared_eval_step(self, batch, split):
-        # Forward + Loss
         loss, _ = self.net.get_loss(batch)
-
-        # Log the loss - Dataset-wise
         self.log(
             self.tplts["loss"].format(split=split, category=self.category),
             loss,
@@ -68,11 +63,7 @@ class LitModule(LightningModule):
             add_dataloader_idx=False,
         )
 
-        # Recall
-        # Generated : Batch x Beams x L=4
-        # Dense : Batch x Beams
         gen = self.net.search(batch, n_results=max(self.Ks))
-
         target = batch["target"]
 
         if self.dcg_denom.device != target.device:
@@ -92,13 +83,9 @@ class LitModule(LightningModule):
             DCG = (
                 ((2 ** all_hits.float() - 1) / self.dcg_denom).cumsum(dim=1).mean(dim=0)
             )
-            # Note : we have a single positive, so IDCG is (2**1 - 1) / log2(2) = 1, we ignore it.
 
         elif self.mode == "dense":
-            # Take a slice of the last items
             target = target[:, None] if target.dim() == 1 else target[:, -1:]
-
-            # Gen : B x Beams, Target : B x 1 -> B x Beams
             all_hits = gen == target
 
             RatK = (all_hits.cumsum(dim=1) > 0).float().mean(dim=0)
@@ -126,8 +113,6 @@ class LitModule(LightningModule):
                 add_dataloader_idx=False,
             )
 
-        # Accumulate gen directly for diversity metrics (test only).
-        # gen already has filter_preds applied and contains valid token IDs.
         if split == "test" and (self.code_to_item is not None or self.id_to_item is not None):
             self._accumulate_diversity(gen)
 
@@ -173,7 +158,6 @@ class LitModule(LightningModule):
 
             self._test_rec_items.extend(rec_items)
 
-            # ILD: mean pairwise cosine distance for this user
             if self.item_embeddings is not None:
                 embs = np.array([
                     self.item_embeddings[item]
@@ -197,10 +181,7 @@ class LitModule(LightningModule):
         if self.code_to_item is None and self.id_to_item is None:
             return
 
-        # ILD
         mean_ild = float(np.mean(self._test_ild_scores)) if self._test_ild_scores else 0.0
-
-        # Popularity bias — count item exposure across all recommendations
         rec_counts = {}
         for item in self._test_rec_items:
             rec_counts[item] = rec_counts.get(item, 0) + 1
@@ -209,7 +190,6 @@ class LitModule(LightningModule):
         counts_sorted = np.sort(counts)
         n = len(counts_sorted)
 
-        # Gini
         if n > 1:
             gini = (
                 2 * np.sum(np.arange(1, n + 1) * counts_sorted)
@@ -218,7 +198,6 @@ class LitModule(LightningModule):
         else:
             gini = 0.0
 
-        # Entropy
         probs = counts / counts.sum()
         entropy = float(-np.sum(probs * np.log(probs + 1e-8)))
 
@@ -228,7 +207,6 @@ class LitModule(LightningModule):
 
         print(f"[Diversity] ILD={mean_ild:.4f} | Gini={gini:.4f} | Entropy={entropy:.4f}")
 
-        # Reset accumulators
         self._test_rec_items = []
         self._test_ild_scores = []
 

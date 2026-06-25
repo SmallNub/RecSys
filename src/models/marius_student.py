@@ -8,7 +8,6 @@ from einops import rearrange
 from src.models import SpecialTokens
 from src.models.utils import load_model
 
-
 @dataclass
 class TransformerConfig:
     n_layers: int
@@ -18,7 +17,6 @@ class TransformerConfig:
     dropout: float
     emb_dropout: float
     seq_len: int
-
 
 class RoPE(nn.Module):
     def __init__(self, head_dim):
@@ -36,7 +34,6 @@ class RoPE(nn.Module):
 
         return cos, sin
 
-
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -46,7 +43,6 @@ def apply_rope(x, cos, sin):
     cos = cos[None, None, :, :].to(x.dtype)
     sin = sin[None, None, :, :].to(x.dtype)
     return x * cos + rotate_half(x) * sin
-
 
 class Attention(nn.Module):
     def __init__(self, d_model, d_head, dropout_p=0.1, use_rope=True):
@@ -98,8 +94,7 @@ class Attention(nn.Module):
 
         y = rearrange(y, "b h l d -> b l (h d)")
         return self.o_proj(y)
-
-
+    
 class SwiGLU(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -112,7 +107,6 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         w1_out, w2_out = self.w12(x).chunk(2, dim=-1)
         return self.w3(F.silu(w1_out) * w2_out)
-
 
 class TemporalBlock(nn.Module):
     def __init__(self, d_model, d_head, dropout_p=0.1):
@@ -127,7 +121,6 @@ class TemporalBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
-
 class DepthBlock(nn.Module):
     def __init__(self, d_model, d_head, dropout_p=0.1):
         super().__init__()
@@ -140,7 +133,6 @@ class DepthBlock(nn.Module):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal)
         x = x + self.ffn(self.norm2(x))
         return x
-
 
 class MARIUS(nn.Module):
     def __init__(

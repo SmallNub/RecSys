@@ -68,7 +68,6 @@ def get_metrics(cfg, ckpt_path, split, datasets, diversity_context=None):
     n_params = sum(p.numel() for p in model.parameters())
     model.full_hydra_config = cfg
 
-    # Inject diversity context for test split
     if split == "test" and diversity_context is not None:
         model.code_to_item = diversity_context.get("code_to_item")
         model.id_to_item = diversity_context.get("id_to_item")
@@ -153,7 +152,6 @@ def main(test_config):
     patch_fsspec()
     fs = fsspec.filesystem(test_config.paths.protocol)
 
-    # 1. Get config and checkpoint from previous run
     cfg, best_checkpoint = get_top_cfg(fs, test_config)
 
     L.seed_everything(cfg.seed, workers=True)
@@ -161,11 +159,9 @@ def main(test_config):
     if test_config.enforce_filtering:
         cfg.model.net.filter_preds = True
 
-    # 2. Instantiate datasets
     cfg.data.datasets.which = ["valid", "test"]
     datasets = hydra.utils.instantiate(cfg.data.datasets, paths=cfg.paths)
     
-    # Dynamic vocab size override specifically for SASRec
     from src.models import SpecialTokens
     first_ds = next(iter(datasets.values())) if datasets else None
     if first_ds is not None and hasattr(first_ds, "pp") and hasattr(first_ds.pp, "item_to_id"):
@@ -178,7 +174,6 @@ def main(test_config):
             cfg.model.net.vocab_size = vocab_size
             print(f"[INFO] Overrode model.net.vocab_size in test to {vocab_size} for SASRec")
 
-    # 3. Build diversity context
     diversity_context = {}
     
     first_ds = next(iter(datasets.values())) if datasets else None
@@ -200,28 +195,23 @@ def main(test_config):
         diversity_context["code_to_item"] = None
         diversity_context["n_centroids"] = None
 
-    # Load item embeddings if available
     try:
         diversity_context["item_embeddings"] = load_item_embeddings(fs, cfg)
     except Exception as e:
         print(f"[WARNING] Could not load item embeddings: {e}. ILD metric will be disabled.")
         diversity_context["item_embeddings"] = None
 
-    # Load popularity counts if available
     try:
         diversity_context["popularity_counts"] = get_popularity_counts(fs, cfg)
     except Exception as e:
         print(f"[WARNING] Could not load popularity counts: {e}")
         diversity_context["popularity_counts"] = None
 
-    # 4. Standard accuracy metrics (valid has no diversity)
     valid_metrics = get_metrics(cfg, best_checkpoint, "valid", datasets)
 
-    # 5. Test metrics — diversity computed inside Lightning via on_test_epoch_end
     test_metrics = get_metrics(cfg, best_checkpoint, "test", datasets,
                                diversity_context=diversity_context)
 
-    # 6. Save pickle
     to_pickle(
         fs,
         os.path.join(os.path.dirname(best_checkpoint), FILENAMES["metrics"]),
@@ -232,7 +222,6 @@ def main(test_config):
         },
     )
 
-    # 7. Append to shared summary CSV
     summary_path = os.path.join(
         test_config.paths.model_folder_tplt, "results_summary.csv"
     )

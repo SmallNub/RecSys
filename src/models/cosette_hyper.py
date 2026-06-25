@@ -6,9 +6,6 @@ import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from torch import nn
 
-# ==============================================================================
-# Hyperbolic Math Utilities (Poincare Ball)
-# ==============================================================================
 MIN_NORM = 1e-15
 
 def project(x, c=1.0):
@@ -39,15 +36,10 @@ def expmap0(u, c=1.0):
 def logmap0(y, c=1.0):
     """Maps a point y from the Poincare ball to the Euclidean tangent space at origin."""
     sqrt_c = math.sqrt(c)
-    # The clamp here is crucial. If y_norm gets too close to 1/sqrt(c), atanh explodes.
-    # Our project() function ensures it stays just under, but clamp is a good safety net.
     y_norm = torch.norm(y, dim=-1, keepdim=True).clamp(min=MIN_NORM, max=(1.0 - 1e-5) / sqrt_c)
     return (torch.atanh(sqrt_c * y_norm) * y) / (sqrt_c * y_norm)
 
 
-# ==============================================================================
-# Standard Utilities
-# ==============================================================================
 class MLPLayers(nn.Module):
     def __init__(self, layers, dropout=0.0, activation="relu"):
         super(MLPLayers, self).__init__()
@@ -100,10 +92,6 @@ def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
     Q *= B  
     return Q
 
-
-# ==============================================================================
-# Hyperbolic Quantization
-# ==============================================================================
 class HyperbolicVectorQuantizer(nn.Module):
     def __init__(
         self,
@@ -185,7 +173,6 @@ class HyperbolicVectorQuantizer(nn.Module):
         indices = indices.view(x.shape[:-1])
         return x_q, loss, indices, d
 
-
 class HyperbolicResidualVectorQuantizer(nn.Module):
     def __init__(
         self,
@@ -252,9 +239,6 @@ class HyperbolicResidualVectorQuantizer(nn.Module):
         return x_q_agg, mean_losses, all_indices, all_distances
 
 
-# ==============================================================================
-# Restored SigLIP Loss
-# ==============================================================================
 class SigLIPLoss(torch.nn.Module):
     def __init__(
         self,
@@ -272,7 +256,6 @@ class SigLIPLoss(torch.nn.Module):
         )
 
     def _siglip_loss(self, logits, items, timelines):
-        # ==== START BY CREATING A {-1, 1} MASK
         with torch.no_grad():
             # N x N
             mask = torch.full(
@@ -281,7 +264,6 @@ class SigLIPLoss(torch.nn.Module):
                 dtype=torch.float32,
                 device=self.tau.device,
             )
-            # (N == BxL) -> N x B x L -> N x B
             pos = (items[:, None, None] == timelines[None, :, :]).any(axis=2)
             pos = pos.to(
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -294,17 +276,12 @@ class SigLIPLoss(torch.nn.Module):
         return loss
 
     def forward(self, xa, xb, items, timelines):
-        # xa and xb MUST be Euclidean (Tangent Space) vectors here!
         xa = F.normalize(xa, dim=-1)
         xb = F.normalize(xb, dim=-1)
         logits = torch.mm(xa, xb.T) * self.tau.exp() + self.bias
         loss = self._siglip_loss(logits, items, timelines)
         return loss
 
-
-# ==============================================================================
-# HypRQ-VAE + COSETTE Contrastive Loss
-# ==============================================================================
 class COSETTE(torch.nn.Module):
     def __init__(
         self,
@@ -379,7 +356,6 @@ class COSETTE(torch.nn.Module):
         loss = 0.0
         metrics = defaultdict(float)
 
-        # 1. Hyperbolic Reconstruction Loss
         if self.loss_weights.get("reconstruction", 0.0) > 0:
             idxs = torch.randint(
                 0,
@@ -404,16 +380,12 @@ class COSETTE(torch.nn.Module):
             metrics["reconstruction_loss"] = recon_loss.item()
             metrics["quantization_loss"] = rq_loss.item()
 
-        # 2. Contrastive Loss (Projected to Tangent Space!)
         if self.loss_weights.get("contrastive", 0.0) > 0:
             embeddings = F.embedding(items, self.embeddings)
             
             z_e = self.encoder(embeddings)
             z_h = expmap0(z_e, c=c)
             z_q_h, sig_rq_loss, _, _ = self.rq(z_h, use_sk=True)
-            
-            # THE FIX: Map the quantized Poincare coordinates back to Tangent Space 
-            # before passing them to the Euclidean SigLIP loss.
             z_q_e = logmap0(z_q_h, c=c)
 
             contrastive_loss = self.siglip(z_q_e, z_q_e, items, timelines)

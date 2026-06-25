@@ -40,17 +40,14 @@ for CATEGORY in "${CATEGORIES[@]}"; do
         echo ">>> ${CATEGORY} - Run ${RUN_IDX}/${N_RUNS}"
         echo "----------------------------------------"
 
-        # Step 1: Train COSETTE
         python data_scripts/2_train_cosette.py cosette=default \
             data.category=${CATEGORY} \
             marker=run${RUN_IDX}
 
-        # Step 2: Remove collisions (reconstructs quant name internally via get_latest_timestamp_dir)
         python data_scripts/3_remove_colisions.py \
             data.category=${CATEGORY} \
             marker=run${RUN_IDX}
 
-        # Step 3: Resolve quant_id from parquet output — name is COSETTE{category}_{timestamp}_run{N}-col
         QUANT=$(python -c "
 from pathlib import Path
 base = Path('datasets/data/embeddings/sentence-t5-xl/${CATEGORY}/')
@@ -59,13 +56,11 @@ print(max(runs))
 ")
         echo "[${CATEGORY}] Run ${RUN_IDX}: Using quant_id=${QUANT}-col"
 
-        # Step 4: Train MARIUS
         python src/train.py experiment=${EXPERIMENT} \
             data.datasets.category=${CATEGORY} \
             data.datasets.quant_id=${QUANT}-col \
             seed=${SEED}
 
-        # Step 5: Resolve latest MARIUS run directory — grab after training so timestamp is correct
         LATEST_MARIUS_RUN=$(ls -1d "${MARIUS_BASE_DIR}/${TASKNAME}_"[0-9]*/ 2>/dev/null | sort | tail -n 1)
         if [ -z "$LATEST_MARIUS_RUN" ]; then
             echo "Error: No MARIUS run found in ${MARIUS_BASE_DIR}"
@@ -80,4 +75,3 @@ print(max(runs))
     done
 done
 
-echo "All categories and runs complete."
