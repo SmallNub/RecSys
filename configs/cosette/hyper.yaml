@@ -9,7 +9,7 @@ centroids:
 
 model: 
   type: hyperbolic
-  layers: [1024, 512, 256, 32]
+  layers: [1024, 512, 256, 16]
   c: 2.0
 
 loss: 
