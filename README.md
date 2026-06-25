@@ -1,39 +1,66 @@
 <div align="center">
 
-# COSETTE & MARIUS
-Introduced in ***Closing the Performance Gap in Generative Recommenders with Collaborative Tokenization and Efficient Modeling***
+# Autoregressive Retrieval in the Ball
+**A Reproduction and Hyperbolic Manifold Extension of MARIUS and COSETTE**
 
-<a href="https://simon-lepage.github.io"><strong>Simon Lepage</strong></a>
-—
-<strong>Jérémie Mary</strong>
-—
-<a href=https://davidpicard.github.io><strong>David Picard</strong></a>
+<strong>Nordin el Assassi</strong>
+·
+<strong>Elliott Callenbach</strong>
+·
+<strong>Steven Dong</strong>
+·
+<strong>Sakr Ismail</strong>
+·
+<strong>Simen Veenman</strong>
 
-<a href=https://ailab.criteo.com>CRITEO AI Lab</a>
-&
-<a href=https://imagine-lab.enpc.fr>ENPC</a>
+University of Amsterdam (UvA)
+<br><br>
+
+<a href="https://github.com/SmallNub/RecSys">
+    <img alt="GitHub Repo" src="https://img.shields.io/badge/GitHub-Repository-blue.svg">
+</a>
+<a href="LICENSE">
+    <img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg">
+</a>
+<br><br>
 </div>
 
-<div align="center">
-    <a href="https://arxiv.org/abs/2508.14910">
-        <img alt="ArXiV Badge" src="https://img.shields.io/badge/arXiv-2508.14910-b31b1b.svg">
-    </a>
-    <img src="assets/overview.png"></img>
-</div>
+---
 
-## Overview
+## Abstract
 
-This repository provides the official implementation of COSETTE and MARIUS, introduced in our paper on efficient generative recommendation.
+Generative sequential recommenders have recently emerged as a promising alternative to traditional ID-based models by eliminating massive embedding tables and complex approximate nearest neighbor searches. However, closing the accuracy and computational efficiency gap remains a critical challenge. This repository presents a comprehensive reproducibility study of **COSETTE** and **MARIUS**, two frameworks designed to bridge this performance divide through contrastive semantic tokenization and audio-inspired multi-scale attention architectures. 
 
-It includes : 
-- **Preprocessing scripts** to download and embed the Amazon Reviews 2023 dataset (`data_scripts/`);
-- **COSETTE**, for collaborative and semantic tokenization, with its postprocessing;
-- **SASRec++**, an improved dense sequential recommendation baseline;
-- **MARIUS**, an efficient generative recommender architecture built for scalability and performance.
+Moving beyond standard ranking metrics, we evaluate the scalability of these models on the large-scale Amazon 2023 dataset and assess structural characteristics using non-ranking metrics for popularity bias and semantic variety. Finally, we introduce **HyperCOS**, an architectural extension that shifts residual vector quantization into a hyperbolic manifold to better capture hierarchical item spaces. Our empirical findings show that while HyperCOS successfully reduces semantic ID collision rates and maintains optimization stability, the resulting hyperbolic tokenization yields no statistically significant impact on downstream recommendation metrics.
 
-## Usage
+## 1. Introduction
 
-### Environment
+This project aims to verify and reproduce the findings of Lepage et al. [1], who proposed COSETTE and MARIUS to close the accuracy and computational gap between generative and traditional ID-based recommenders. Beyond reproducing the core accuracy claims, our work extends the original evaluation in several key directions:
+- **Fairness and Diversity**: We evaluate how MARIUS and COSETTE perform on non-ranking metrics such as popularity bias (Gini Index, Entropy) and Intra-List Diversity (ILD).
+- **Scalability**: We rigorously test the framework on both the legacy Amazon 2014 and the large-scale Amazon 2023 datasets.
+- **Hyperbolic Extension (HyperCOS)**: We modify the latent space of COSETTE to use hyperbolic geometry, which is theoretically better suited for capturing hierarchical relations in item data.
+
+## 2. Methodology & Extensions
+
+### 2.1. Reproducibility of COSETTE and MARIUS
+We reimplemented the COSETTE (Collaborative and Semantic Tokenization) and MARIUS (Multi-scale Attention as Recommendation Index with fUSion) architectures, along with the SASRec++ baseline. While the results on the modern, large-scale Amazon 2023 dataset are highly reproducible, we found that backward compatibility with legacy 2014 configurations presented challenges due to undocumented parameter shifts in the original codebase.
+
+### 2.2. Fairness and Popularity Bias
+Generative recommenders are often prone to popularity bias. Our evaluation demonstrates that MARIUS effectively mitigates exposure inequality, yielding a lower Gini Index, at a marginal cost to intra-list diversity compared to SASRec++.
+
+### 2.3. HyperCOS
+Residual quantization naturally induces a hierarchical item space. To better capture this, **HyperCOS** replaces the Euclidean operations in COSETTE's latent space with operations in a hyperbolic manifold (the Poincaré ball model). This exponential spatial capacity helps drive distinct items to receive unique, collision-free semantic IDs. While HyperCOS successfully reduces the collision rate of COSETTE, our experiments indicate it has no statistically significant effect on the downstream performance of MARIUS.
+
+### 2.4. MARIUS Architectural Explorations
+In addition to the core reproductions, our repository includes several experimental variations of the MARIUS architecture (available under `src/models/` and executable via the `scripts/train_marius_*.sh` scripts):
+- **Feature Fusion (`marius_fusion`)**: Injects the unquantized semantic ID as an additional input for MARIUS.
+- **Advanced Architecture (`marius_advanced`)**: Integrates modern transformer components including RoPE, SwiGLU blocks, and GELU activations.
+- **Advanced Loss Functions**: Implements listwise and uniformity losses to better align optimization with target ranking metrics.
+- **Knowledge Distillation (`marius_student` & `marius_teacher`)**: Uses a student-teacher paradigm to help the high-capacity advanced models learn from the robust baseline representation space.
+
+## 3. Usage
+
+### 3.1. Environment
 
 Create a new environment with Python 3.9 and install dependencies:
 
@@ -41,41 +68,52 @@ Create a new environment with Python 3.9 and install dependencies:
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 ```
 
-### Data processing
+### 3.2. Data Processing
 
-Run the following scripts (in order) from the `data_scripts/` directory.
-Each script can be configured through its associated Hydra config file in `configs/` (e.g., to select a different category).
-- `0_raw_to_parquet.py` — Downloads the raw data from the [official Huggingface repository](https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023) and converts it to Parquet format.
-- `1_make_embeddings.py` — Embeds items using a `sentence-transformers` model. We used [Sentence-T5-XL](https://huggingface.co/sentence-transformers/sentence-t5-xl).
-- `2_train_cosette.py` — Trains **COSETTE** to quantize the embeddings.
-- `3_remove_collisions.py` — Applies the deduplication procedure on the generated tokenization, taking centroids distance into account. 
-    - You will need to override `data.quant_method` in the configuration, as the name is dynamically generated for each COSETTE training.
+We provide automated SLURM-compatible bash scripts in the `scripts/` directory to download and process the datasets. These scripts wrap the core Python data generation modules found in `data_scripts/` (e.g., `0_raw_to_parquet.py`, `1_make_embeddings.py`).
 
-### Training
-
-This repository includes implementations for **SASRec++** and **MARIUS**. Train a model with: 
 ```sh
-python src/train.py experiment=sasrec # or marius
+# Process the 2014 dataset splits:
+bash scripts/process_data_2014.sh
+
+# Process the 2023 dataset splits:
+bash scripts/process_data_2023.sh
 ```
-Adjust parameters as needed for your setup (filesystem path, number of CPUs, COSETTE run name, etc). We used *HDFS* for our experiments.
 
-### Testing
+### 3.3. Training and Evaluation Pipelines
 
-Compute validation and test metrics with:
+For robust evaluation and reproducibility, we provide comprehensive end-to-end pipelines that handle training, quantization, and evaluation across multiple seeds and configurations.
+
+- **SASRec++ Pipeline**:
+  ```sh
+  bash scripts/train_pipeline_sasrec.sh
+  ```
+
+- **COSETTE and MARIUS Pipeline**:
+  ```sh
+  bash scripts/train_pipeline_cos_marius.sh
+  ```
+
+- **HyperCOS Extension Pipeline**:
+  ```sh
+  bash scripts/train_pipeline_hypercos_marius.sh
+  ```
+
+Alternatively, you can run individual steps manually. Each Python script can be configured via its associated Hydra configuration file in the `configs/` directory:
 ```sh
+# Manually train a specific model (e.g. marius, sasrec)
+python src/train.py experiment=marius 
+
+# Evaluate a specific model run
 python src/test.py run_directory=xxx
 ```
-Replace `xxx` with the path to your trained model directory.
 
-## Citation
+## 4. Acknowledgements & References
 
-To cite our work, please use the following BibTeX entry:
+This repository is built upon the original work by Lepage et al.:
 
-```bibtex
-@article{lepage2025closing,
-  title={Closing the Performance Gap in Generative Recommenders with Collaborative Tokenization and Efficient Modeling},
-  author={Lepage, Simon and Mary, Jérémie and Picard, David},
-  journal={arXiv:2508.14910},
-  year={2025}
-}
-```
+> [1] Lepage, S., Mary, J., Picard, D.: *Closing the Performance Gap in Generative Recommenders with Collaborative Tokenization and Efficient Modeling*. arXiv preprint arXiv:2508.14910 (2025).
+
+## 5. License
+
+This project is licensed under the [Apache License 2.0](LICENSE) - see the [LICENSE](LICENSE) file for details.
