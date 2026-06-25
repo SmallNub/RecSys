@@ -149,43 +149,27 @@ class MARIUS(nn.Module):
         depth_cfg,
         tie_embeddings=False,
         filter_preds=False,
-        top_k=10,
-        truncation_weight=0.25,
-        listwise_weight=0.40,
-        repr_weight=0.35,
-        # Balanced 3-Phase Schedule Configuration
-        phase1_duration=20000,
-        phase2_duration=15000,
-        phase3_duration=5000,
-        distill_temp=3.0,          
+        distill_temp=4.0,
+        ce_weight=0.1,
+        distill_weight=1.0,
+        student_mask_prob=0.25,
     ):
         super().__init__()
         self.temporal_cfg = temporal_cfg
         self.depth_cfg = depth_cfg
         self.filter_preds = filter_preds
-        
-        self.top_k = top_k
-        self.truncation_weight = truncation_weight
-        self.listwise_weight = listwise_weight
-        self.repr_weight = repr_weight
-
-        # Set up explicit milestones
-        self.p1_end = phase1_duration
-        self.p2_end = phase1_duration + phase2_duration
-        self.total_steps = phase1_duration + phase2_duration + phase3_duration
-        
-        self.register_buffer("current_step", torch.tensor(0, dtype=torch.long))
+        self.distill_temp = distill_temp
+        self.ce_weight = ce_weight
+        self.distill_weight = distill_weight
+        self.student_mask_prob = student_mask_prob
 
         assert depth_cfg.vocab_size == temporal_cfg.vocab_size, "Vocab size mismatch"
 
-        if self.temporal_cfg.emb_dropout is None:
-            self.temporal_cfg.emb_dropout = self.temporal_cfg.dropout
-        if self.depth_cfg.emb_dropout is None:
-            self.depth_cfg.emb_dropout = self.depth_cfg.dropout
+        t_emb_drop = temporal_cfg.emb_dropout if temporal_cfg.emb_dropout is not None else temporal_cfg.dropout
+        d_emb_drop = depth_cfg.emb_dropout if depth_cfg.emb_dropout is not None else depth_cfg.dropout
 
-        # Setup Distillation attributes
+        # Load Pre-trained Fixed Expert Teacher
         self.teacher = load_model("outputs/checkpoints/marius/MARIUS_teacher_260619_133025")
-        self.distill_temp = distill_temp
         if self.teacher is not None:
             self.teacher.eval()
             for param in self.teacher.parameters():
@@ -205,11 +189,10 @@ class MARIUS(nn.Module):
 
         self.temp_emb_ln = nn.LayerNorm(temporal_cfg.d_model)
         self.depth_emb_ln = nn.LayerNorm(depth_cfg.d_model)
-
         self.depth_pos_emb = nn.Embedding(128, depth_cfg.d_model)
 
-        self.dropout_t = nn.Dropout(temporal_cfg.emb_dropout)
-        self.dropout_d = nn.Dropout(depth_cfg.emb_dropout)
+        self.dropout_t = nn.Dropout(t_emb_drop)
+        self.dropout_d = nn.Dropout(d_emb_drop)
 
         self.temp_tf = nn.ModuleList([
             TemporalBlock(temporal_cfg.d_model, temporal_cfg.d_head, dropout_p=temporal_cfg.dropout)
@@ -223,13 +206,9 @@ class MARIUS(nn.Module):
 
         self.temp_final_norm = nn.RMSNorm(temporal_cfg.d_model)
         self.depth_final_norm = nn.LayerNorm(depth_cfg.d_model)
-
         self.mid_proj = nn.Linear(temporal_cfg.d_model, depth_cfg.d_model, bias=False)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         
-        self.listwise_temp = nn.Parameter(torch.tensor(0.0))
-        self.repr_temp = nn.Parameter(torch.tensor(0.0))
-
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -255,9 +234,20 @@ class MARIUS(nn.Module):
             if hasattr(block.ffn, 'w3'):
                 torch.nn.init.normal_(block.ffn.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.depth_cfg.n_layers))
 
+    def _corrupt_student_input(self, input_tensor):
+        """Forces the student to infer missing context by randomly masking token streams."""
+        corrupted = input_tensor.clone()
+        valid_mask = (corrupted[:, :, 0] != SpecialTokens.PAD.value)
+        
+        rand_grid = torch.rand(corrupted.shape[:2], device=input_tensor.device)
+        mask_condition = (rand_grid < self.student_mask_prob) & valid_mask
+        
+        corrupted[mask_condition] = 0 
+        return corrupted
+
     def get_param_groups(self):
         def _select_no_decay(n):
-            return any(k in n for k in ["_emb", "norm"]) or n.endswith("_temp")
+            return any(k in n for k in ["_emb", "norm"])
         no_decay = [p for n, p in self.named_parameters() if _select_no_decay(n)]
         decay = [p for n, p in self.named_parameters() if not _select_no_decay(n)]
         return [{"params": no_decay, "weight_decay": 0.0}, {"params": decay}]
@@ -292,7 +282,8 @@ class MARIUS(nn.Module):
         logits = torch.matmul(hidden_states, self.depth_emb.weight.T)
         return logits, hidden_states
 
-    def train_forward_fused(self, temporal, target):
+    def train_forward(self, input, target):
+        temporal = self.temporal_forward(input)
         mid = self.mid_proj(temporal)
         mid = rearrange(mid, "b l d -> (b l) 1 d")
 
@@ -317,155 +308,37 @@ class MARIUS(nn.Module):
         logits, hidden_states = self.depth_forward(tgt)
         return logits, hidden_states, mid, target
 
-    def compute_softmax_loss_at_k(self, logits, targets, k=10):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-
-        flat_logits = logits[mask]
-        flat_targets = targets[mask]
-
-        pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1)).squeeze(-1)
-        topk_scores, _ = torch.topk(flat_logits, k=k, dim=-1)
-        
-        max_scores = torch.max(topk_scores, dim=-1)[0]
-        shifted_topk = topk_scores - max_scores.unsqueeze(-1)
-        shifted_pos = pos_scores - max_scores
-
-        denom = torch.log(torch.exp(shifted_pos) + torch.exp(shifted_topk).sum(dim=-1) + 1e-8) + max_scores
-        return torch.mean(denom - pos_scores)
-
-    def compute_plackett_luce_loss(self, logits, targets):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-
-        flat_logits = logits[mask]
-        flat_targets = targets[mask]
-
-        pos_scores = flat_logits.gather(dim=-1, index=flat_targets.unsqueeze(-1))
-        topk_neg, _ = torch.topk(flat_logits, k=32, dim=-1)
-        
-        slate = torch.cat([pos_scores, topk_neg], dim=-1)
-        t = torch.exp(self.listwise_temp).clamp(min=1e-3, max=5.0)
-        scaled_slate = slate / t
-
-        max_val = torch.max(scaled_slate, dim=-1, keepdim=True)[0]
-        norm_slate = scaled_slate - max_val
-        denom = torch.log(torch.exp(norm_slate).sum(dim=-1) + 1e-8) + max_val.squeeze(-1)
-        log_prob = scaled_slate[:, 0] - denom
-
-        return torch.mean(-log_prob)
-
-    def compute_infonce_loss(self, hidden_states, targets):
-        mask = (targets != -100) & (targets != SpecialTokens.PAD.value)
-        if not mask.any():
-            return torch.tensor(0.0, device=hidden_states.device)
-
-        flat_h = hidden_states[mask]
-        flat_targets = targets[mask]
-
-        pos_emb = self.depth_emb(flat_targets)
-        
-        flat_h_norm = F.normalize(flat_h, p=2, dim=-1)
-        pos_emb_norm = F.normalize(pos_emb, p=2, dim=-1)
-
-        similarity_matrix = torch.matmul(flat_h_norm, pos_emb_norm.T)
-        
-        t = torch.exp(self.repr_temp).clamp(min=1e-2, max=1.0)
-        logits = similarity_matrix / t
-        
-        collision_mask = flat_targets.unsqueeze(0) == flat_targets.unsqueeze(1)
-        identity_mask = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
-        logits = logits.masked_fill(collision_mask & ~identity_mask, -1e9)
-        
-        labels = torch.arange(logits.shape[0], device=hidden_states.device)
-        return F.cross_entropy(logits, labels)
-
     def get_loss(self, batch):
         inp, tgt = batch["input"], batch["target"]
         
-        # 1. Base Forward Passes
-        temporal = self.temporal_forward(inp)
-        logits, hidden_states, _, target_rearranged = self.train_forward_fused(temporal, tgt)
-        
-        # 2. Compute Raw Underlying Losses
-        logits_rearranged = rearrange(logits, "b l v -> b v l")
-        ce_loss = self.criterion(logits_rearranged, target_rearranged)
-        
-        trunc_loss = self.compute_softmax_loss_at_k(logits, target_rearranged, k=self.top_k)
-        listwise_loss = self.compute_plackett_luce_loss(logits, target_rearranged)
-        repr_loss = self.compute_infonce_loss(hidden_states, target_rearranged)
-        
-        total_structural = (
-            self.truncation_weight * trunc_loss + 
-            self.listwise_weight * listwise_loss + 
-            self.repr_weight * repr_loss
-        )
-
-        # 3. Comprehensive 3-Phase Scheduling Core
-        ce_floor = 0.15
-        p2_distill_floor = 0.40
-
-        if self.training:
-            self.current_step += 1
-            step = min(self.current_step.item(), self.total_steps)
-            
-            if step <= self.p1_end:
-                # --- PHASE 1: Stable Replication Mode ---
-                w_ce = 1.0
-                w_distill = 1.0
-                w_structural = 0.0
-                
-            elif step <= self.p2_end:
-                # --- PHASE 2: Hand-Off Smooth Mixing Window ---
-                p2_progress = (step - self.p1_end) / float(self.p2_end - self.p1_end)
-                # Cosine wave maps from 1.0 smoothly down to 0.0
-                cos_f = 0.5 * (1.0 + math.cos(math.pi * p2_progress))
-                
-                w_ce = ce_floor + (1.0 - ce_floor) * cos_f
-                w_distill = p2_distill_floor + (1.0 - p2_distill_floor) * cos_f
-                w_structural = (1.0 - ce_floor) * (1.0 - cos_f)
-                
-            else:
-                # --- PHASE 3: Autonomous Ranking Refinement ---
-                p3_progress = (step - self.p2_end) / float(self.total_steps - self.p2_end)
-                cos_f3 = 0.5 * (1.0 + math.cos(math.pi * p3_progress))
-                
-                w_ce = ce_floor
-                w_structural = 1.0 - ce_floor
-                # Slowly evaporate the remaining distillation cushion to absolute 0
-                w_distill = p2_distill_floor * cos_f3
-        else:
-            # Inference evaluation assumes perfect Phase 3 criteria
-            w_ce = ce_floor
-            w_distill = 0.0
-            w_structural = 1.0 - ce_floor
-
-        # 4. Mix Active Standard Gradients
-        final_loss = (w_ce * ce_loss) + (w_structural * total_structural)
-
-        # 5. Inject Teacher Logit Matching (Active across Phase 1, Phase 2, and Phase 3 fade)
-        if self.teacher is not None and self.training and w_distill > 0.0:
+        # 1. Teacher Forward Pass (Pristine Input Track)
+        if self.teacher is not None:
             with torch.no_grad():
-                if hasattr(self.teacher, "train_forward_fused"):
-                    t_temporal = self.teacher.temporal_forward(inp)
-                    teacher_logits, _, _, _ = self.teacher.train_forward_fused(t_temporal, tgt)
-                else:
-                    teacher_logits, _ = self.teacher.train_forward(inp, tgt)
+                logits_teacher, *_ = self.teacher.train_forward(inp, tgt)
 
+        # 2. Student Forward Pass (Asymmetric Masked Track)
+        student_input = self._corrupt_student_input(inp) if self.training else inp
+        logits_student, _, _, target_rearranged = self.train_forward(student_input, tgt)
+        
+        # 3. Suppressed Hard CE Loss Component
+        logits_rearranged = rearrange(logits_student, "b l v -> b v l")
+        ce_loss = self.criterion(logits_rearranged, target_rearranged)
+        final_loss = self.ce_weight * ce_loss
+
+        # 4. Soft Target Ranking Distribution Alignment
+        if self.teacher is not None:
             mask = target_rearranged != -100
             if mask.any():
-                flat_student = logits[mask]
-                flat_teacher = teacher_logits[mask]
+                flat_student = logits_student[mask]
+                flat_teacher = logits_teacher[mask]
 
                 soft_student = F.log_softmax(flat_student / self.distill_temp, dim=-1)
                 soft_teacher = F.softmax(flat_teacher / self.distill_temp, dim=-1)
                 distill_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (self.distill_temp ** 2)
                 
-                final_loss += w_distill * distill_loss
+                final_loss += self.distill_weight * distill_loss
 
-        return final_loss, logits
+        return final_loss, logits_student
 
     def search(self, batch, n_results):
         assert self.training is False, "Not in evaluation mode."
