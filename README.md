@@ -33,44 +33,60 @@ Generative sequential recommenders have recently emerged as a promising alternat
 
 Moving beyond standard ranking metrics, we evaluate the scalability of these models on the large-scale Amazon 2023 dataset and assess structural characteristics using non-ranking metrics for popularity bias and semantic variety. Finally, we introduce **HyperCOS**, an architectural extension that shifts residual vector quantization into a hyperbolic manifold to better capture hierarchical item spaces. Our empirical findings show that while HyperCOS successfully reduces semantic ID collision rates and maintains optimization stability, the resulting hyperbolic tokenization yields no statistically significant impact on downstream recommendation metrics.
 
-## 1. Introduction
+## 1. Introduction & Methodology
 
-This project aims to verify and reproduce the findings of Lepage et al. [1], who proposed COSETTE and MARIUS to close the accuracy and computational gap between generative and traditional ID-based recommenders. Beyond reproducing the core accuracy claims, our work extends the original evaluation in several key directions:
-- **Fairness and Diversity**: We evaluate how MARIUS and COSETTE perform on non-ranking metrics such as popularity bias (Gini Index, Entropy) and Intra-List Diversity (ILD).
-- **Scalability**: We rigorously test the framework on both the legacy Amazon 2014 and the large-scale Amazon 2023 datasets.
-- **Hyperbolic Extension (HyperCOS)**: We modify the latent space of COSETTE to use hyperbolic geometry, which is theoretically better suited for capturing hierarchical relations in item data.
+This project aims to verify and reproduce the findings of Lepage et al. [1], who proposed COSETTE and MARIUS. Beyond reproducing the core accuracy claims, our work extends the original evaluation in several key directions:
 
-## 2. Methodology & Extensions
+- **Reproducibility**: Validation on both legacy Amazon 2014 and large-scale Amazon 2023 datasets.
+- **Fairness and Popularity Bias**: Evaluation using non-ranking metrics like Gini Index and Intra-List Diversity (ILD).
+- **HyperCOS**: An architectural extension replacing Euclidean operations in COSETTE's latent space with a hyperbolic manifold (Poincaré ball model) to better capture hierarchical item relations.
+- **MARIUS Variations**: Architectural explorations including Feature Fusion, SwiGLU/RoPE/GELU integration, Listwise/Uniformity loss functions, and Knowledge Distillation.
 
-### 2.1. Reproducibility of COSETTE and MARIUS
-We reimplemented the COSETTE (Collaborative and Semantic Tokenization) and MARIUS (Multi-scale Attention as Recommendation Index with fUSion) architectures, along with the SASRec++ baseline. While the results on the modern, large-scale Amazon 2023 dataset are highly reproducible, we found that backward compatibility with legacy 2014 configurations presented challenges due to undocumented parameter shifts in the original codebase.
 
-### 2.2. Fairness and Popularity Bias
-Generative recommenders are often prone to popularity bias. Our evaluation demonstrates that MARIUS effectively mitigates exposure inequality, yielding a lower Gini Index, at a marginal cost to intra-list diversity compared to SASRec++.
+## 2. Repository Structure
 
-### 2.3. HyperCOS
-Residual quantization naturally induces a hierarchical item space. To better capture this, **HyperCOS** replaces the Euclidean operations in COSETTE's latent space with operations in a hyperbolic manifold (the Poincaré ball model). This exponential spatial capacity helps drive distinct items to receive unique, collision-free semantic IDs. While HyperCOS successfully reduces the collision rate of COSETTE, our experiments indicate it has no statistically significant effect on the downstream performance of MARIUS.
-
-### 2.4. MARIUS Architectural Explorations
-In addition to the core reproductions, our repository includes several experimental variations of the MARIUS architecture (available under `src/models/` and executable via the `scripts/train_marius_*.sh` scripts):
-- **Feature Fusion (`marius_fusion`)**: Injects the unquantized semantic ID as an additional input for MARIUS.
-- **Advanced Architecture (`marius_advanced`)**: Integrates modern transformer components including RoPE, SwiGLU blocks, and GELU activations.
-- **Advanced Loss Functions**: Implements listwise and uniformity losses to better align optimization with target ranking metrics.
-- **Knowledge Distillation (`marius_student` & `marius_teacher`)**: Uses a student-teacher paradigm to help the high-capacity advanced models learn from the robust baseline representation space.
+```text
+.
+├── configs/            # Hydra configuration files (model parameters, paths, etc.)
+├── data_scripts/       # Data preprocessing: raw -> parquet, embedding generation, quantization
+├── datasets/           # Root directory for raw and processed datasets
+├── scripts/            # SLURM-compatible bash pipelines for automated end-to-end runs
+├── src/                # Core PyTorch/Lightning source code for models (MARIUS, SASRec)
+├── LICENSE             # Apache 2.0 License
+└── README.md           
+```
 
 ## 3. Usage
 
-### 3.1. Environment
+### 3.1. Hardware Requirements
+All experiments in this project were conducted on the Snellius national supercomputer, utilizing NVIDIA H100 GPUs. Our provided bash scripts in `scripts/` are configured for SLURM workload managers with the corresponding `#SBATCH` directives. You can adapt these scripts to run locally or on other GPU clusters by modifying or removing the SLURM headers.
 
+### 3.2. Environment Setup
 Create a new environment with Python 3.9 and install dependencies:
-
 ```sh
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 ```
 
-### 3.2. Data Processing
+### 3.3. Quick Start (Minimal Example)
+If you want to bypass the automated SLURM pipelines and test a small configuration locally, you can use the direct Python commands. Each step relies on Hydra configurations found in `configs/`:
 
-We provide automated SLURM-compatible bash scripts in the `scripts/` directory to download and process the datasets. These scripts wrap the core Python data generation modules found in `data_scripts/` (e.g., `0_raw_to_parquet.py`, `1_make_embeddings.py`).
+```sh
+# 1. Download and process a small subset (e.g., Beauty category)
+python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 data.category=Beauty
+
+# 2. Generate item embeddings
+python data_scripts/1_make_embeddings.py category=Beauty num_gpus=1
+
+# 3. Train the model manually
+python src/train.py experiment=marius_small data.datasets.category=Beauty
+
+# 4. Evaluate (Replace 'xxx' with the generated output folder name)
+python src/test.py run_directory=xxx
+```
+> Evaluation metrics (Recall@K, NDCG@K, Gini, ILD) will be printed to `stdout` and saved within the respective run directory inside `outputs/`.
+
+### 3.4. Full Data Processing Pipelines
+To automate processing, we provide SLURM bash scripts.
 
 ```sh
 # Process the 2014 dataset splits:
@@ -80,40 +96,26 @@ bash scripts/process_data_2014.sh
 bash scripts/process_data_2023.sh
 ```
 
-### 3.3. Training and Evaluation Pipelines
+### 3.5. Training and Evaluation Pipelines
+For evaluation, our SLURM pipelines automatically handle training, inference, and evaluation across multiple seeds and configurations. Check the configs for the exact hyperparameters used:
 
-For robust evaluation and reproducibility, we provide comprehensive end-to-end pipelines that handle training, quantization, and evaluation across multiple seeds and configurations.
-
-- **SASRec++ Pipeline**:
-  ```sh
-  bash scripts/train_pipeline_sasrec.sh
-  ```
-
-- **COSETTE and MARIUS Pipeline**:
-  ```sh
-  bash scripts/train_pipeline_cos_marius.sh
-  ```
-
-- **HyperCOS Extension Pipeline**:
-  ```sh
-  bash scripts/train_pipeline_hypercos_marius.sh
-  ```
-
-Alternatively, you can run individual steps manually. Each Python script can be configured via its associated Hydra configuration file in the `configs/` directory:
 ```sh
-# Manually train a specific model (e.g. marius, sasrec)
-python src/train.py experiment=marius 
+# Standard MARIUS and COSETTE baseline pipeline
+bash scripts/train_pipeline_cos_marius.sh
 
-# Evaluate a specific model run
-python src/test.py run_directory=xxx
+# Extended HyperCOS pipeline
+bash scripts/train_pipeline_hypercos_marius.sh
+
+# SASRec++ baseline pipeline
+bash scripts/train_pipeline_sasrec.sh
 ```
 
 ## 4. Acknowledgements & References
 
-This repository is built upon the original work by Lepage et al.:
-
+This repository heavily relies on the foundational work by Lepage et al.:
 > [1] Lepage, S., Mary, J., Picard, D.: *Closing the Performance Gap in Generative Recommenders with Collaborative Tokenization and Efficient Modeling*. arXiv preprint arXiv:2508.14910 (2025).
 
-## 5. License
+We gratefully acknowledge the use of the [Snellius](https://www.surf.nl/en/services/compute/snellius-the-national-supercomputer) national supercomputer, provided by SURF, for all experiments conducted in this work.
 
-This project is licensed under the [Apache License 2.0](LICENSE) - see the [LICENSE](LICENSE) file for details.
+## 5. License
+This project is licensed under the [Apache License 2.0](LICENSE).
