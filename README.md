@@ -65,25 +65,7 @@ Create a new environment with Python 3.9 and install dependencies:
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 ```
 
-### 3.3. Quick Start (Minimal Example)
-If you want to bypass the automated SLURM pipelines and test a small configuration locally, you can use the direct Python commands. Each step relies on Hydra configurations found in `configs/`:
-
-```sh
-# 1. Download and process a small subset (e.g., Beauty category)
-python data_scripts/0_raw_to_parquet.py --config-name 0_raw_to_parquet_2014 data.category=Beauty
-
-# 2. Generate item embeddings
-python data_scripts/1_make_embeddings.py category=Beauty num_gpus=1
-
-# 3. Train the model manually
-python src/train.py experiment=marius_small data.datasets.category=Beauty
-
-# 4. Evaluate (Replace 'xxx' with the generated output folder name)
-python src/test.py run_directory=xxx
-```
-> Evaluation metrics (Recall@K, NDCG@K, Gini, ILD) will be printed to `stdout` and saved within the respective run directory inside `outputs/`.
-
-### 3.4. Full Data Processing Pipelines
+### 3.3. Full Data Processing Pipelines
 To automate processing, we provide SLURM bash scripts.
 
 ```sh
@@ -94,8 +76,9 @@ bash scripts/process_data_2014.sh
 bash scripts/process_data_2023.sh
 ```
 
-### 3.5. Training and Evaluation Pipelines
-For evaluation, our SLURM pipelines automatically handle training, inference, and evaluation across multiple seeds and configurations. Check the configs for the exact hyperparameters used:
+### 3.4. Training and Evaluation Pipelines
+For evaluation, our SLURM pipelines automatically handle training, inference, and evaluation across multiple seeds and configurations.  Check the configs for the exact hyperparameters used. If you want to bypass the automated SLURM pipelines and test a small configuration locally, you can use the direct Python commands. Each step relies on Hydra configurations found in `configs/`:
+
 
 ```sh
 # Standard MARIUS and COSETTE baseline pipeline
@@ -107,6 +90,9 @@ bash scripts/train_pipeline_hypercos_marius.sh
 # SASRec++ baseline pipeline
 bash scripts/train_pipeline_sasrec.sh
 ```
+
+> Evaluation metrics (Recall@K, NDCG@K, Gini, ILD) will be printed to `stdout` and saved within the respective run directory inside `outputs/`.
+
 
 ## 4. Acknowledgements & References
 
