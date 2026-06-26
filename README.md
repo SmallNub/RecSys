@@ -99,7 +99,7 @@ bash scripts/train_pipeline_sasrec.sh
 This repository heavily relies on the foundational work by Lepage et al.:
 > [1] Lepage, S., Mary, J., Picard, D.: *Closing the Performance Gap in Generative Recommenders with Collaborative Tokenization and Efficient Modeling*. arXiv preprint arXiv:2508.14910 (2025).
 
-We gratefully acknowledge the use of the [Snellius](https://www.surf.nl/en/services/compute/snellius-the-national-supercomputer) national supercomputer, provided by SURF, for all experiments conducted in this work.
+We thank SURF (www.surf.nl) for the support in using the National Supercomputer Snellius.
 
 ## 5. License
 This project is licensed under the [Apache License 2.0](LICENSE).
