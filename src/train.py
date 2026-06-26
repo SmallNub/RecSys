@@ -39,6 +39,7 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     cfg.trainer.logger.name = name
 
+    # Optimize transformer speeds by adjusting matmul precision
     torch.set_float32_matmul_precision(cfg.get("fp32_matmul_precision", "high"))
     torch.backends.mha.set_fastpath_enabled(False)
 
@@ -55,6 +56,7 @@ def main(cfg: DictConfig) -> Optional[float]:
         and hasattr(first_ds, "pp")
         and hasattr(first_ds.pp, "item_to_id")
     ):
+        # Dynamically calculate vocabulary size from the loaded dataset, factoring in special padding/BOS tokens
         vocab_size = len(first_ds.pp.item_to_id) + len(SpecialTokens)
         log.info(f"Detected actual vocab size from dataset: {vocab_size}")
         if (

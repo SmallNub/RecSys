@@ -1,3 +1,5 @@
+"""Generates textual embeddings for item metadata using sentence-transformers."""
+
 import os
 import pickle
 import tempfile
@@ -14,6 +16,7 @@ from src.utils.tools import patch_fsspec
 
 
 def preprocess(row, eos):
+    """Constructs a single descriptive text string for an item's metadata."""
     lines = []
 
     if row["title"]:
@@ -40,6 +43,7 @@ def preprocess(row, eos):
 
 
 def get_model(fs, model_folder):
+    """Downloads model folder from remote filesystem to local temp directory if needed."""
     if fs.exists(model_folder) and not os.path.exists(model_folder):
         print("Model folder exist but not locally, downloading from ", model_folder)
         tmpdir = tempfile.mkdtemp()

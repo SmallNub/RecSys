@@ -42,6 +42,7 @@ class CosineScheduler(LRScheduler):
         elif self.last_epoch < self.warmup_steps + self.cosine_steps:
             return [
                 base_lr * self.final_factor
+                # Apply cosine decay formula from warmup peak down to the final minimum learning rate factor
                 + 0.5
                 * (base_lr - base_lr * self.final_factor)
                 * (

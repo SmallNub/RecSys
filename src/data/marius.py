@@ -14,6 +14,7 @@ class Remap:
         self.special_tokens_offset = len(SpecialTokens)
 
     def __call__(self, quantized):
+        # Offset raw codebook indices so that each hierarchical level has a non-overlapping embedding space
         return quantized + self.levels_offset + self.special_tokens_offset
 
 
@@ -59,6 +60,7 @@ class MARIUSPrePro:
 
         # Target - All items except first.
         target = quantized_query[1:]
+        # Pad target sequences with -100 to ignore padded positions in CrossEntropyLoss
         target = np.concatenate(
             [
                 np.full(

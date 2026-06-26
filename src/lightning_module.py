@@ -21,6 +21,7 @@ class LitModule(LightningModule):
             "NDCG": "{split}/{category}/NDCG@{K}",
         }
 
+        # Precompute DCG denominator for fast NDCG evaluation at different K
         self.dcg_denom = torch.log2(torch.arange(1, max(self.Ks) + 1) + 1).view(1, -1)
 
         self.code_to_item = None
@@ -77,6 +78,7 @@ class LitModule(LightningModule):
             assert gen.shape == (B, max(self.Ks), L)
             assert target.shape == (B, 1, L)
 
+            # Check if all tokens in the generated beam match the target sequence
             all_hits = (gen == target).all(dim=-1)  # Broadcast along beam
 
             RatK = (all_hits.cumsum(dim=1) > 0).float().mean(dim=0)
@@ -174,6 +176,7 @@ class LitModule(LightningModule):
                     sim_matrix = embs @ embs.T
                     dist_matrix = 1 - sim_matrix
                     n = len(embs)
+                    # Compute upper-triangle pairwise distance for ILD (Intra-List Diversity)
                     ild = dist_matrix[np.triu_indices(n, k=1)].mean()
                     self._test_ild_scores.append(float(ild))
 

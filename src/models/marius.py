@@ -1,3 +1,5 @@
+"""MARIUS baseline model architecture for sequential recommendation."""
+
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +11,7 @@ from src.models import SpecialTokens
 
 @dataclass
 class TransformerConfig:
+    """Configuration parameters for the Transformer models."""
     n_layers: int
     d_head: int
     d_model: int
@@ -19,6 +22,7 @@ class TransformerConfig:
 
 
 class MARIUS(torch.nn.Module):
+    """MARIUS model for sequential recommendation, integrating temporal sequences and depth-wise item features."""
     def __init__(
         self,
         temporal_cfg,
@@ -155,6 +159,7 @@ class MARIUS(torch.nn.Module):
         mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
 
         target = rearrange(target, "b l k -> (b l) k")
+        # Filter out padded target tokens (label -100) from the flattened sequence
         keep = target[:, 0] != -100
 
         mid_tokens = mid_tokens[keep]
@@ -187,6 +192,7 @@ class MARIUS(torch.nn.Module):
             n_results += self.temporal_cfg.seq_len
 
         temporal_tokens = self.temporal_forward(input)
+        # Extract the final representation from the sequence for auto-regressive generation
         mid_tokens = self.mid_proj(temporal_tokens)[:, -1, :]
 
         B, b, D = input.shape[0], n_results, self.depth_cfg.d_model
@@ -202,6 +208,7 @@ class MARIUS(torch.nn.Module):
         sequences = sequences.unsqueeze(1).repeat(1, b, 1, 1)
 
         new_tokens = self.depth_emb(topk_indices).unsqueeze(2)
+        # Concatenate newly predicted tokens onto the generation sequences
         sequences = torch.concat([sequences, new_tokens], dim=2)
 
         arranged = torch.arange(B, device=sequences.device).view(-1, 1)

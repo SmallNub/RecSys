@@ -1,3 +1,5 @@
+"""Converts raw Amazon datasets into Parquet format for faster processing and training."""
+
 import os
 import pickle
 import subprocess
@@ -35,6 +37,7 @@ def main(config):
 
 
 def _sanitize(p):
+    """Sanitizes price strings into floats, returning None on failure."""
     try:
         return float(p)
     except (ValueError, TypeError):
@@ -55,6 +58,7 @@ META_SELECTED_COLS = [
 
 
 def process_category(category, config, wd):
+    """Processes a dataset category, standardizing timelines and metadata into parquet files."""
     # Original LFS pull per file (replaced by snapshot_download in main).
     # os.chdir(config.paths.tmp_lfs_folder)
     # for file in _category_files(category):

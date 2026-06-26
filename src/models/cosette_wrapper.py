@@ -1,3 +1,5 @@
+"""Provides a frozen wrapper for the COSETTE model, used to perform fast inference-only encoding and decoding between continuous embeddings and discrete IDs."""
+
 import os
 import torch
 import torch.nn as nn

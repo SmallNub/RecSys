@@ -1,3 +1,5 @@
+"""MARIUS Teacher model architecture for knowledge distillation."""
+
 from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
@@ -18,6 +20,7 @@ class TransformerConfig:
 
 
 class MARIUS(torch.nn.Module):
+    """MARIUS Teacher model, providing soft targets for knowledge distillation to student models."""
     def __init__(
         self,
         temporal_cfg,
@@ -182,6 +185,7 @@ class MARIUS(torch.nn.Module):
     def train_forward(self, input, target):
         temporal_tokens = self.temporal_forward(input)
         mid_tokens = self.mid_proj(temporal_tokens)
+        # Flatten batch and sequence dimensions to process all valid tokens at once
         mid_tokens = rearrange(mid_tokens, "b l d -> (b l) 1 d")
 
         target = rearrange(target, "b l k -> (b l) k")

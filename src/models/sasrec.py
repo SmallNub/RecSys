@@ -1,9 +1,12 @@
+"""Sequential recommendation model (SASRec) using Transformer architecture."""
+
 import torch
 
 from src.models import SpecialTokens
 
 
 class FullSoftmax(torch.nn.Module):
+    """Computes softmax loss over the entire item vocabulary."""
     def __init__(self, temperature=1.0):
         super().__init__()
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -17,6 +20,7 @@ class FullSoftmax(torch.nn.Module):
 
 
 class SampledSoftmax(torch.nn.Module):
+    """Efficiently computes softmax loss by sampling negative items instead of the full vocabulary."""
     def __init__(self, n_items, temperature=1.0):
         super().__init__()
         self.cross_entropy = torch.nn.CrossEntropyLoss()
@@ -29,6 +33,7 @@ class SampledSoftmax(torch.nn.Module):
         embs = embs.view(B * L, D)
         target = target.view(B * L)
 
+        # Compute standard dot-product scores for the target sequence items
         target_scores = (embs * model.get_embs(target)).sum(dim=-1)  # B*L
         samples = torch.randint(
             low=0,
@@ -36,9 +41,11 @@ class SampledSoftmax(torch.nn.Module):
             size=(self.n_items,),
             device=embs.device,
         )
+        # Calculate scores for randomly sampled negative items
         noise_scores = embs @ model.get_embs(samples).T
 
         reject_samples = target[:, None] == samples[None, :]
+        # Mask out cases where the sampled negative accidentally matches the target item
         noise_scores -= 1e6 * reject_samples.float()
 
         logits = (
@@ -50,6 +57,7 @@ class SampledSoftmax(torch.nn.Module):
 
 
 class L2Norm(torch.nn.Module):
+    """Applies L2 normalization along the last dimension."""
     def __init__(self, eps=1e-6):
         super().__init__()
         self.eps = eps
@@ -62,6 +70,7 @@ class L2Norm(torch.nn.Module):
 
 
 class SASRec(torch.nn.Module):
+    """Self-Attentive Sequential Recommendation (SASRec) core model class."""
     def __init__(
         self,
         n_layers,
@@ -156,6 +165,7 @@ class SASRec(torch.nn.Module):
 
     def forward(self, x):
         x_emb = self.embedding(x)
+        # Inject absolute position embeddings into the sequence
         x_emb += self.position_embeddings.weight[None, : x.shape[1], :]
         x_emb = self.inp_norm(x_emb)
         if self.emb_dropout > 0:
@@ -166,6 +176,7 @@ class SASRec(torch.nn.Module):
         x_enc = self.encoder(
             x_emb,
             mask=self.causal_mask[:L, :L],
+            # Create a padding mask to ignore padded positions in attention
             src_key_padding_mask=(x == SpecialTokens.PAD.value),
         )
 

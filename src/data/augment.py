@@ -29,6 +29,7 @@ class CropAndAugment:
 
     def _augment(self, tl, ts):
         if self.augment == "all_shuffle":
+            # Completely shuffle the timeline order, discarding all temporal structure
             indices = np.random.permutation(len(tl))
             tl = tl[indices]
             ts = ts[indices]
@@ -36,6 +37,7 @@ class CropAndAugment:
         elif self.augment == "timewise_shuffle":
             for _t in np.unique(ts):
                 mask = ts == _t
+                # Group items by the exact same timestamp to randomly shuffle simultaneous interactions
                 if mask.sum() > 1:  # Only shuffle if there are multiple entries
                     tl[mask] = tl[mask][np.random.permutation(mask.sum())]
 

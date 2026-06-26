@@ -1,3 +1,5 @@
+"""COSETTE model architecture and submodules (Euclidean version)."""
+
 from collections import defaultdict
 
 import torch
@@ -54,6 +56,7 @@ def kmeans(
 
 @torch.no_grad()
 def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
+    # Initialize Q matrix with exponentiated negative distances scaled by epsilon
     Q = torch.exp(-distances / epsilon)
 
     B = Q.shape[0]
@@ -73,6 +76,7 @@ def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
 
 
 class VectorQuantizer(nn.Module):
+    """Core quantization module mapping continuous vectors to discrete codebook entries."""
     def __init__(
         self,
         n_centroids,
@@ -141,6 +145,7 @@ class VectorQuantizer(nn.Module):
         if not self.initted and self.training:
             self.init_emb(latent)
 
+        # Compute squared Euclidean distance using expanded (x-y)^2 = x^2 + y^2 - 2xy trick
         d = (
             torch.sum(latent**2, dim=1, keepdim=True)
             + torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()
@@ -221,7 +226,9 @@ class ResidualVectorQuantizer(nn.Module):
         residual = x
         for quantizer in self.vq_layers:
             x_res, loss, indices, distance = quantizer(residual, use_sk=use_sk)
+            # Subtract the quantized vector from the current residual to pass to the next level
             residual = residual - x_res
+            # Accumulate the overall quantized representation
             x_q = x_q + x_res
 
             all_losses.append(loss)
@@ -263,6 +270,7 @@ class SigLIPLoss(torch.nn.Module):
             pos = pos.to(
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
+            # Create a boolean mask indicating positive pairs (same item id)
             pos = torch.matmul(pos, pos.T) > 0
             mask[pos] = 1.0
 
@@ -279,6 +287,7 @@ class SigLIPLoss(torch.nn.Module):
 
 
 class COSETTE(torch.nn.Module):
+    """COSETTE model for learning semantic IDs through contrastive learning and residual quantization."""
     def __init__(
         self,
         # Embeddings

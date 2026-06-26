@@ -37,6 +37,7 @@ def find_checkpoint_dir(fs, root):
 
     print(f"[WARNING] No snapshot found at {root}, searching for checkpoint_* dirs...")
     try:
+        # Fallback: Manually scan for the chronologically latest checkpoint subdirectory if snapshot metadata is missing
         subdirs = [
             os.path.basename(x.rstrip("/"))
             for x in fs.glob(os.path.join(root, "checkpoint_*"))
@@ -183,6 +184,7 @@ def debug_code_lookup(model, batch, code_to_item, n_centroids, device):
         gen = model.net.search(batch, n_results=10)
 
     sample_code_raw = tuple(gen[0][0].cpu().tolist())
+    # Decode token IDs by reversing the hierarchical offset and special token shift
     sample_code = tuple(
         c - offset - (level * n_centroids) for level, c in enumerate(sample_code_raw)
     )

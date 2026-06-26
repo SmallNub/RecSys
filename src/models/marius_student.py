@@ -1,3 +1,5 @@
+"""MARIUS Student model architecture for knowledge distillation."""
+
 from dataclasses import dataclass
 import math
 import torch
@@ -21,6 +23,7 @@ class TransformerConfig:
 
 
 class RoPE(nn.Module):
+    """Rotary Position Embedding (RoPE) module."""
     def __init__(self, head_dim):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
@@ -145,6 +148,7 @@ class DepthBlock(nn.Module):
 
 
 class MARIUS(nn.Module):
+    """MARIUS Student model, designed for knowledge distillation from a pre-trained teacher model."""
     def __init__(
         self,
         temporal_cfg,
@@ -279,6 +283,7 @@ class MARIUS(nn.Module):
     def _corrupt_student_input(self, input_tensor):
         """Forces the student to infer missing context by randomly masking token streams."""
         corrupted = input_tensor.clone()
+        # Create a mask so we only drop valid tokens, never padding tokens
         valid_mask = corrupted[:, :, 0] != SpecialTokens.PAD.value
 
         rand_grid = torch.rand(corrupted.shape[:2], device=input_tensor.device)
@@ -369,6 +374,7 @@ class MARIUS(nn.Module):
 
         # 3. Suppressed Hard CE Loss Component
         logits_rearranged = rearrange(logits_student, "b l v -> b v l")
+        # Standard Cross-Entropy against ground truth labels
         ce_loss = self.criterion(logits_rearranged, target_rearranged)
         final_loss = self.ce_weight * ce_loss
 
@@ -381,6 +387,7 @@ class MARIUS(nn.Module):
 
                 soft_student = F.log_softmax(flat_student / self.distill_temp, dim=-1)
                 soft_teacher = F.softmax(flat_teacher / self.distill_temp, dim=-1)
+                # KL Divergence between teacher soft targets and student predictions, scaled by temperature squared
                 distill_loss = F.kl_div(
                     soft_student, soft_teacher, reduction="batchmean"
                 ) * (self.distill_temp**2)

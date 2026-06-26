@@ -1,3 +1,5 @@
+"""Trains the COSETTE model (Euclidean or Hyperbolic) to generate semantic IDs for items."""
+
 import logging
 import os
 import random
@@ -35,6 +37,7 @@ def worker_init_fn(worker_id):
 
 
 class LinearDecayScheduler(LRScheduler):
+    """Learning rate scheduler that implements linear warmup followed by linear decay."""
     def __init__(self, optimizer, warmup_steps, cooldown_steps, factor=0.1):
         self.optimizer = optimizer
         self.factor = factor
@@ -69,6 +72,7 @@ class LinearDecayScheduler(LRScheduler):
 
 
 class Trainer(object):
+    """Handles the training loop, validation metrics, and checkpointing for COSETTE models."""
     def __init__(self, config, model, dataset):
         self.config = config
         self.model = model
@@ -410,6 +414,7 @@ def make_name(config, timestamp):
 
 
 def make_cosette_embs(config):
+    """Main pipeline to initialize, train, and extract semantic IDs using the COSETTE model."""
     set_global_seed(config.seed)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

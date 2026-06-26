@@ -1,3 +1,5 @@
+"""Resolves semantic ID collisions by iteratively re-assigning item indices based on minimum distance."""
+
 import collections
 import copy
 import os
@@ -66,6 +68,7 @@ def get_indices_count(all_indices_tup):
 
 
 def get_collision_item(all_indices_tup):
+    """Identifies groups of items that have been assigned the exact same semantic ID code."""
     index2id = defaultdict(list)
     for i, index in enumerate(all_indices_tup):
         index2id[index].append(i)

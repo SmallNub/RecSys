@@ -40,6 +40,7 @@ def get_top_cfg(fs, config):
             f"[WARNING] {FILENAMES['snapshot']} not found at {root}. Searching for sub-directories..."
         )
         try:
+            # Fallback: Manually scan for the chronologically latest checkpoint subdirectory if snapshot metadata is missing
             subdirs = [
                 os.path.basename(x.rstrip("/"))
                 for x in fs.glob(os.path.join(root, "checkpoint_*"))

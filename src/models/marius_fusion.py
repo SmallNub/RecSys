@@ -1,3 +1,5 @@
+"""MARIUS Fusion model architecture for sequential recommendation, integrating continuous COSETTE embeddings."""
+
 import math
 from dataclasses import dataclass
 import torch
@@ -21,6 +23,7 @@ class TransformerConfig:
 
 
 class RoPE:
+    """Rotary Position Embedding (RoPE) helper class."""
     def __init__(self, head_dim):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.inv_freq = inv_freq
@@ -141,6 +144,7 @@ class DepthBlock(nn.Module):
 
 
 class MARIUS(nn.Module):
+    """MARIUS Fusion model, integrating continuous representations from COSETTE with discrete token embeddings."""
     def __init__(
         self,
         temporal_cfg,
@@ -282,6 +286,7 @@ class MARIUS(nn.Module):
                 q = self.cosette.model.rq.vq_layers[i]
                 idx = target[:, i]
 
+                # Ensure index is within the valid codebook range before lookup
                 valid = (idx >= 0) & (idx < getattr(q, "n_centroids", 32000))
                 safe = torch.where(valid, idx, torch.zeros_like(idx))
 
@@ -291,6 +296,7 @@ class MARIUS(nn.Module):
             res = torch.stack(res, dim=1)
             cont = self.depth_proj(res)
 
+            # Fuse discrete and continuous embeddings through normalization and add
             fused_tgt = self.fuse_norm(dec + cont)
             tgt = torch.cat([mid, fused_tgt], dim=1)
         else:

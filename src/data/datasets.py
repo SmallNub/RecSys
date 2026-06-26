@@ -22,6 +22,7 @@ def get_items_map(fs, path):
         items = pickle.load(f)
 
     m = {}
+    # Precompute mappings from item IDs to vocabulary indices, reserving space for special tokens
     m["item_to_id"] = {item: i + len(SpecialTokens) for i, item in enumerate(items)}
     m["id_to_item"] = {id: item for item, id in m["item_to_id"].items()}
     return m
@@ -106,6 +107,7 @@ def make_datasets(
                 total_len is not None
             ), "total_len must be specified for the training dataset."
             df = pd.read_parquet(path, filesystem=fs).reset_index()[COL_ORDER]
+            # Filter out single-item timelines as they cannot be used for sequence prediction
             df = df[df.timeline.apply(len) > 1]
             datasets["train"] = TrainDataset(df, pp_cfg, total_len)
         else:

@@ -92,6 +92,7 @@ def download_2014(categories, local_dir):
             urllib.request.urlretrieve(url, gz_path)
 
             print(f"  Decompressing {gz_name} ...")
+            # Decompress streaming gzip file chunk-by-chunk to save RAM
             with gzip.open(gz_path, "rb") as f_in, open(json_path, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
             os.remove(gz_path)

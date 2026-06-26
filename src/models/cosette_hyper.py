@@ -1,3 +1,5 @@
+"""COSETTE model architecture and submodules (Hyperbolic version using Poincare ball)."""
+
 from collections import defaultdict
 import math
 
@@ -13,6 +15,7 @@ def project(x, c=1.0):
     """Projects points to ensure they strictly remain inside the Poincare ball."""
     norm = torch.norm(x, dim=-1, keepdim=True)
     maxnorm = (1.0 - 1e-5) / math.sqrt(c)
+    # Project vector back into the Poincare ball if it exceeds the maximum allowed norm
     cond = norm > maxnorm
     projected = x / norm.clamp_min(MIN_NORM) * maxnorm
     return torch.where(cond, projected, x)
@@ -24,6 +27,7 @@ def mobius_add(x, y, c=1.0):
     y2 = torch.sum(y * y, dim=-1, keepdim=True)
     xy = torch.sum(x * y, dim=-1, keepdim=True)
 
+    # Mobius addition formula: ( (1 + 2c<x,y> + c|y|^2)x + (1 - c|x|^2)y ) / (1 + 2c<x,y> + c^2|x|^2|y|^2 )
     num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
     den = 1 + 2 * c * xy + c**2 * x2 * y2
 
@@ -102,6 +106,7 @@ def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
 
 
 class HyperbolicVectorQuantizer(nn.Module):
+    """Vector Quantizer that operates within hyperbolic space."""
     def __init__(
         self,
         n_centroids,
@@ -161,6 +166,7 @@ class HyperbolicVectorQuantizer(nn.Module):
         x_expand = latent.unsqueeze(1)
         emb_expand = codebook.unsqueeze(0)
 
+        # Calculate hyperbolic distance: 2/sqrt(c) * atanh(sqrt(c) * ||-x + y||)
         minus_x = -x_expand
         m_add = mobius_add(minus_x, emb_expand, self.c)
         m_add_norm = torch.norm(m_add, dim=-1).clamp(max=1.0 - 1e-5)
@@ -294,6 +300,7 @@ class SigLIPLoss(torch.nn.Module):
 
 
 class COSETTE(torch.nn.Module):
+    """Hyperbolic variation of the COSETTE model for learning semantic IDs in a Poincare ball space."""
     def __init__(
         self,
         embs_block,

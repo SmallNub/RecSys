@@ -39,7 +39,9 @@ class SASRecPrePro:
 
         pad_to = self.crop_and_augment.crop_length
 
+        # Construct inputs by taking all but the last item, right-aligning them with padding
         query = [SpecialTokens.PAD.value] * (pad_to - len(tl[:-1])) + tl[:-1]
+        # Construct targets shifted by one to the future, right-aligning them
         target = [SpecialTokens.PAD.value] * (pad_to - len(tl[1:])) + tl[1:]
 
         return {

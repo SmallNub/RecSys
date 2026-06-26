@@ -1,3 +1,5 @@
+"""Advanced MARIUS model architecture for sequential recommendation."""
+
 from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
@@ -8,6 +10,7 @@ from src.models import SpecialTokens
 
 @dataclass
 class TransformerConfig:
+    """Configuration parameters for the Transformer models."""
     n_layers: int
     d_head: int
     d_model: int
@@ -18,6 +21,7 @@ class TransformerConfig:
 
 
 class MARIUS(torch.nn.Module):
+    """Advanced MARIUS model for sequential recommendation, incorporating GELU activations and truncated normal weight initialization."""
     def __init__(
         self,
         temporal_cfg,
